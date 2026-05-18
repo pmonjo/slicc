@@ -47,6 +47,10 @@ import {
   startFollowerWithAutoReconnect,
 } from '../../../packages/webapp/src/scoops/tray-webrtc.js';
 import { FollowerSyncManager } from '../../../packages/webapp/src/scoops/tray-follower-sync.js';
+import {
+  connectOffscreenFollowerSprinkleBridge,
+  type OffscreenMessageHub,
+} from './follower-sprinkle-bridge.js';
 import { OffscreenBridge } from './offscreen-bridge.js';
 import { ServiceWorkerLeaderTraySocket } from './tray-socket-proxy.js';
 import { createLogger } from '../../../packages/webapp/src/core/index.js';
@@ -268,11 +272,17 @@ async function init(): Promise<void> {
 
     if (trayRuntimeConfig?.joinUrl) {
       let activeSync: FollowerSyncManager | null = null;
+      let activeSprinkleBridge: ReturnType<typeof connectOffscreenFollowerSprinkleBridge> | null =
+        null;
       let targetRefreshInterval: ReturnType<typeof setInterval> | null = null;
       const detachSync = () => {
         if (targetRefreshInterval) {
           clearInterval(targetRefreshInterval);
           targetRefreshInterval = null;
+        }
+        if (activeSprinkleBridge) {
+          activeSprinkleBridge.detach();
+          activeSprinkleBridge = null;
         }
         if (!activeSync) return;
         bridge.setFollowerSync(null);
@@ -291,6 +301,12 @@ async function init(): Promise<void> {
             log.info('Extension follower connected', { trayId: connection.trayId });
             detachSync();
             const runtimeId = `follower-${connection.bootstrapId}`;
+            // Track our sprinkle bridge ahead of time so the FollowerSyncManager
+            // callbacks can forward `sprinkles.list` / `sprinkle.update` to the
+            // panel without a forward declaration. Bind is wrapped in a closure
+            // so a transient bridge swap during reconnect doesn't leak stale
+            // forwards to a previous panel session.
+            let sprinkleBridgeRef: typeof activeSprinkleBridge = null;
             const sync: FollowerSyncManager = new FollowerSyncManager(connection.channel, {
               browserTransport: browser.getTransport(),
               browserAPI: browser,
@@ -299,11 +315,47 @@ async function init(): Promise<void> {
                 bridge.emitFollowerIncomingMessage(messageId, text),
               onStatus: (scoopStatus) => bridge.emitFollowerStatus(scoopStatus),
               onTargetsChanged: () => void refreshTargets(),
+              onSprinklesList: (sprinkles) => sprinkleBridgeRef?.forwardSprinklesList(sprinkles),
+              onSprinkleUpdate: (name, data) =>
+                sprinkleBridgeRef?.forwardSprinkleUpdate(name, data),
               onDisconnect: (reason) => {
                 log.warn('Follower sync disconnected', { reason });
                 detachSync();
               },
             });
+            // Wire panel↔offscreen sprinkle messages: panel `follower-sprinkle-fetch`
+            // / `follower-sprinkle-lick` enter via chrome.runtime.onMessage and are
+            // routed through `sync` (a FollowerSyncManager). Outbound forwards
+            // for `sprinkles.list` / `sprinkle.update` are bound above.
+            const hub: OffscreenMessageHub = {
+              sendToPanel: (envelope) => {
+                chrome.runtime.sendMessage(envelope).catch(() => {
+                  // No panel open — expected, drop silently.
+                });
+              },
+              onPanelMessage: (handler) => {
+                const listener = (msg: unknown): boolean => {
+                  if (
+                    !msg ||
+                    typeof msg !== 'object' ||
+                    !('source' in msg) ||
+                    !('payload' in msg)
+                  ) {
+                    return false;
+                  }
+                  handler(msg as { source: string; payload: unknown });
+                  return false;
+                };
+                chrome.runtime.onMessage.addListener(listener);
+                return () => chrome.runtime.onMessage.removeListener(listener);
+              },
+            };
+            sprinkleBridgeRef = connectOffscreenFollowerSprinkleBridge(hub, {
+              fetchSprinkleContent: (name: string) => sync.fetchSprinkleContent(name),
+              sendSprinkleLick: (name: string, body: unknown, targetScoop?: string) =>
+                sync.sendSprinkleLick(name, body, targetScoop),
+            });
+            activeSprinkleBridge = sprinkleBridgeRef;
             const refreshTargets = async () => {
               try {
                 const pages = await browser.listPages();

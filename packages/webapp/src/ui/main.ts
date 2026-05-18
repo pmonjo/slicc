@@ -1412,6 +1412,58 @@ async function mainExtension(app: HTMLElement, options?: { detached?: boolean })
   layout.updateAddButtons();
   await sprinkleManager.restoreOpenSprinkles();
 
+  // ── Follower sprinkle sync (extension follower mode) ───────────────
+  // When the extension acts as a tray follower, the offscreen document hosts
+  // the `FollowerSyncManager` (it has signaling + WebRTC). DOM-bound sprinkle
+  // rendering lives here in the side panel. The panel↔offscreen bridge in
+  // `chrome-extension/src/follower-sprinkle-bridge.ts` carries `sprinkles.list`
+  // / `sprinkle.update` / `sprinkle.content` between them. The controller
+  // shares layout callbacks with the local `SprinkleManager` above — leader-
+  // pushed sprinkles surface in the same rail as local ones. If the offscreen
+  // is not in follower mode, no `follower-sprinkles-list` messages arrive
+  // and the controller stays idle.
+  const { PanelFollowerSprinkleProxy } =
+    await import('../../../chrome-extension/src/follower-sprinkle-bridge.js');
+  const { SprinkleFollowerController } = await import('./sprinkle-follower-controller.js');
+  const followerSprinkleSender = {
+    send(envelope: { source: 'panel'; payload: unknown }): void {
+      chrome.runtime.sendMessage(envelope).catch(() => {
+        // Offscreen not awake — drop silently. The proxy's fetch promise
+        // will hang until the offscreen wakes up and responds, or until
+        // the controller is torn down.
+      });
+    },
+  };
+  const followerSprinkleSubscriber = {
+    onMessage(handler: (envelope: { source: string; payload: unknown }) => void): () => void {
+      const listener = (msg: unknown): boolean => {
+        if (!msg || typeof msg !== 'object' || !('source' in msg) || !('payload' in msg)) {
+          return false;
+        }
+        handler(msg as { source: string; payload: unknown });
+        return false;
+      };
+      chrome.runtime.onMessage.addListener(listener);
+      return () => chrome.runtime.onMessage.removeListener(listener);
+    },
+  };
+  let followerSprinkleController: InstanceType<typeof SprinkleFollowerController> | null = null;
+  const followerSprinkleProxy = new PanelFollowerSprinkleProxy(
+    followerSprinkleSender,
+    followerSprinkleSubscriber,
+    {
+      onSprinklesList: (sprinkles) => void followerSprinkleController?.updateAvailable(sprinkles),
+      onSprinkleUpdate: (name, data) =>
+        followerSprinkleController?.handleSprinkleUpdate(name, data),
+    }
+  );
+  followerSprinkleController = new SprinkleFollowerController({
+    sync: followerSprinkleProxy,
+    addSprinkle: (name, title, element, zone, opts) =>
+      layout.addSprinkle(name, title, element, zone as 'primary' | 'drawer' | undefined, opts),
+    removeSprinkle: (name) => layout.removeSprinkle(name),
+  });
+
   // Auto-surface newly-added .shtml files in the rail. The panel's
   // `localFs` doesn't have the orchestrator's watcher (that lives in
   // offscreen), so attach a fresh one to catch panel-side writes

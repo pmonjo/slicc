@@ -153,6 +153,32 @@ export interface SprinkleLickMsg {
 }
 
 /**
+ * Side panel → offscreen: when the extension is acting as a tray follower,
+ * request the leader's `.shtml` content for a sprinkle (which the offscreen
+ * `FollowerSyncManager` answers via `sprinkle.fetch` → chunked `sprinkle.content`
+ * reassembly). The `id` is generated panel-side and echoed back on
+ * `follower-sprinkle-fetch-result`. Distinct from `sprinkle-lick` because the
+ * destination is the remote leader, not the local offscreen lick manager.
+ */
+export interface FollowerSprinkleFetchRequestMsg {
+  type: 'follower-sprinkle-fetch';
+  id: string;
+  sprinkleName: string;
+}
+
+/**
+ * Side panel → offscreen: in extension follower mode, forward a sprinkle lick
+ * to the leader (`sprinkle.lick` on the wire). Distinct from `sprinkle-lick`,
+ * which would route the lick to a local scoop instead of the remote leader.
+ */
+export interface FollowerSprinkleLickMsg {
+  type: 'follower-sprinkle-lick';
+  sprinkleName: string;
+  body: unknown;
+  targetScoop?: string;
+}
+
+/**
  * Webhook event relayed from the page-side LeaderTrayManager into the
  * worker-side LickManager. The page-side leader receives `webhook.event`
  * control messages from the Cloudflare tray and forwards them here so the
@@ -254,6 +280,8 @@ export type PanelToOffscreenMessage =
   | PanelCdpCommandMsg
   | OAuthRequestMsg
   | SprinkleLickMsg
+  | FollowerSprinkleFetchRequestMsg
+  | FollowerSprinkleLickMsg
   | WebhookEventMsg
   | ReloadSkillsMsg
   | ToolUIActionMsg
@@ -501,6 +529,45 @@ export interface NavigateLickMsg {
   tabId?: number;
 }
 
+/**
+ * Offscreen → panel: in extension follower mode, the leader has sent a new
+ * sprinkle list. The panel-side `SprinkleFollowerController` reconciles this
+ * against its open set.
+ */
+export interface FollowerSprinklesListMsg {
+  type: 'follower-sprinkles-list';
+  sprinkles: Array<{
+    name: string;
+    title: string;
+    path: string;
+    open: boolean;
+    autoOpen: boolean;
+  }>;
+}
+
+/**
+ * Offscreen → panel: in extension follower mode, the leader has pushed a
+ * `sprinkle.update` payload. The panel routes it to the matching open
+ * sprinkle's update listeners.
+ */
+export interface FollowerSprinkleUpdateMsg {
+  type: 'follower-sprinkle-update';
+  sprinkleName: string;
+  data: unknown;
+}
+
+/**
+ * Offscreen → panel: result of a `follower-sprinkle-fetch` request. Either
+ * `content` is set (success) or `error` is set (leader rejected or
+ * disconnected before the fetch could complete).
+ */
+export interface FollowerSprinkleFetchResultMsg {
+  type: 'follower-sprinkle-fetch-result';
+  id: string;
+  content?: string;
+  error?: string;
+}
+
 export type OffscreenToPanelMessage =
   | OffscreenReadyMsg
   | AgentEventMsg
@@ -516,6 +583,9 @@ export type OffscreenToPanelMessage =
   | OAuthResultMsg
   | TrayRuntimeStatusMsg
   | ClearChatAckMsg
+  | FollowerSprinklesListMsg
+  | FollowerSprinkleUpdateMsg
+  | FollowerSprinkleFetchResultMsg
   // Terminal session events emitted by the worker's `TerminalSessionHost`.
   // Consumed by the panel's `TerminalSessionClient`.
   | TerminalEventMsg;
