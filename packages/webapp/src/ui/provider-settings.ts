@@ -40,6 +40,40 @@ function isExtensionRuntime(): boolean {
   return typeof chrome !== 'undefined' && !!chrome?.runtime?.id;
 }
 
+/**
+ * Dispatch the `slicc:tray-join` CustomEvent and wire a one-shot
+ * `slicc:tray-join-failed` listener that surfaces the half-state
+ * failure in the dialog's status element. The listener self-removes
+ * after firing, and a `data-dismiss-timer` attribute on the status
+ * element is honored to cancel the optimistic 800ms dialog-dismiss
+ * timer set by the caller — so a failure keeps the dialog open with
+ * an actionable message instead of dismissing into a silent
+ * half-state where the user's next chat message could route to the
+ * local cone (per `ui/main.ts:mainStandaloneWorker`'s tray-join
+ * handler comments).
+ */
+function dispatchTrayJoinWithFailureFeedback(joinUrl: string, statusEl: HTMLElement): void {
+  const onFailure = (e: Event) => {
+    const detail = (e as CustomEvent<{ joinUrl: string; error: string }>).detail;
+    window.removeEventListener('slicc:tray-join-failed', onFailure);
+    // Cancel the optimistic dismiss so the user can read the error.
+    const dismissTimerStr = statusEl.dataset.dismissTimer;
+    if (dismissTimerStr) {
+      const dismissTimer = Number(dismissTimerStr);
+      if (Number.isFinite(dismissTimer)) clearTimeout(dismissTimer);
+      delete statusEl.dataset.dismissTimer;
+    }
+    statusEl.textContent = `Sync failed: ${detail.error}. Reload the page and try again.`;
+    statusEl.style.color = 'var(--slicc-cone)';
+  };
+  window.addEventListener('slicc:tray-join-failed', onFailure);
+  // Auto-cleanup the listener after 10s — much longer than the 800ms
+  // optimistic dismiss, but short enough that a stale listener doesn't
+  // outlive the dialog if the dispatcher's user navigates away.
+  setTimeout(() => window.removeEventListener('slicc:tray-join-failed', onFailure), 10_000);
+  window.dispatchEvent(new CustomEvent('slicc:tray-join', { detail: { joinUrl } }));
+}
+
 // Storage keys
 const ACCOUNTS_KEY = 'slicc_accounts';
 const MODEL_KEY = 'selected-model';
@@ -1585,21 +1619,22 @@ export function showProviderSettings(options?: ShowProviderSettingsOptions): Pro
           };
           void chrome.runtime.sendMessage({ source: 'panel' as const, payload }).catch(() => {});
         } else {
-          window.dispatchEvent(
-            new CustomEvent('slicc:tray-join', {
-              detail: { joinUrl: stored.joinUrl },
-            })
-          );
+          dispatchTrayJoinWithFailureFeedback(stored.joinUrl, statusEl);
         }
 
         statusEl.textContent = 'Connecting\u2026';
         statusEl.style.display = '';
         statusEl.style.color = 'var(--s2-content-secondary)';
 
-        setTimeout(() => {
+        // 800 ms is fast feedback for the success path; failure
+        // surfaces sooner via `slicc:tray-join-failed` and the
+        // listener inside `dispatchTrayJoinWithFailureFeedback`
+        // cancels this timer.
+        const dismissTimer = setTimeout(() => {
           overlay.remove();
           resolve(false);
         }, 800);
+        statusEl.dataset.dismissTimer = String(dismissTimer);
       });
       dialog.appendChild(joinBtn);
 
@@ -1705,21 +1740,21 @@ export function showProviderSettings(options?: ShowProviderSettingsOptions): Pro
             // Offscreen may not be ready yet; mainExtension will reconnect shortly.
           });
         } else {
-          window.dispatchEvent(
-            new CustomEvent('slicc:tray-join', {
-              detail: { joinUrl: stored.joinUrl },
-            })
-          );
+          dispatchTrayJoinWithFailureFeedback(stored.joinUrl, statusEl);
         }
 
         statusEl.textContent = 'Connecting\u2026';
         statusEl.style.display = '';
         statusEl.style.color = 'var(--s2-content-secondary)';
 
-        setTimeout(() => {
+        // See note above the other dispatch site \u2014 the listener
+        // inside `dispatchTrayJoinWithFailureFeedback` cancels this
+        // timer if a failure event arrives.
+        const dismissTimer = setTimeout(() => {
           overlay.remove();
           resolve(false);
         }, 800);
+        statusEl.dataset.dismissTimer = String(dismissTimer);
       });
       dialog.appendChild(joinBtn);
       dialog.appendChild(statusEl);
