@@ -43,6 +43,7 @@ import type { VirtualFS } from '../fs/virtual-fs.js';
 import { buildTrayLaunchUrl } from '../scoops/tray-runtime-config.js';
 import { getLeaderTrayRuntimeStatus, type LeaderTrayRuntimeStatus } from '../scoops/tray-leader.js';
 import { createLogger } from '../core/logger.js';
+import { ThrottledErrorTracker } from '../scoops/throttled-error-tracker.js';
 
 const log = createLogger('page-leader-tray');
 
@@ -233,21 +234,26 @@ export function startPageLeaderTray(options: StartPageLeaderTrayOptions): PageLe
   // recovery log fires on the first success after a failing streak so
   // an operator can see MTTR rather than guessing whether silence =
   // recovery or = suppression.
-  // `lastTargetErrorLogAt = -Infinity` (NOT 0): we use `performance.now()`
-  // which starts small (~ms since process boot), so an initial value
-  // of 0 would make the first `now - last > 60_000` check FALSE and
-  // suppress the very first error log — the opposite of what we want.
-  // -Infinity guarantees the first failure passes through.
-  let lastTargetErrorLogAt = Number.NEGATIVE_INFINITY;
-  let leaderTargetsInFailingState = false;
+  // Throttle: at most one error log per 60 s for sustained CDP
+  // failures, with a recovery signal on the first stable success
+  // window. See `scoops/throttled-error-tracker.ts` for the full
+  // contract. The throttle is keyed to CDP listing only — broadcast
+  // failures (the second try block below) are their own surface and
+  // shouldn't be conflated with "CDP refresh failed".
+  const cdpThrottle = new ThrottledErrorTracker(log, {
+    failureMessage: 'Leader CDP target refresh failed (best-effort, throttled)',
+    recoveryMessage: 'Leader CDP target refresh recovered (stable for debounce window)',
+  });
   const refreshLeaderTargets = async () => {
+    let pages: Awaited<ReturnType<typeof options.browserAPI.listPages>>;
     try {
-      const pages = await options.browserAPI.listPages();
-      if (leaderTargetsInFailingState) {
-        leaderTargetsInFailingState = false;
-        lastTargetErrorLogAt = Number.NEGATIVE_INFINITY;
-        log.info('Leader target refresh recovered');
-      }
+      pages = await options.browserAPI.listPages();
+    } catch (err) {
+      cdpThrottle.reportFailure(err);
+      return;
+    }
+    cdpThrottle.reportSuccess();
+    try {
       const targets: RemoteTargetInfo[] = pages.map((p) => ({
         targetId: p.targetId,
         title: p.title,
@@ -255,14 +261,11 @@ export function startPageLeaderTray(options: StartPageLeaderTrayOptions): PageLe
       }));
       sync.setLocalTargets(targets);
     } catch (err) {
-      const now = performance.now();
-      leaderTargetsInFailingState = true;
-      if (now - lastTargetErrorLogAt > 60_000) {
-        lastTargetErrorLogAt = now;
-        log.error('Leader target refresh failed (best-effort, throttled)', {
-          error: err instanceof Error ? err.message : String(err),
-        });
-      }
+      // Distinct from the CDP-failure path above so the message
+      // doesn't lie. A broadcast error doesn't mean CDP is broken.
+      log.error('Leader target broadcast failed (sync.setLocalTargets threw)', {
+        error: err instanceof Error ? err.message : String(err),
+      });
     }
   };
   intervals.push(setInterval(refreshLeaderTargets, refreshIntervalMs));

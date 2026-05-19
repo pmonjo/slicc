@@ -39,6 +39,7 @@ import type { SprinkleSummary } from '../scoops/tray-sync-protocol.js';
 import type { SprinkleAddOptions } from './sprinkle-manager.js';
 import { SprinkleFollowerController } from './sprinkle-follower-controller.js';
 import { createLogger } from '../core/logger.js';
+import { ThrottledErrorTracker } from '../scoops/throttled-error-tracker.js';
 
 const log = createLogger('page-follower-tray');
 
@@ -199,38 +200,36 @@ export function startPageFollowerTray(
     // symmetric recovery log on first success after a failing streak.
     // Uses `performance.now()` not `Date.now()` so NTP backward jumps
     // can't cause indefinite suppression.
-    // `lastTargetErrorLogAt = -Infinity` (NOT 0): we use `performance.now()`
-    // which starts small (~ms since process boot), so an initial value
-    // of 0 would make the first `now - last > 60_000` check FALSE and
-    // suppress the very first error log. -Infinity guarantees the
-    // first failure passes through.
-    let lastTargetErrorLogAt = Number.NEGATIVE_INFINITY;
-    let targetsInFailingState = false;
+    // Throttle: at most one error log per 60 s for sustained CDP
+    // failures, with a recovery signal on the first stable success
+    // window. Shared with `page-leader-tray.ts` via
+    // `scoops/throttled-error-tracker.ts`.
+    const cdpThrottle = new ThrottledErrorTracker(log, {
+      failureMessage: 'Follower CDP target listing failed (best-effort, throttled)',
+      recoveryMessage: 'Follower CDP target listing recovered (stable for debounce window)',
+    });
     const refreshTargets = async (): Promise<void> => {
+      let pages: Awaited<ReturnType<typeof options.browserAPI.listPages>>;
       try {
-        const pages = await options.browserAPI.listPages();
-        // A reconnect mid-flight may have swapped `activeSync` — bail in
-        // that case so we don't advertise this connection's runtimeId
-        // against the new sync (or vice versa).
-        if (activeSync !== sync) return;
-        if (targetsInFailingState) {
-          targetsInFailingState = false;
-          lastTargetErrorLogAt = Number.NEGATIVE_INFINITY;
-          log.info('Follower target advertisement recovered');
-        }
+        pages = await options.browserAPI.listPages();
+      } catch (err) {
+        cdpThrottle.reportFailure(err);
+        return;
+      }
+      // A reconnect mid-flight may have swapped `activeSync` — bail in
+      // that case so we don't advertise this connection's runtimeId
+      // against the new sync (or vice versa).
+      if (activeSync !== sync) return;
+      cdpThrottle.reportSuccess();
+      try {
         sync.advertiseTargets(
           pages.map((p) => ({ targetId: p.targetId, title: p.title, url: p.url })),
           runtimeId
         );
       } catch (err) {
-        const now = performance.now();
-        targetsInFailingState = true;
-        if (now - lastTargetErrorLogAt > 60_000) {
-          lastTargetErrorLogAt = now;
-          log.error('Follower target advertisement failed (best-effort, throttled)', {
-            error: err instanceof Error ? err.message : String(err),
-          });
-        }
+        log.error('Follower target advertisement broadcast failed (sync.advertiseTargets threw)', {
+          error: err instanceof Error ? err.message : String(err),
+        });
       }
     };
 
