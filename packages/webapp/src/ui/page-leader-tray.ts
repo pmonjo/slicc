@@ -249,13 +249,14 @@ export function startPageLeaderTray(options: StartPageLeaderTrayOptions): PageLe
         sync.broadcastScoopsList();
         sync.broadcastSprinklesList();
       } catch (err) {
-        // `warn`, not `debug` — `log.debug` only fires under `__DEV__`,
-        // and a sustained failure here means followers see stale scoop
-        // and sprinkle lists for the entire session with no signal in
-        // the prod log. The inner broadcast methods have their own
-        // narrow catches around user callbacks (e.g. `getSprinkles`);
-        // anything reaching this outer catch is unexpected.
-        log.warn('Failed to broadcast follower lists', {
+        // `error`, not `warn` — the prod default log level is ERROR
+        // (`logger.ts`), so `warn` would also be suppressed. The inner
+        // broadcast methods have their own narrow catches around user
+        // callbacks (e.g. `getSprinkles`); anything reaching this outer
+        // catch is unexpected and an `error`-grade signal. Sustained
+        // failures otherwise leave followers staring at stale scoop /
+        // sprinkle lists for the entire session with no log signal.
+        log.error('Failed to broadcast follower lists', {
           error: err instanceof Error ? err.message : String(err),
         });
       }
