@@ -69,12 +69,14 @@ export interface SprinkleManagerOptions {
   autoOpenBehavior?: 'activate' | 'attention';
   /**
    * Fired after `sendToSprinkle` pushes data to the local renderer.
-   * `page-leader-tray.ts` wires this to `LeaderSyncManager.broadcastSprinkleUpdate`
-   * so followers receive the agent's push (`sprinkle.update` over the
-   * WebRTC channel). Without this hook, `sendToSprinkle` updates only
-   * the leader's local renderer — followers see the static initial
-   * content but never the live state changes the agent pushes, and
-   * the only way to recover is a manual snapshot refresh.
+   * The standalone-leader boot path in `ui/main.ts:mainStandaloneWorker`
+   * (after `startPageLeaderTray`) wires this to
+   * `pageLeaderTray.sync.broadcastSprinkleUpdate` so followers receive
+   * the agent's push (`sprinkle.update` over the WebRTC channel).
+   * Without this hook, `sendToSprinkle` updates only the leader's local
+   * renderer — followers see the static initial content but never the
+   * live state changes the agent pushes, and the only way to recover
+   * is a manual snapshot refresh.
    *
    * Fires only when the named sprinkle is currently open locally;
    * skipped for closed sprinkles (matches the local-render behavior
@@ -144,10 +146,14 @@ export class SprinkleManager {
 
   /**
    * Replace the leader-broadcast hook after construction. Used by the
-   * page-leader-tray boot path where the `LeaderSyncManager` is created
-   * AFTER the `SprinkleManager` (chicken-and-egg: the tray needs callbacks
-   * the manager provides, so the manager exists first). Calling this with
-   * `undefined` detaches the hook (e.g., on `host reset`).
+   * standalone-leader boot path in `ui/main.ts`: `SprinkleManager` is
+   * built unconditionally early in `mainStandaloneWorker`, while
+   * `startPageLeaderTray` runs later inside the `storedWorkerBaseUrl`
+   * branch and reads `sprinkleManager`-backed callbacks (`getSprinkles`,
+   * `readSprinkleContent`) into its options. The manager therefore
+   * has to exist first, but the hook back into the tray's sync can
+   * only be installed once `pageLeaderTray.sync` is available.
+   * Calling this with `undefined` detaches the hook (e.g., on `host reset`).
    */
   setSendToSprinkleHook(hook: ((name: string, data: unknown) => void) | undefined): void {
     this.onSendToSprinkle = hook;
@@ -478,11 +484,11 @@ export class SprinkleManager {
     // In extension mode, listeners are inside the sandbox iframe.
     // Forward via the renderer's postMessage channel.
     entry.renderer.pushUpdate(data);
-    // Notify the broadcast hook (wired by `page-leader-tray.ts` to
-    // `LeaderSyncManager.broadcastSprinkleUpdate`) so followers receive
-    // the same payload as a `sprinkle.update` over the WebRTC channel.
-    // Hook exceptions are swallowed — a broken broadcaster must not
-    // skip or undo the local pushes above.
+    // Notify the broadcast hook (wired by `ui/main.ts`'s standalone-
+    // leader boot path to `pageLeaderTray.sync.broadcastSprinkleUpdate`)
+    // so followers receive the same payload as a `sprinkle.update` over
+    // the WebRTC channel. Hook exceptions are swallowed — a broken
+    // broadcaster must not skip or undo the local pushes above.
     if (this.onSendToSprinkle) {
       try {
         this.onSendToSprinkle(name, data);

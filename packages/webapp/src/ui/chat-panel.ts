@@ -347,8 +347,9 @@ export class ChatPanel {
 
   /**
    * Wire a callback fired after the user submits a local chat message
-   * (alongside the agent handle's `sendMessage`). `page-leader-tray.ts`
-   * wires this to `LeaderSyncManager.broadcastUserMessage` so connected
+   * (alongside the agent handle's `sendMessage`). The standalone-leader
+   * boot path in `ui/main.ts:mainStandaloneWorker` (after `startPageLeaderTray`)
+   * wires this to `pageLeaderTray.sync.broadcastUserMessage` so connected
    * followers see the leader's input live as a `user_message_echo`.
    * Without it, followers only see the leader's input after a manual
    * snapshot refresh — agent responses stream live but the prompt that
