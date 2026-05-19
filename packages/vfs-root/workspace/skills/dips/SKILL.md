@@ -14,7 +14,7 @@ allowed-tools: bash
 
 # Dips
 
-Dips are inline `shtml` code blocks in chat that hydrate into sandboxed interactive widgets. **Ephemeral** — no state persistence, no `readFile`. Only `slicc.lick()` is available for agent communication.
+Dips are inline `shtml` code blocks in chat that hydrate into sandboxed interactive widgets. **Ephemeral** — no state persistence, no `readFile`. Only `slicc.lick(event)` is available for agent communication; always pack payloads as `{ action, data: { ... } }` for a predictable shape on the cone side.
 
 **Use them generously.** A dip is the right answer any time a response could benefit from visualization, interaction, or a moment of delight. Don't reserve them for "complex" tasks — a slider that lets the user feel a number, a chart that beats a paragraph of stats, a button that's faster than typing "yes" all earn their keep.
 
@@ -93,7 +93,7 @@ When a dip's lick handler needs to do real work (lookup, transformation, generat
 
 The flow:
 
-1. Dip emits a lick: `slicc.lick({action: 'compute', input: ...})`.
+1. Dip emits a lick: `slicc.lick({action: 'compute', data: {input: ...}})`.
 2. The lick reaches the cone (or scoop) as a message.
 3. Instead of replying conversationally, the receiver shells out to `agent` with a tight allow-list and a self-contained prompt.
 4. `agent` returns the answer on stdout. The receiver writes the result back to the dip via a follow-up dip or via `sprinkle send` (if the dip was the entry point to a sprinkle flow).
@@ -128,15 +128,23 @@ result=$(agent /tmp "curl,jq" "Fetch <url>, return field 'price' as a number.")
 
 ```javascript
 // Explicit "send to agent" button.
-slicc.lick({ action: 'use-config', config: getCurrentConfig() });
+slicc.lick({ action: 'use-config', data: { config: getCurrentConfig() } });
 
 // Lick on threshold crossing.
 if (total > budget) {
-  slicc.lick({ action: 'over-budget', total, budget, breakdown });
+  slicc.lick({ action: 'over-budget', data: { total, budget, breakdown } });
 }
 
 // Lick on completion.
-slicc.lick({ action: 'sort-complete', algorithm: algo, comparisons: n });
+slicc.lick({ action: 'sort-complete', data: { algorithm: algo, comparisons: n } });
 ```
+
+> **Payload shape:** `slicc.lick(eventOrAction)` accepts either a plain
+> action string (`slicc.lick('cancel')`) or an `{ action, data? }`
+> object. **Always pack extra fields inside `data: { ... }`** — the
+> cone reads `event.data` as the payload, so top-level extras either
+> get dropped (sprinkle bridge) or folded into `data` as the whole
+> event object (dip bridge), neither of which gives the cone a
+> predictable shape. The canonical form works identically in both.
 
 The agent receives the lick as a structured message and can respond with prose, another dip, or spawn a scoop.

@@ -32,7 +32,7 @@ This shows how to use Lucide icons in inline sprinkles instead of emojis.
   <div class="sprinkle-action-card__header">Select Status</div>
   <div class="sprinkle-action-card__body">
     <div class="sprinkle-stack">
-      <button class="sprinkle-btn" onclick="slicc.lick({action:'status',value:'success'})">
+      <button class="sprinkle-btn" onclick="slicc.lick({action:'status',data:{value:'success'}})">
         <i
           data-lucide="check-circle"
           class="sprinkle-icon"
@@ -40,7 +40,7 @@ This shows how to use Lucide icons in inline sprinkles instead of emojis.
         ></i>
         Success
       </button>
-      <button class="sprinkle-btn" onclick="slicc.lick({action:'status',value:'warning'})">
+      <button class="sprinkle-btn" onclick="slicc.lick({action:'status',data:{value:'warning'}})">
         <i
           data-lucide="alert-triangle"
           class="sprinkle-icon"
@@ -48,7 +48,7 @@ This shows how to use Lucide icons in inline sprinkles instead of emojis.
         ></i>
         Warning
       </button>
-      <button class="sprinkle-btn" onclick="slicc.lick({action:'status',value:'error'})">
+      <button class="sprinkle-btn" onclick="slicc.lick({action:'status',data:{value:'error'}})">
         <i
           data-lucide="x-circle"
           class="sprinkle-icon"
@@ -56,7 +56,7 @@ This shows how to use Lucide icons in inline sprinkles instead of emojis.
         ></i>
         Error
       </button>
-      <button class="sprinkle-btn" onclick="slicc.lick({action:'status',value:'info'})">
+      <button class="sprinkle-btn" onclick="slicc.lick({action:'status',data:{value:'info'}})">
         <i data-lucide="info" class="sprinkle-icon" style="color: var(--uxc-accent-text)"></i> Info
       </button>
     </div>
