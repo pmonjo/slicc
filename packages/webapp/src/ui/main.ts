@@ -2538,31 +2538,66 @@ async function mainStandaloneWorker(app: HTMLElement, isElectronOverlay: boolean
   window.addEventListener('slicc:tray-join', (rawEvent: Event) => {
     const event = rawEvent as CustomEvent<{ joinUrl: string }>;
     const joinUrl = event.detail?.joinUrl;
-    if (!joinUrl) return;
+    if (!joinUrl) {
+      log.warn('slicc:tray-join fired without joinUrl');
+      return;
+    }
 
-    pageLeaderTray?.stop();
-    pageLeaderTray = null;
-    setConnectedFollowersGetter(null);
-    setTrayResetter(null);
-    // Detach the leader-only hooks now that the runtime is switching
-    // to follower mode — without this, a stale `pageLeaderTray` ref
-    // (already nulled above) would still be invoked by the next user
-    // chat submit / sprinkle push and silently no-op.
-    layout.panels.chat.setOnLocalUserMessage(undefined);
-    sprinkleManager.setSendToSprinkleHook(undefined);
+    try {
+      pageLeaderTray?.stop();
+      pageLeaderTray = null;
+      setConnectedFollowersGetter(null);
+      setTrayResetter(null);
+      // Detach the leader-only hooks now that the runtime is switching
+      // to follower mode — without this, a stale `pageLeaderTray` ref
+      // (already nulled above) would still be invoked by the next user
+      // chat submit / sprinkle push and silently no-op.
+      layout.panels.chat.setOnLocalUserMessage(undefined);
+      sprinkleManager.setSendToSprinkleHook(undefined);
 
-    pageFollowerTray?.stop();
-    pageFollowerTray = null;
+      pageFollowerTray?.stop();
+      pageFollowerTray = null;
 
-    pageFollowerTray = startPageFollowerTray({
-      joinUrl,
-      onSnapshot: (messages) => layout.panels.chat.loadMessages(messages),
-      onUserMessage: (text, _messageId, _scoopJid, attachments) =>
-        layout.panels.chat.addUserMessage(text, attachments),
-      onStatus: (status) => layout.panels.chat.setProcessing(status === 'processing'),
-      setChatAgent: (agent) => layout.panels.chat.setAgent(agent),
-      browserAPI: browser,
-    });
+      // Mirror the boot-path options at `:2388-2413`, especially the
+      // `addSprinkle` / `removeSprinkle` callbacks — `startPageFollowerTray`
+      // silently no-ops follower sprinkle rendering when those are
+      // omitted (`page-follower-tray.ts` gates the controller on their
+      // presence). Without this, a hot-join over the settings dialog
+      // would give the user chat sync but no sprinkle sync until they
+      // reload — exactly the asymmetry R9 flagged as a blocker.
+      pageFollowerTray = startPageFollowerTray({
+        joinUrl,
+        onSnapshot: (messages) => layout.panels.chat.loadMessages(messages),
+        onUserMessage: (text, _messageId, _scoopJid, attachments) =>
+          layout.panels.chat.addUserMessage(text, attachments),
+        onStatus: (status) => layout.panels.chat.setProcessing(status === 'processing'),
+        setChatAgent: (agent) => layout.panels.chat.setAgent(agent),
+        browserAPI: browser,
+        addSprinkle: (name, title, element, zone, options) =>
+          layout.addSprinkle(
+            name,
+            title,
+            element,
+            zone as 'primary' | 'drawer' | undefined,
+            options
+          ),
+        removeSprinkle: (name) => layout.removeSprinkle(name),
+      });
+    } catch (err) {
+      // The teardown above (`pageLeaderTray?.stop()`, the nullings, the
+      // hook detaches) is already complete by the time a synchronous
+      // throw could land here from `startPageFollowerTray`. The runtime
+      // is in a half-state: leader gone, follower not started. We
+      // surface an error-grade log so QA / on-call sees the failure;
+      // user-side recovery is a page reload.
+      log.error(
+        'slicc:tray-join handler failed — runtime is in a half-state, page reload required',
+        {
+          joinUrl,
+          error: err instanceof Error ? err.message : String(err),
+        }
+      );
+    }
   });
 
   // Tear down on page unload so the WebSocket and any open data channels
