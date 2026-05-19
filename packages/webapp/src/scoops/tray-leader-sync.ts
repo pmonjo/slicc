@@ -219,6 +219,10 @@ export class LeaderSyncManager {
     follower.unsubscribe();
     follower.sync.close();
     this.followers.delete(bootstrapId);
+    // Clear the broadcast-error throttle entry so the map doesn't
+    // grow unbounded across reconnects (followers are keyed by
+    // bootstrapId; a reconnect mints a fresh one).
+    this.followerBroadcastErrorLogAt.delete(bootstrapId);
 
     // Remove this follower's targets from the registry
     // Find the runtimeId that maps to this bootstrapId
@@ -240,6 +244,56 @@ export class LeaderSyncManager {
   }
 
   /**
+   * Per-follower throttle for broadcast send failures. A stuck channel
+   * (closed/closing, full SCTP buffer) would otherwise log on every
+   * broadcast — and broadcasters include per-pi-event traffic during
+   * tool streaming, so a single bad follower could produce hundreds
+   * of identical error logs in a single turn before keepalive evicts
+   * it. Cleared on success and on `removeFollower`.
+   */
+  private readonly followerBroadcastErrorLogAt = new Map<string, number>();
+  private static readonly BROADCAST_ERROR_THROTTLE_MS = 60_000;
+
+  /**
+   * Send a message to every connected follower. Each `follower.sync.send`
+   * is wrapped in its own try/catch so a single dead/closing channel
+   * doesn't abort the iteration and silently strand subsequent
+   * siblings without the message (`RTCDataChannel.send()` throws
+   * `InvalidStateError` for closed/closing channels and
+   * `OperationError` when the SCTP send buffer overflows).
+   *
+   * Failures are throttled per-follower (~1 log per 60s) so a stuck
+   * channel can't flood logs during a high-event turn. Successful
+   * sends clear the throttle so a recovered channel logs immediately
+   * if it fails again. Does NOT auto-remove the broken follower —
+   * keepalive timeout owns that decision; ripping a follower out
+   * mid-broadcast risks deadlocking the next iteration if it
+   * observes a partial `followers` map.
+   */
+  private broadcastToAllFollowers(message: LeaderToFollowerMessage): void {
+    const now = performance.now();
+    for (const [bootstrapId, follower] of this.followers) {
+      try {
+        follower.sync.send(message);
+        // Clear throttle on success so a follower that just recovered
+        // logs immediately if its channel fails again.
+        this.followerBroadcastErrorLogAt.delete(bootstrapId);
+      } catch (err) {
+        const lastLogAt =
+          this.followerBroadcastErrorLogAt.get(bootstrapId) ?? Number.NEGATIVE_INFINITY;
+        if (now - lastLogAt > LeaderSyncManager.BROADCAST_ERROR_THROTTLE_MS) {
+          this.followerBroadcastErrorLogAt.set(bootstrapId, now);
+          log.error('Broadcast send to follower failed (channel may be stuck)', {
+            bootstrapId,
+            messageType: message.type,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
+      }
+    }
+  }
+
+  /**
    * Broadcast an agent event to all connected followers.
    * Called from the orchestrator callback wiring in main.ts.
    */
@@ -247,28 +301,37 @@ export class LeaderSyncManager {
     if (this.followers.size === 0) return;
     const scoopJid = this.options.getScoopJid();
     const message: LeaderToFollowerMessage = { type: 'agent_event', event, scoopJid };
-    for (const follower of this.followers.values()) {
-      follower.sync.send(message);
-    }
+    this.broadcastToAllFollowers(message);
   }
 
   /**
    * Broadcast a user message to all connected followers.
    * Called when any user message enters the leader (local or from a follower).
+   *
+   * Attachments are scrubbed of leader-local VFS paths via
+   * `stripLocalPathsForRemote` before going on the wire. The follower-
+   * originated path already scrubs in `handleFollowerMessage` (defense
+   * in depth — that scrub stays), so the second pass here is idempotent.
+   * The leader-originated path (the panel chat `setOnLocalUserMessage`
+   * hook) was the gap: leader paths like
+   * `/tmp/attachment-<stamp>-<seq>-<rand>-<name>` (the off-load shape
+   * produced by `attachment-vfs.ts:makeAttachmentPath`) would have
+   * shipped raw to every follower, where they're meaningless.
    */
   broadcastUserMessage(text: string, messageId: string, attachments?: MessageAttachment[]): void {
     if (this.followers.size === 0) return;
     const scoopJid = this.options.getScoopJid();
+    const safeAttachments = attachments?.length
+      ? stripLocalPathsForRemote(attachments)
+      : attachments;
     const message: LeaderToFollowerMessage = {
       type: 'user_message_echo',
       text,
       messageId,
       scoopJid,
-      attachments,
+      attachments: safeAttachments,
     };
-    for (const follower of this.followers.values()) {
-      follower.sync.send(message);
-    }
+    this.broadcastToAllFollowers(message);
   }
 
   /**
@@ -277,9 +340,7 @@ export class LeaderSyncManager {
   broadcastStatus(status: string): void {
     if (this.followers.size === 0) return;
     const message: LeaderToFollowerMessage = { type: 'status', scoopStatus: status };
-    for (const follower of this.followers.values()) {
-      follower.sync.send(message);
-    }
+    this.broadcastToAllFollowers(message);
   }
 
   /**
@@ -379,9 +440,7 @@ export class LeaderSyncManager {
     }
     const activeScoopJid = this.options.getScoopJid();
     const message: LeaderToFollowerMessage = { type: 'scoops.list', scoops, activeScoopJid };
-    for (const follower of this.followers.values()) {
-      follower.sync.send(message);
-    }
+    this.broadcastToAllFollowers(message);
   }
 
   /**
@@ -402,9 +461,7 @@ export class LeaderSyncManager {
       return;
     }
     const message: LeaderToFollowerMessage = { type: 'sprinkles.list', sprinkles };
-    for (const follower of this.followers.values()) {
-      follower.sync.send(message);
-    }
+    this.broadcastToAllFollowers(message);
   }
 
   /**
@@ -419,9 +476,7 @@ export class LeaderSyncManager {
       sprinkleName,
       data,
     };
-    for (const follower of this.followers.values()) {
-      follower.sync.send(message);
-    }
+    this.broadcastToAllFollowers(message);
   }
 
   /** Chunk size for sprinkle content responses. Mirrors snapshot chunking. */
@@ -681,9 +736,7 @@ export class LeaderSyncManager {
     if (this.followers.size === 0) return;
     const entries = this.getConnectedEntries();
     const message: LeaderToFollowerMessage = { type: 'targets.registry', targets: entries };
-    for (const follower of this.followers.values()) {
-      follower.sync.send(message);
-    }
+    this.broadcastToAllFollowers(message);
   }
 
   /**

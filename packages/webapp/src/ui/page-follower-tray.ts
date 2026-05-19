@@ -3,7 +3,8 @@
  * sync follower role.
  *
  * Mirror of {@link startPageLeaderTray} for the joining browser. When the
- * user opens a join URL (or has one stored in `tray-join-storage-key`
+ * user opens a join URL (or has one stored under the
+ * `TRAY_JOIN_STORAGE_KEY` constant — `slicc.trayJoinUrl` — in
  * localStorage), this helper:
  *
  *   1. Starts a `FollowerTrayManager` with automatic reconnect (via
@@ -34,12 +35,16 @@ import { FollowerSyncManager } from '../scoops/tray-follower-sync.js';
 import type { AgentHandle, ChatMessage } from './types.js';
 import type { MessageAttachment } from '../core/attachments.js';
 import type { BrowserAPI } from '../cdp/browser-api.js';
+import type { SprinkleSummary } from '../scoops/tray-sync-protocol.js';
+import type { SprinkleAddOptions } from './sprinkle-manager.js';
+import { SprinkleFollowerController } from './sprinkle-follower-controller.js';
 import { createLogger } from '../core/logger.js';
+import { ThrottledErrorTracker } from '../scoops/throttled-error-tracker.js';
 
 const log = createLogger('page-follower-tray');
 
 export interface StartPageFollowerTrayOptions {
-  /** The leader's join URL (from `tray-join-storage-key` localStorage). */
+  /** The leader's join URL (from the `TRAY_JOIN_STORAGE_KEY` constant — `slicc.trayJoinUrl` — in localStorage). */
   joinUrl: string;
 
   // --- FollowerSyncManager callbacks (forwarded directly) ---
@@ -67,6 +72,31 @@ export interface StartPageFollowerTrayOptions {
 
   // --- BrowserAPI for federated target advertisement ---
   browserAPI: BrowserAPI;
+
+  // --- Sprinkle sync wiring (optional) ---
+  /**
+   * Add a sprinkle panel to the host layout. When omitted, the follower simply
+   * does not surface the leader's sprinkles — chat sync still works fully.
+   * Matches the signature of `SprinkleManagerCallbacks.addSprinkle` so callers
+   * can pass through the same layout callbacks used by the leader's
+   * `SprinkleManager`.
+   */
+  addSprinkle?: (
+    name: string,
+    title: string,
+    element: HTMLElement,
+    zone?: string,
+    options?: SprinkleAddOptions
+  ) => void;
+  /** Remove a sprinkle panel from the host layout. */
+  removeSprinkle?: (name: string) => void;
+  /**
+   * Notified when the leader updates the sprinkle list. The host layout can
+   * use this to update e.g. a sprinkle picker without subscribing to the
+   * follower sync directly. Optional — `SprinkleFollowerController` already
+   * handles open-state mirroring.
+   */
+  onSprinklesList?: (sprinkles: SprinkleSummary[]) => void;
 
   // --- Test hooks ---
   /** @internal Override fetch (defaults to plain `fetch`). */
@@ -107,6 +137,7 @@ export function startPageFollowerTray(
   const refreshIntervalMs = options._refreshIntervalMs ?? 5000;
 
   let activeSync: FollowerSyncManager | null = null;
+  let activeSprinkleController: SprinkleFollowerController | null = null;
   let targetRefreshInterval: ReturnType<typeof setInterval> | null = null;
   let reconnectHandle: FollowerAutoReconnectHandle | null = null;
 
@@ -114,6 +145,10 @@ export function startPageFollowerTray(
     if (targetRefreshInterval) {
       clearInterval(targetRefreshInterval);
       targetRefreshInterval = null;
+    }
+    if (activeSprinkleController) {
+      activeSprinkleController.dispose();
+      activeSprinkleController = null;
     }
     if (!activeSync) return;
     options.browserAPI.setTrayTargetProvider(null);
@@ -124,6 +159,13 @@ export function startPageFollowerTray(
   const wireFollowerSync = (connection: FollowerTrayConnection): void => {
     detachSync();
     const runtimeId = `follower-${connection.bootstrapId}`;
+
+    // The sprinkle controller (if the caller wired sprinkle layout callbacks)
+    // is constructed lazily here so it shares the lifecycle of this sync
+    // instance — a transient WebRTC drop tears it down and a reconnect rebuilds
+    // it against the new channel.
+    let sprinkleController: SprinkleFollowerController | null = null;
+
     const sync = new FollowerSyncManager(connection.channel, {
       browserTransport: options.browserAPI.getTransport(),
       browserAPI: options.browserAPI,
@@ -131,25 +173,55 @@ export function startPageFollowerTray(
       onUserMessage: options.onUserMessage,
       onStatus: options.onStatus,
       onTargetsChanged: () => void refreshTargets(),
+      onSprinklesList: (sprinkles) => {
+        options.onSprinklesList?.(sprinkles);
+        void sprinkleController?.updateAvailable(sprinkles);
+      },
+      onSprinkleUpdate: (name, data) => sprinkleController?.handleSprinkleUpdate(name, data),
       onDisconnect: (reason) => {
         log.warn('Follower sync disconnected', { reason });
         detachSync();
       },
     });
 
+    if (options.addSprinkle && options.removeSprinkle) {
+      sprinkleController = new SprinkleFollowerController({
+        sync,
+        addSprinkle: options.addSprinkle,
+        removeSprinkle: options.removeSprinkle,
+      });
+      activeSprinkleController = sprinkleController;
+    }
+
+    // CDP target listing — throttled error path. Shared with
+    // `page-leader-tray.ts` via `scoops/throttled-error-tracker.ts`;
+    // see that file for the throttle/recovery contract.
+    const cdpThrottle = new ThrottledErrorTracker(log, {
+      failureMessage: 'Follower CDP target listing failed (best-effort, throttled)',
+      recoveryMessage: 'Follower CDP target listing recovered (stable for debounce window)',
+    });
     const refreshTargets = async (): Promise<void> => {
+      let pages: Awaited<ReturnType<typeof options.browserAPI.listPages>>;
       try {
-        const pages = await options.browserAPI.listPages();
-        // A reconnect mid-flight may have swapped `activeSync` — bail in
-        // that case so we don't advertise this connection's runtimeId
-        // against the new sync (or vice versa).
-        if (activeSync !== sync) return;
+        pages = await options.browserAPI.listPages();
+      } catch (err) {
+        cdpThrottle.reportFailure(err);
+        return;
+      }
+      // A reconnect mid-flight may have swapped `activeSync` — bail in
+      // that case so we don't advertise this connection's runtimeId
+      // against the new sync (or vice versa).
+      if (activeSync !== sync) return;
+      cdpThrottle.reportSuccess();
+      try {
         sync.advertiseTargets(
           pages.map((p) => ({ targetId: p.targetId, title: p.title, url: p.url })),
           runtimeId
         );
-      } catch {
-        /* ignore — best-effort target advertisement */
+      } catch (err) {
+        log.error('Follower target advertisement broadcast failed (sync.advertiseTargets threw)', {
+          error: err instanceof Error ? err.message : String(err),
+        });
       }
     };
 

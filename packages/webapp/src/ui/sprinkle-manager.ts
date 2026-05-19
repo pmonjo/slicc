@@ -67,6 +67,25 @@ export interface SprinkleManagerOptions {
    * disruptive.
    */
   autoOpenBehavior?: 'activate' | 'attention';
+  /**
+   * Fired after `sendToSprinkle` pushes data to the local renderer.
+   * The standalone-leader boot path in `ui/main.ts:mainStandaloneWorker`
+   * (after `startPageLeaderTray`) wires this to
+   * `pageLeaderTray.sync.broadcastSprinkleUpdate` so followers receive
+   * the agent's push (`sprinkle.update` over the WebRTC channel).
+   * Without this hook, `sendToSprinkle` updates only the leader's local
+   * renderer — followers see the static initial content but never the
+   * live state changes the agent pushes, and the only way to recover
+   * is a manual snapshot refresh.
+   *
+   * Fires only when the named sprinkle is currently open locally;
+   * skipped for closed sprinkles (matches the local-render behavior
+   * — there's nothing to update on the leader side either).
+   *
+   * Hook exceptions are caught and logged — a broken broadcaster
+   * must not skip the local renderer push or break the sprinkle.
+   */
+  onSendToSprinkle?: (name: string, data: unknown) => void;
 }
 
 /**
@@ -109,6 +128,7 @@ export class SprinkleManager {
   private inflightRefresh: Promise<void> | null = null;
   private lastRefreshAt = 0;
   private autoOpenBehavior: 'activate' | 'attention';
+  private onSendToSprinkle?: (name: string, data: unknown) => void;
 
   constructor(
     fs: VirtualFS,
@@ -121,6 +141,39 @@ export class SprinkleManager {
     this.bridge = new SprinkleBridge(fs, lickHandler, (name) => this.close(name), stopConeHandler);
     this.callbacks = callbacks;
     this.autoOpenBehavior = options.autoOpenBehavior ?? 'activate';
+    this.onSendToSprinkle = options.onSendToSprinkle;
+  }
+
+  /**
+   * Replace the leader-broadcast hook after construction. Used by the
+   * standalone-leader boot path in `ui/main.ts`: `SprinkleManager` is
+   * built unconditionally early in `mainStandaloneWorker`, while
+   * `startPageLeaderTray` runs later inside the `storedWorkerBaseUrl`
+   * branch and reads `sprinkleManager`-backed callbacks (`getSprinkles`,
+   * `readSprinkleContent`) into its options. The manager therefore
+   * has to exist first, but the hook back into the tray's sync can
+   * only be installed once `pageLeaderTray.sync` is available.
+   * Calling this with `undefined` detaches the hook — currently invoked
+   * by the `slicc:tray-join` listener in `ui/main.ts` when the standalone
+   * runtime switches from leader to follower mode. (`host reset` does
+   * NOT detach: it calls `pageLeaderTray.reset()` which keeps the same
+   * `sync` instance alive so the hook stays functional.)
+   */
+  setSendToSprinkleHook(hook: ((name: string, data: unknown) => void) | undefined): void {
+    if (this.onSendToSprinkle && !hook) {
+      // Audit a defined → undefined transition at `error` level —
+      // prod log gate is ERROR, so `info` would be suppressed
+      // exactly when operators need this signal. In-flight
+      // `sendToSprinkle` calls between this detach and the next attach
+      // (e.g. mid-transition from leader to follower mode) silently
+      // drop the broadcast half — leader-local rendering still works,
+      // but followers never see the update. Mode switches are
+      // user-driven and rare, so error-level isn't noisy; QA reports
+      // "sprinkle blank on follower after mode switch" map cleanly to
+      // this entry.
+      log.error('SprinkleManager broadcast hook detached');
+    }
+    this.onSendToSprinkle = hook;
   }
 
   /** Restore sprinkles that were open in the previous session.
@@ -448,5 +501,24 @@ export class SprinkleManager {
     // In extension mode, listeners are inside the sandbox iframe.
     // Forward via the renderer's postMessage channel.
     entry.renderer.pushUpdate(data);
+    // Notify the broadcast hook (wired by `ui/main.ts`'s standalone-
+    // leader boot path to `pageLeaderTray.sync.broadcastSprinkleUpdate`)
+    // so followers receive the same payload as a `sprinkle.update` over
+    // the WebRTC channel. Hook exceptions are swallowed — a broken
+    // broadcaster must not skip or undo the local pushes above.
+    if (this.onSendToSprinkle) {
+      try {
+        this.onSendToSprinkle(name, data);
+      } catch (err) {
+        // `error` not `warn` — prod default log level is ERROR. A
+        // broken broadcaster here would silently drop the agent's
+        // sprinkle push for every connected follower with no log
+        // signal.
+        log.error('onSendToSprinkle hook threw', {
+          name,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
   }
 }

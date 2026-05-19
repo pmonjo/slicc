@@ -40,6 +40,85 @@ function isExtensionRuntime(): boolean {
   return typeof chrome !== 'undefined' && !!chrome?.runtime?.id;
 }
 
+/**
+ * Dispatch the `slicc:tray-join` CustomEvent and wire a one-shot
+ * `slicc:tray-join-failed` listener that surfaces the half-state
+ * failure in the dialog's status element. Returns a cancel function
+ * so the caller can detach the listener proactively if the dialog
+ * closes before the event arrives.
+ *
+ * Each dispatch is stamped with a fresh `requestId` carried in the
+ * `slicc:tray-join` event's `detail` and echoed back on the failure
+ * event — the listener filters by `requestId` so a double-Connect
+ * doesn't bleed errors between attempts. If the user clicks
+ * "Connect" twice rapidly each click has its own correlation id.
+ *
+ * If `statusEl` is detached from the DOM by the time the failure
+ * event arrives, we log at `error` level so the half-state isn't
+ * invisible — the UX swallowing path matters because the next chat
+ * send in a half-state could route to the wrong agent.
+ */
+/** Exposed for unit testing — not part of the public module surface. */
+export function _testOnly_dispatchTrayJoinWithFailureFeedback(
+  joinUrl: string,
+  statusEl: HTMLElement
+): () => void {
+  return dispatchTrayJoinWithFailureFeedback(joinUrl, statusEl);
+}
+
+function dispatchTrayJoinWithFailureFeedback(joinUrl: string, statusEl: HTMLElement): () => void {
+  const requestId = `tray-join-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  let removed = false;
+  let autoCleanupTimer: ReturnType<typeof setTimeout> | undefined;
+  const remove = () => {
+    if (removed) return;
+    removed = true;
+    // Clear the auto-cleanup timer so a proactive cancel() releases
+    // the closure (joinUrl, statusEl, onFailure) instead of pinning
+    // it for up to 10s after the dialog dismisses.
+    if (autoCleanupTimer !== undefined) clearTimeout(autoCleanupTimer);
+    window.removeEventListener('slicc:tray-join-failed', onFailure);
+  };
+  const onFailure = (e: Event) => {
+    const detail = (e as CustomEvent<{ joinUrl: string; error: string; requestId?: string }>)
+      .detail;
+    // Filter by requestId so a double-Connect attempt doesn't receive
+    // the other attempt's failure. Older `slicc:tray-join` dispatchers
+    // (pre-R12) don't echo the requestId — we accept those too (legacy
+    // path) so the listener still works during a rolling upgrade of
+    // the codebase.
+    if (detail.requestId !== undefined && detail.requestId !== requestId) return;
+    remove();
+    if (!statusEl.isConnected) {
+      // Dialog dismissed before the failure event arrived — the user
+      // sees no error UX. Surface to logs at error so the half-state
+      // is at least auditable.
+      log.error('Tray-join failure arrived after dialog dismissed (UX swallowed half-state)', {
+        joinUrl,
+        error: detail.error,
+        requestId,
+      });
+      return;
+    }
+    // Cancel the optimistic dismiss so the user can read the error.
+    const dismissTimerStr = statusEl.dataset.dismissTimer;
+    if (dismissTimerStr) {
+      const dismissTimer = Number(dismissTimerStr);
+      if (Number.isFinite(dismissTimer)) clearTimeout(dismissTimer);
+      delete statusEl.dataset.dismissTimer;
+    }
+    statusEl.textContent = `Sync failed: ${detail.error}. Reload the page and try again.`;
+    statusEl.style.color = 'var(--slicc-cone)';
+  };
+  window.addEventListener('slicc:tray-join-failed', onFailure);
+  // Auto-cleanup the listener after 10s — much longer than the 800ms
+  // optimistic dismiss, but short enough that a stale listener doesn't
+  // outlive the dialog if the user navigates away.
+  autoCleanupTimer = setTimeout(remove, 10_000);
+  window.dispatchEvent(new CustomEvent('slicc:tray-join', { detail: { joinUrl, requestId } }));
+  return remove;
+}
+
 // Storage keys
 const ACCOUNTS_KEY = 'slicc_accounts';
 const MODEL_KEY = 'selected-model';
@@ -1585,21 +1664,22 @@ export function showProviderSettings(options?: ShowProviderSettingsOptions): Pro
           };
           void chrome.runtime.sendMessage({ source: 'panel' as const, payload }).catch(() => {});
         } else {
-          window.dispatchEvent(
-            new CustomEvent('slicc:tray-join', {
-              detail: { joinUrl: stored.joinUrl },
-            })
-          );
+          dispatchTrayJoinWithFailureFeedback(stored.joinUrl, statusEl);
         }
 
         statusEl.textContent = 'Connecting\u2026';
         statusEl.style.display = '';
         statusEl.style.color = 'var(--s2-content-secondary)';
 
-        setTimeout(() => {
+        // 800 ms is fast feedback for the success path; failure
+        // surfaces sooner via `slicc:tray-join-failed` and the
+        // listener inside `dispatchTrayJoinWithFailureFeedback`
+        // cancels this timer.
+        const dismissTimer = setTimeout(() => {
           overlay.remove();
           resolve(false);
         }, 800);
+        statusEl.dataset.dismissTimer = String(dismissTimer);
       });
       dialog.appendChild(joinBtn);
 
@@ -1705,21 +1785,21 @@ export function showProviderSettings(options?: ShowProviderSettingsOptions): Pro
             // Offscreen may not be ready yet; mainExtension will reconnect shortly.
           });
         } else {
-          window.dispatchEvent(
-            new CustomEvent('slicc:tray-join', {
-              detail: { joinUrl: stored.joinUrl },
-            })
-          );
+          dispatchTrayJoinWithFailureFeedback(stored.joinUrl, statusEl);
         }
 
         statusEl.textContent = 'Connecting\u2026';
         statusEl.style.display = '';
         statusEl.style.color = 'var(--s2-content-secondary)';
 
-        setTimeout(() => {
+        // See note above the other dispatch site \u2014 the listener
+        // inside `dispatchTrayJoinWithFailureFeedback` cancels this
+        // timer if a failure event arrives.
+        const dismissTimer = setTimeout(() => {
           overlay.remove();
           resolve(false);
         }, 800);
+        statusEl.dataset.dismissTimer = String(dismissTimer);
       });
       dialog.appendChild(joinBtn);
       dialog.appendChild(statusEl);

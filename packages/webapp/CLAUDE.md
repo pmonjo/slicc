@@ -78,6 +78,15 @@ Deep reference: `docs/kernel/process-model.md`.
 - Active surface is file tools, `bash`, and scoop/nanoclaw helpers.
 - Browser automation is intentionally routed through shell commands rather than a separate tool family.
 
+### Tray Sync (multi-browser leader/follower)
+
+- Path: `packages/webapp/src/scoops/tray-*`, plus page wiring in `packages/webapp/src/ui/page-leader-tray.ts` and `packages/webapp/src/ui/page-follower-tray.ts`.
+- `tray-sync-protocol.ts` is the **canonical wire format**. The iOS follower (`packages/ios-app/SliccFollower/Models/SyncProtocol.swift`) mirrors a **subset** — federated `fs.*` and follower-originated CDP/tab.open are TS-only. iOS DOES respond to leader-initiated `cdp.request` / `tab.open` (and sends back `cdp.response` / `cdp.event` / `tab.opened`). See `docs/architecture.md` "Multi-Browser Sync (Tray) Architecture" for the matrix, and `packages/ios-app/CLAUDE.md` for the 5-step protocol-update checklist.
+- `tray-leader-sync.ts` (`LeaderSyncManager`) — broadcasts agent events, snapshots, scoops list, sprinkle list/content/updates, federated CDP, federated FS; handles inbound requests from followers (snapshot, sprinkle.fetch, sprinkle.lick, scoops.select, CDP/FS routing).
+- `tray-follower-sync.ts` (`FollowerSyncManager`) — TS follower used by **both** the standalone browser follower (`page-follower-tray.ts`) and the extension offscreen follower (`packages/chrome-extension/src/offscreen.ts` `joinUrl` branch). Implements `AgentHandle` so a follower's `ChatPanel.setAgent(sync)` forwards user input to the leader instead of a local orchestrator.
+- The iOS native follower (`packages/ios-app/SliccFollower/`) is a **separate implementation** of the same protocol — it does NOT consume `tray-follower-sync.ts`. Match its behavior when adding follower-side rendering (e.g., sprinkle handling lives in `AppState.handleDataChannelMessage` + `AppState.fetchSprinkleContent` on the Swift side).
+- Sprinkle sync: both the TS browser follower (`SprinkleFollowerController` + `FollowerSyncManager.fetchSprinkleContent`) and the iOS follower (`AppState.fetchSprinkleContent` + `SprinkleWebView`) implement the same chunk-reassemble + waiter-dedup + lick-forward flow. Leader-side wiring lives in `page-leader-tray.ts` (`getSprinkles`, `readSprinkleContent`, `onSprinkleLick`, periodic `broadcastSprinklesList`). The leader pushes `sprinkle.update` payloads when `SprinkleManager.sendToSprinkle(name, data)` runs.
+
 ### Core Agent
 
 - Path: `packages/webapp/src/core/`

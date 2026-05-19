@@ -1413,6 +1413,74 @@ async function mainExtension(app: HTMLElement, options?: { detached?: boolean })
   layout.updateAddButtons();
   await sprinkleManager.restoreOpenSprinkles();
 
+  // ── Follower sprinkle sync (extension follower mode) ───────────────
+  // When the extension acts as a tray follower, the offscreen document hosts
+  // the `FollowerSyncManager` (it has signaling + WebRTC). DOM-bound sprinkle
+  // rendering lives here in the side panel. The panel↔offscreen bridge in
+  // `chrome-extension/src/follower-sprinkle-bridge.ts` carries the
+  // `follower-sprinkles-list` / `follower-sprinkle-update` /
+  // `follower-sprinkle-fetch` / `follower-sprinkle-fetch-result` /
+  // `follower-sprinkle-lick` runtime envelopes between them (these wrap the
+  // leader-facing wire messages `sprinkles.list` / `sprinkle.update` /
+  // `sprinkle.content` / `sprinkle.fetch` / `sprinkle.lick`, which only the
+  // offscreen sees on the WebRTC channel). The controller shares layout
+  // callbacks with the local `SprinkleManager` above — leader-pushed
+  // sprinkles surface in the same rail as local ones. If the offscreen is
+  // not in follower mode, no `follower-sprinkles-list` envelopes arrive
+  // and the controller stays idle; pending fetches reject via the proxy's
+  // bounded `DEFAULT_FETCH_TIMEOUT_MS` so the controller doesn't pin the
+  // `opening` set forever.
+  const { PanelFollowerSprinkleProxy } =
+    await import('../../../chrome-extension/src/follower-sprinkle-bridge.js');
+  const { SprinkleFollowerController } = await import('./sprinkle-follower-controller.js');
+  const followerSprinkleSender = {
+    send(envelope: { source: 'panel'; payload: unknown }): void {
+      chrome.runtime.sendMessage(envelope).catch((err: unknown) => {
+        // "Receiving end does not exist" is expected when no offscreen is
+        // awake (or the extension is not in follower mode). The proxy's
+        // bounded fetch timeout will surface the failure to the controller.
+        // Anything else (extension context invalidated, message size
+        // exceeded, non-cloneable payloads) is logged so the failure is
+        // observable in DevTools.
+        const msg = err instanceof Error ? err.message : String(err);
+        if (/receiving end does not exist/i.test(msg)) return;
+        // `error` not `warn` — prod default log level is ERROR. The
+        // documented failure modes are all real bugs requiring
+        // investigation.
+        log.error('Panel → offscreen sendMessage failed', { error: msg });
+      });
+    },
+  };
+  const followerSprinkleSubscriber = {
+    onMessage(handler: (envelope: { source: string; payload: unknown }) => void): () => void {
+      const listener = (msg: unknown): boolean => {
+        if (!msg || typeof msg !== 'object' || !('source' in msg) || !('payload' in msg)) {
+          return false;
+        }
+        handler(msg as { source: string; payload: unknown });
+        return false;
+      };
+      chrome.runtime.onMessage.addListener(listener);
+      return () => chrome.runtime.onMessage.removeListener(listener);
+    },
+  };
+  let followerSprinkleController: InstanceType<typeof SprinkleFollowerController> | null = null;
+  const followerSprinkleProxy = new PanelFollowerSprinkleProxy(
+    followerSprinkleSender,
+    followerSprinkleSubscriber,
+    {
+      onSprinklesList: (sprinkles) => void followerSprinkleController?.updateAvailable(sprinkles),
+      onSprinkleUpdate: (name, data) =>
+        followerSprinkleController?.handleSprinkleUpdate(name, data),
+    }
+  );
+  followerSprinkleController = new SprinkleFollowerController({
+    sync: followerSprinkleProxy,
+    addSprinkle: (name, title, element, zone, opts) =>
+      layout.addSprinkle(name, title, element, zone as 'primary' | 'drawer' | undefined, opts),
+    removeSprinkle: (name) => layout.removeSprinkle(name),
+  });
+
   // Auto-surface newly-added .shtml files in the rail. The panel's
   // `localFs` doesn't have the orchestrator's watcher (that lives in
   // offscreen), so attach a fresh one to catch panel-side writes
@@ -2328,6 +2396,23 @@ async function mainStandaloneWorker(app: HTMLElement, isElectronOverlay: boolean
         onStatus: (status) => layout.panels.chat.setProcessing(status === 'processing'),
         setChatAgent: (agent) => layout.panels.chat.setAgent(agent),
         browserAPI: browser,
+        // Follower-side sprinkle rendering: the leader broadcasts `sprinkles.list`,
+        // and the `SprinkleFollowerController` (inside `startPageFollowerTray`)
+        // mirrors the open-state by fetching `.shtml` content over the data
+        // channel and rendering through the same layout callbacks the local
+        // `SprinkleManager` uses for its own local sprinkles. Name collisions
+        // with locally-discovered sprinkles are possible but rare — the
+        // follower is typically running against an empty/disconnected VFS for
+        // sprinkle discovery purposes.
+        addSprinkle: (name, title, element, zone, options) =>
+          layout.addSprinkle(
+            name,
+            title,
+            element,
+            zone as 'primary' | 'drawer' | undefined,
+            options
+          ),
+        removeSprinkle: (name) => layout.removeSprinkle(name),
       });
     } else if (storedWorkerBaseUrl) {
       pageLeaderTray = startPageLeaderTray({
@@ -2368,6 +2453,13 @@ async function mainStandaloneWorker(app: HTMLElement, isElectronOverlay: boolean
         onFollowerMessage: (text, messageId, attachments) => {
           layout.panels.chat.addUserMessage(text, attachments);
           agentHandle.sendMessage(text, messageId, attachments);
+          // Re-broadcast so OTHER connected followers also see this
+          // follower's message. The originating follower dedupes its
+          // own echo via `sentMessageIds` in `FollowerSyncManager`, so
+          // no double-display. Without this, multi-follower setups
+          // were silently single-direction: only the sender and the
+          // leader saw a follower's message; sibling followers didn't.
+          pageLeaderTray?.sync.broadcastUserMessage(text, messageId, attachments);
         },
         onFollowerAbort: () => agentHandle.stop(),
         onFollowerCountChanged: (_count) => {
@@ -2389,8 +2481,25 @@ async function mainStandaloneWorker(app: HTMLElement, isElectronOverlay: boolean
         browserTransport: realCdpTransport,
         vfs: localFs,
       });
-      layout.panels.chat.setLeaderBroadcast((text, id, att) =>
-        pageLeaderTray?.sync.broadcastUserMessage(text, id, att)
+      // Forward agent → sprinkle pushes over the WebRTC wire. Without
+      // this hook, `SprinkleManager.sendToSprinkle` (called by the welcome
+      // sprinkle flow, the `sprinkle` shell command, and any agent
+      // pushing data via the bridge) updates only the leader's local
+      // renderer — followers see the static initial content but never
+      // the live updates. iOS has the same expectation: its
+      // `AppState.sprinkleUpdates[name]` map is populated by
+      // `sprinkle.update` envelopes that this broadcaster emits.
+      sprinkleManager.setSendToSprinkleHook((name, data) =>
+        pageLeaderTray?.sync.broadcastSprinkleUpdate(name, data)
+      );
+      // Forward the leader's own chat input over the wire as
+      // `user_message_echo`. Without this hook, followers only see the
+      // leader's prompt after a snapshot refresh — agent responses
+      // stream live but the question that triggered them doesn't,
+      // leaving the follower chat looking like the assistant is
+      // talking to itself.
+      layout.panels.chat.setOnLocalUserMessage((text, messageId, attachments) =>
+        pageLeaderTray?.sync.broadcastUserMessage(text, messageId, attachments)
       );
     }
   }
@@ -2430,28 +2539,128 @@ async function mainStandaloneWorker(app: HTMLElement, isElectronOverlay: boolean
   // (The extension path uses chrome.runtime.sendMessage → `refresh-tray-runtime`
   // instead; this is the standalone equivalent.)
   window.addEventListener('slicc:tray-join', (rawEvent: Event) => {
-    const event = rawEvent as CustomEvent<{ joinUrl: string }>;
+    const event = rawEvent as CustomEvent<{ joinUrl: string; requestId?: string }>;
     const joinUrl = event.detail?.joinUrl;
-    if (!joinUrl) return;
+    // Echo the dispatcher's requestId (when present) on any failure
+    // event so the dispatcher's listener can filter — double-Connect
+    // attempts otherwise bleed errors between their respective UX
+    // surfaces. Legacy callers without requestId still work (the
+    // dispatcher's filter accepts undefined).
+    const requestId = event.detail?.requestId;
+    if (!joinUrl) {
+      // `error`, not `warn` — the only emitters are SLICC's own UI
+      // surfaces, so a missing `joinUrl` is a dispatcher contract
+      // violation. Prod log level is ERROR, so anything less is
+      // suppressed and the bug goes invisible.
+      log.error('slicc:tray-join fired without joinUrl — UI dispatcher contract violation');
+      return;
+    }
 
-    pageLeaderTray?.stop();
+    // Null the leader ref BEFORE calling `.stop()` so any reentrant
+    // code path triggered during teardown (cached getter consumers
+    // like `getConnectedFollowers`, microtasks already scheduled
+    // against the leader's sync, follower-stop side-effects) sees the
+    // post-teardown state rather than a still-pointed-but-destroying
+    // leader. Each `.stop()` and `startPageFollowerTray` then gets
+    // its own try block so a throw at one step doesn't skip the
+    // teardown of later steps.
+    const leaderToStop = pageLeaderTray;
     pageLeaderTray = null;
     setConnectedFollowersGetter(null);
     setTrayResetter(null);
-    layout.panels.chat.setLeaderBroadcast(null);
-
-    pageFollowerTray?.stop();
+    layout.panels.chat.setOnLocalUserMessage(undefined);
+    sprinkleManager.setSendToSprinkleHook(undefined);
+    const previousFollower = pageFollowerTray;
     pageFollowerTray = null;
 
-    pageFollowerTray = startPageFollowerTray({
-      joinUrl,
-      onSnapshot: (messages) => layout.panels.chat.loadMessages(messages),
-      onUserMessage: (text, _messageId, _scoopJid, attachments) =>
-        layout.panels.chat.addUserMessage(text, attachments),
-      onStatus: (status) => layout.panels.chat.setProcessing(status === 'processing'),
-      setChatAgent: (agent) => layout.panels.chat.setAgent(agent),
-      browserAPI: browser,
-    });
+    try {
+      leaderToStop?.stop();
+    } catch (err) {
+      // `error`, not `warn` — `LeaderTrayHandle.stop()` is not
+      // internally guarded, so a throw mid-sequence (e.g. `sync.stop()`
+      // failing during a follower send) leaves the inner sub-stops
+      // un-run. The user could end up with a zombie WebSocket /
+      // RTCPeerConnection / ping timer. Prod log gate is ERROR so
+      // `warn` would silently absorb this leak.
+      log.error('Leader stop threw during tray-join switch — runtime resources may have leaked', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+    try {
+      previousFollower?.stop();
+    } catch (err) {
+      log.error(
+        'Previous follower stop threw during tray-join switch — runtime resources may have leaked',
+        {
+          error: err instanceof Error ? err.message : String(err),
+        }
+      );
+    }
+
+    try {
+      // Mirror the boot-path follower options exactly — especially
+      // `addSprinkle` / `removeSprinkle`. `startPageFollowerTray`
+      // silently no-ops follower sprinkle rendering when those are
+      // omitted (`page-follower-tray.ts` gates the controller on their
+      // presence), so a hot-join would otherwise give chat sync but
+      // no sprinkle sync until the next page reload.
+      pageFollowerTray = startPageFollowerTray({
+        joinUrl,
+        onSnapshot: (messages) => layout.panels.chat.loadMessages(messages),
+        onUserMessage: (text, _messageId, _scoopJid, attachments) =>
+          layout.panels.chat.addUserMessage(text, attachments),
+        onStatus: (status) => layout.panels.chat.setProcessing(status === 'processing'),
+        setChatAgent: (agent) => layout.panels.chat.setAgent(agent),
+        browserAPI: browser,
+        addSprinkle: (name, title, element, zone, options) =>
+          layout.addSprinkle(
+            name,
+            title,
+            element,
+            zone as 'primary' | 'drawer' | undefined,
+            options
+          ),
+        removeSprinkle: (name) => layout.removeSprinkle(name),
+      });
+    } catch (err) {
+      // Half-state: leader stopped, follower never started, chat agent
+      // not swapped. The next chat send would route to the local cone
+      // instead of the (non-existent) remote leader — possibly leaking
+      // a message intended for the remote runtime. We can't recover
+      // automatically (would have to re-read TRAY_WORKER_STORAGE_KEY
+      // and rebuild the leader, duplicating boot logic), so the user
+      // path is a page reload — but we MUST surface the failure to
+      // UI listeners so the settings dialog (or any other dispatcher)
+      // can render a toast / banner.
+      log.error(
+        'slicc:tray-join handler failed — runtime is in a half-state, page reload required',
+        {
+          joinUrl,
+          error: err instanceof Error ? err.message : String(err),
+        }
+      );
+      try {
+        window.dispatchEvent(
+          new CustomEvent('slicc:tray-join-failed', {
+            detail: {
+              joinUrl,
+              error: err instanceof Error ? err.message : String(err),
+              requestId,
+            },
+          })
+        );
+      } catch (dispatchErr) {
+        // A synchronous listener throw is absorbed by DOM dispatch,
+        // but `new CustomEvent(...)` itself can throw if `detail` is
+        // non-cloneable (theoretical — strings are cloneable today,
+        // but a future refactor that drops an Error object in
+        // `detail` would trip this). Logging here ensures the
+        // original failure is at least recorded.
+        log.error('slicc:tray-join-failed dispatch itself threw', {
+          dispatchError: dispatchErr instanceof Error ? dispatchErr.message : String(dispatchErr),
+        });
+      }
+    }
   });
 
   // Tear down on page unload so the WebSocket and any open data channels

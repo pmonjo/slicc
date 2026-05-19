@@ -218,10 +218,12 @@ export class ChatPanel {
   private keydownListener: ((e: KeyboardEvent) => void) | null = null;
   private messages: ChatMessage[] = [];
   private agent: AgentHandle | null = null;
-  private leaderBroadcast:
-    | ((text: string, messageId: string, attachments?: MessageAttachment[]) => void)
-    | null = null;
   private unsubscribe: (() => void) | null = null;
+  private onLocalUserMessage?: (
+    text: string,
+    messageId: string,
+    attachments?: MessageAttachment[]
+  ) => void;
   private isStreaming = false;
   private currentStreamId: string | null = null;
   private sessionStore: SessionStore;
@@ -343,11 +345,41 @@ export class ChatPanel {
     this.unsubscribe = agent.onEvent((ev) => this.handleAgentEvent(ev));
   }
 
-  /** Register a broadcast hook for when the leader sends their own user message. */
-  setLeaderBroadcast(
-    fn: ((text: string, messageId: string, attachments?: MessageAttachment[]) => void) | null
+  /**
+   * Wire a callback fired after the user submits a local chat message
+   * (alongside the agent handle's `sendMessage`). The standalone-leader
+   * boot path in `ui/main.ts:mainStandaloneWorker` (after `startPageLeaderTray`)
+   * wires this to `pageLeaderTray.sync.broadcastUserMessage` so connected
+   * followers see the leader's input live as a `user_message_echo`.
+   * Without it, followers only see the leader's input after a manual
+   * snapshot refresh — agent responses stream live but the prompt that
+   * triggered them doesn't, leaving the follower chat looking like the
+   * assistant is talking to itself.
+   *
+   * Pass `undefined` to detach — currently invoked by the
+   * `slicc:tray-join` listener in `ui/main.ts` when the standalone
+   * runtime switches from leader to follower mode. Hook exceptions
+   * are caught and logged — a broken broadcaster must not skip the
+   * local `agent.sendMessage` path or break the panel.
+   */
+  setOnLocalUserMessage(
+    handler:
+      | ((text: string, messageId: string, attachments?: MessageAttachment[]) => void)
+      | undefined
   ): void {
-    this.leaderBroadcast = fn;
+    if (this.onLocalUserMessage && !handler) {
+      // Audit a defined → undefined transition at `error` level —
+      // prod log gate is ERROR, so `info` would be suppressed
+      // exactly when operators need this signal. A leader-to-follower
+      // mode switch detaches this hook before the new follower agent
+      // is wired; chat sends in that window route to the local agent
+      // with no broadcast to followers. The transition is expected on
+      // mode switch but rare (user-initiated), so error-level isn't
+      // noisy in practice; QA reports "follower can't see my chat
+      // after switching modes" map cleanly to this log entry.
+      log.error('ChatPanel onLocalUserMessage hook detached');
+    }
+    this.onLocalUserMessage = handler;
   }
 
   /** Set a callback for terminal output events. */
@@ -1256,7 +1288,24 @@ export class ChatPanel {
 
     // Send to agent (orchestrator persists & queues if the cone is busy)
     this.agent?.sendMessage(text, msg.id, attachments);
-    this.leaderBroadcast?.(text, msg.id, attachments);
+    // Notify the leader-tray broadcast hook so followers receive a
+    // matching `user_message_echo` live. Exception isolation: a broken
+    // broadcaster must not undo the local agent send.
+    if (this.onLocalUserMessage) {
+      try {
+        this.onLocalUserMessage(text, msg.id, attachments.length > 0 ? attachments : undefined);
+      } catch (err) {
+        // `error` not `warn` — prod default log level is ERROR, so
+        // `warn` would silently swallow a broken broadcaster. The
+        // hook is the load-bearing path for follower visibility of
+        // the leader's own messages; a regression here would surface
+        // as "follower can't see what I'm typing" in QA but with no
+        // log to trace it.
+        log.error('onLocalUserMessage hook threw', {
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
   }
 
   private handleAgentEvent(event: AgentEvent): void {

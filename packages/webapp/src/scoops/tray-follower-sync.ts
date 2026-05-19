@@ -19,6 +19,7 @@ import {
   type TrayTargetEntry,
   type TrayFsRequest,
   type TrayFsResponse,
+  type SprinkleSummary,
 } from './tray-sync-protocol.js';
 import { handleFsRequest } from './tray-fs-handler.js';
 import type { VirtualFS } from '../fs/virtual-fs.js';
@@ -61,6 +62,43 @@ export interface FollowerSyncManagerOptions {
   vfs?: VirtualFS;
   /** Called when local browser targets may have changed (e.g. after a tab is opened or closed). */
   onTargetsChanged?: () => void;
+  /** Called when the leader sends an updated sprinkle list. */
+  onSprinklesList?: (sprinkles: SprinkleSummary[]) => void;
+  /** Called when the leader sends a `sprinkle.update` payload (mirrors `SprinkleManager.sendToSprinkle`). */
+  onSprinkleUpdate?: (sprinkleName: string, data: unknown) => void;
+  /**
+   * Bound on every `fetchSprinkleContent` call. If the leader never
+   * answers a `sprinkle.fetch` (deadlocked agent, partial chunked
+   * transfer abandoned, leader still connected but stuck), the
+   * standalone follower would otherwise hang the controller's
+   * `opening` lock forever. Defaults to 15 s — matches
+   * `DEFAULT_FETCH_TIMEOUT_MS` in `follower-sprinkle-bridge.ts`.
+   *
+   * In extension mode, the panel-side `PanelFollowerSprinkleProxy`
+   * also bounds the same call at its own layer (panel → offscreen
+   * round-trip), so BOTH timers fire when the offscreen
+   * `FollowerSyncManager` uses the default. That's intentional
+   * defense-in-depth: whichever fires first cancels via
+   * `cancelSprinkleFetch` (offscreen) or sends
+   * `follower-sprinkle-fetch-cancel` (panel) and the other becomes a
+   * no-op. Pass `0` to disable this timer entirely (the panel proxy
+   * is still active in extension mode), or any positive value to
+   * override the default; non-positive / non-finite inputs throw at
+   * construction.
+   */
+  sprinkleFetchTimeoutMs?: number;
+}
+
+const DEFAULT_SPRINKLE_FETCH_TIMEOUT_MS = 15000;
+
+/** Internal buffer for chunked sprinkle.content reassembly. Mirrors the
+ *  `SprinkleFetchBuffer` Swift struct nested inside the `AppState` class in
+ *  `packages/ios-app/SliccFollower/App/AppState.swift` (declared with the
+ *  `private` access modifier, i.e. type-scoped to `AppState`). */
+interface SprinkleFetchBuffer {
+  sprinkleName: string;
+  chunks: Map<number, string>;
+  totalChunks: number;
 }
 
 /**
@@ -104,10 +142,54 @@ export class FollowerSyncManager implements AgentHandle {
       responses: TrayFsResponse[];
     }
   >();
+  /** Latest sprinkle summaries received from the leader (most-recent `sprinkles.list`). */
+  private latestSprinkles: SprinkleSummary[] = [];
+  /** Cache of resolved sprinkle .shtml content by name. Cleared on explicit invalidate. */
+  private readonly sprinkleContentCache = new Map<string, string>();
+  /** In-flight `sprinkle.fetch` request buffers, keyed by requestId. */
+  private readonly pendingSprinkleFetches = new Map<string, SprinkleFetchBuffer>();
+  /** Map of sprinkleName → requestId for the in-flight fetch (used to dedupe concurrent calls). */
+  private readonly inflightSprinkleByName = new Map<string, string>();
+  /** Waiters awaiting a sprinkle.content reply, keyed by sprinkleName.
+   *  Each waiter carries a fresh `symbol` id so the timeout path can
+   *  identify exactly one entry to splice out without relying on
+   *  reference equality on a closure (which a future refactor that
+   *  wraps `resolve`/`reject` once more would silently break). */
+  private readonly sprinkleContentWaiters = new Map<
+    string,
+    Array<{
+      readonly id: symbol;
+      resolve: (content: string) => void;
+      reject: (err: Error) => void;
+    }>
+  >();
+  /**
+   * Monotonic counter incremented on every `sprinkles.list` arrival.
+   * In-flight fetches are stamped with the current value at issue time;
+   * `handleSprinkleContent` only writes to `sprinkleContentCache` when the
+   * stamp still matches. Closes the cache-write-races-list race
+   * (R3-IMP): if a fetch's content reply lands AFTER a list barrier,
+   * it's content from the pre-barrier world and must not be cached.
+   */
+  private cacheEpoch = 0;
+  /** Per-requestId epoch stamp captured at `fetchSprinkleContent` time. */
+  private readonly fetchEpoch = new Map<string, number>();
   constructor(
     channel: TrayDataChannelLike,
     private readonly options: FollowerSyncManagerOptions = {}
   ) {
+    // Validate the fetch timeout at construction. Without this, a
+    // negative / NaN / Infinity value collapses onto the same code
+    // path as `0` (disabled) because the runtime guard is
+    // `timeoutMs > 0`. Callers expect non-positive to mean either
+    // "use the default" or "disabled"; we treat exactly `0` as the
+    // explicit disable sentinel and reject everything else.
+    const t = options.sprinkleFetchTimeoutMs;
+    if (t !== undefined && (!Number.isFinite(t) || t < 0)) {
+      throw new RangeError(
+        `sprinkleFetchTimeoutMs must be a non-negative finite number (0 disables the timer); got ${t}`
+      );
+    }
     this.sync = createFollowerSyncChannel(channel);
     this.unsubscribe = this.sync.onMessage((message: LeaderToFollowerMessage) => {
       this.handleLeaderMessage(message);
@@ -178,14 +260,55 @@ export class FollowerSyncManager implements AgentHandle {
     return this.latestSnapshot;
   }
 
-  /** Close the sync channel and clean up. */
+  /**
+   * Close the sync channel and clean up. Idempotent — once called, the
+   * channel-close event that follows will short-circuit in
+   * `handleDisconnect`, so a caller-initiated teardown can't trigger
+   * the error-state side effects (red-error follower status, `error`
+   * event emission, `onDisconnect` callback that drives reconnect
+   * logic) that `handleDisconnect` is designed to fire only on an
+   * unexpected channel drop.
+   */
   close(): void {
+    if (this.disconnected) return;
+    this.disconnected = true;
     this.keepalive.stop();
     this.unsubscribe();
     this.sync.close();
     this.eventListeners.clear();
     this.cleanupCDPEventForwarding();
+    this.rejectPendingRequests('Follower sync closed');
     log.info('Follower sync closed');
+  }
+
+  /**
+   * Reject every pending request waiting on the leader and clear the
+   * associated buffers. Called from both `close()` (caller-initiated
+   * shutdown) and `handleDisconnect()` (channel drop / keepalive death).
+   *
+   * Before this method existed, only `sprinkleContentWaiters` got drained
+   * on disconnect — `tabOpenResolvers`, `fsResolvers`, in-flight
+   * `cdpChunkBuffers`, and active `remoteTransports` all leaked. Any
+   * caller awaiting `openRemoteTab()`, `sendFsRequest()`, or a
+   * `RemoteCDPTransport.send()` past a disconnect would hang forever,
+   * because a fresh `FollowerSyncManager` is constructed on reconnect
+   * and the original resolvers never resolve.
+   *
+   * `RemoteCDPTransport.disconnect()` rejects its own pending
+   * request/response promises and clears them, so we don't need to
+   * walk into each transport's internals. (Per-event `once()` waiters
+   * fall back to their individual timeouts; they're not drained here.)
+   */
+  private rejectPendingRequests(reason: string): void {
+    this.rejectPendingSprinkleFetches(reason);
+    const err = new Error(reason);
+    for (const { reject } of this.tabOpenResolvers.values()) reject(err);
+    this.tabOpenResolvers.clear();
+    for (const { reject } of this.fsResolvers.values()) reject(err);
+    this.fsResolvers.clear();
+    this.cdpChunkBuffers.clear();
+    for (const transport of this.remoteTransports.values()) transport.disconnect();
+    this.remoteTransports.clear();
   }
 
   /** Advertise local browser targets to the leader. */
@@ -196,6 +319,139 @@ export class FollowerSyncManager implements AgentHandle {
   /** Get the stored target registry entries from the leader. */
   getTargets(): TrayTargetEntry[] {
     return this.targetEntries;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Sprinkle sync — mirrors `packages/ios-app/SliccFollower/App/AppState.swift`
+  // (refreshSprinkles / fetchSprinkleContent / sendSprinkleLick / chunked
+  // sprinkle.content reassembly + concurrent-fetch dedupe via waiter list).
+  // ---------------------------------------------------------------------------
+
+  /** Latest sprinkle list received from the leader. */
+  getSprinkles(): SprinkleSummary[] {
+    return this.latestSprinkles;
+  }
+
+  /** Ask the leader to re-broadcast the sprinkle list. */
+  refreshSprinkles(): void {
+    this.sync.send({ type: 'sprinkles.refresh' });
+  }
+
+  /**
+   * Fetch the raw .shtml content for a sprinkle. Returns cached content when
+   * available, otherwise sends `sprinkle.fetch` and awaits the reassembled
+   * `sprinkle.content` response. Concurrent calls for the same sprinkle name
+   * share a single inflight request and resolve together.
+   */
+  fetchSprinkleContent(sprinkleName: string): Promise<string> {
+    const cached = this.sprinkleContentCache.get(sprinkleName);
+    if (cached !== undefined) return Promise.resolve(cached);
+
+    const timeoutMs = this.options.sprinkleFetchTimeoutMs ?? DEFAULT_SPRINKLE_FETCH_TIMEOUT_MS;
+
+    return new Promise<string>((resolve, reject) => {
+      // Per-waiter timer — when this fetch's caller times out, only this
+      // waiter rejects; siblings that joined the same in-flight request
+      // keep waiting (or get cancelled together when the LAST waiter
+      // gives up, since `cancelSprinkleFetch` drains them all).
+      const waiterId = Symbol('sprinkle-waiter');
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const wrapResolve = (content: string) => {
+        if (timer !== undefined) clearTimeout(timer);
+        resolve(content);
+      };
+      const wrapReject = (err: Error) => {
+        if (timer !== undefined) clearTimeout(timer);
+        reject(err);
+      };
+
+      const waiters = this.sprinkleContentWaiters.get(sprinkleName) ?? [];
+      waiters.push({ id: waiterId, resolve: wrapResolve, reject: wrapReject });
+      this.sprinkleContentWaiters.set(sprinkleName, waiters);
+
+      if (timeoutMs > 0) {
+        timer = setTimeout(() => {
+          // Drop just this caller's waiter; the in-flight fetch lives
+          // on for the others. If we were the last waiter, cancel the
+          // whole fetch so the three lockstep maps don't leak. The
+          // symbol id (not the closure reference) is what identifies
+          // us — a future refactor that wraps `wrapResolve` once more
+          // would otherwise silently miss the match.
+          const list = this.sprinkleContentWaiters.get(sprinkleName);
+          if (list) {
+            const idx = list.findIndex((w) => w.id === waiterId);
+            if (idx >= 0) list.splice(idx, 1);
+            if (list.length === 0) {
+              this.sprinkleContentWaiters.delete(sprinkleName);
+              this.cancelSprinkleFetch(
+                sprinkleName,
+                `Sprinkle fetch for "${sprinkleName}" timed out after ${timeoutMs}ms`
+              );
+            }
+          }
+          reject(new Error(`Sprinkle fetch for "${sprinkleName}" timed out after ${timeoutMs}ms`));
+        }, timeoutMs);
+      }
+
+      // Only one in-flight request per name. Subsequent calls latch onto the
+      // same waiter list.
+      if (this.inflightSprinkleByName.has(sprinkleName)) return;
+
+      const requestId = `sprinkle-fetch-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      this.inflightSprinkleByName.set(sprinkleName, requestId);
+      this.pendingSprinkleFetches.set(requestId, {
+        sprinkleName,
+        chunks: new Map(),
+        totalChunks: 1,
+      });
+      // Stamp this fetch with the current cache epoch. If the epoch
+      // advances (via a `sprinkles.list` broadcast) before the reply
+      // lands, the cache write at reassembly time will be skipped.
+      this.fetchEpoch.set(requestId, this.cacheEpoch);
+      this.sync.send({ type: 'sprinkle.fetch', requestId, sprinkleName });
+    });
+  }
+
+  /** Forward a sprinkle lick (from a follower-rendered sprinkle) to the leader. */
+  sendSprinkleLick(sprinkleName: string, body: unknown, targetScoop?: string): void {
+    this.sync.send({ type: 'sprinkle.lick', sprinkleName, body, targetScoop });
+  }
+
+  /** Invalidate the cached .shtml content for one sprinkle (or all). */
+  clearSprinkleCache(sprinkleName?: string): void {
+    if (sprinkleName === undefined) this.sprinkleContentCache.clear();
+    else this.sprinkleContentCache.delete(sprinkleName);
+  }
+
+  /**
+   * Cancel any in-flight `sprinkle.fetch` for the named sprinkle. Rejects
+   * all current waiters so callers don't accumulate across retries when
+   * the panel-side proxy gave up on the original fetch (R2-IMP-2).
+   *
+   * Clears the requestId from `pendingSprinkleFetches`, the
+   * `inflightSprinkleByName` lookup, and the `fetchEpoch` stamp — every
+   * site that removes a `pendingSprinkleFetches` entry must keep the
+   * three Maps in lockstep, otherwise an orphan epoch stamp could
+   * mis-classify a future re-used requestId. A late `sprinkle.content`
+   * reply for the cancelled requestId then falls into the
+   * unknown-requestId branch in `handleSprinkleContent` and is silently
+   * dropped — that's what prevents the cache from being poisoned by a
+   * stale post-cancel reply. The next `fetchSprinkleContent(sprinkleName)`
+   * call goes back on the wire cleanly instead of latching onto an
+   * orphan requestId.
+   */
+  cancelSprinkleFetch(sprinkleName: string, reason = 'fetch cancelled'): void {
+    const waiters = this.sprinkleContentWaiters.get(sprinkleName) ?? [];
+    this.sprinkleContentWaiters.delete(sprinkleName);
+    const requestId = this.inflightSprinkleByName.get(sprinkleName);
+    if (requestId !== undefined) {
+      this.inflightSprinkleByName.delete(sprinkleName);
+      this.pendingSprinkleFetches.delete(requestId);
+      this.fetchEpoch.delete(requestId);
+    }
+    if (waiters.length === 0) return;
+    const err = new Error(reason);
+    for (const waiter of waiters) waiter.reject(err);
   }
 
   // ---------------------------------------------------------------------------
@@ -228,6 +484,7 @@ export class FollowerSyncManager implements AgentHandle {
     this.cleanupCDPEventForwarding();
     this.unsubscribe();
     this.sync.close();
+    this.rejectPendingRequests(`Follower sync disconnected: ${reason}`);
 
     // Notify higher-level code for potential reconnection
     this.options.onDisconnect?.(reason);
@@ -341,6 +598,37 @@ export class FollowerSyncManager implements AgentHandle {
         this.routeFsResponse(message.requestId, message.response);
         break;
       }
+      case 'sprinkles.list': {
+        log.info('Sprinkles list received from leader', {
+          sprinkleCount: message.sprinkles.length,
+        });
+        // Treat every list broadcast as a content invalidation barrier.
+        // The leader has no per-file change signal today; broadcasts are
+        // periodic (~5 s default), so a stable `.shtml` re-invalidates
+        // its cache on every tick. This is conservative — the trade-off
+        // is cache effectiveness during steady state in exchange for
+        // never serving stale content to the user when the leader's
+        // file actually changed. Bumping `cacheEpoch` ALSO discards any
+        // in-flight fetch's content reply that arrives AFTER this
+        // barrier — see `handleSprinkleContent`. Without that, a late
+        // pre-barrier reply could poison the cache for the post-barrier
+        // world.
+        this.sprinkleContentCache.clear();
+        this.cacheEpoch++;
+        this.latestSprinkles = message.sprinkles;
+        this.options.onSprinklesList?.(message.sprinkles);
+        break;
+      }
+
+      case 'sprinkle.content':
+        this.handleSprinkleContent(message);
+        break;
+
+      case 'sprinkle.update':
+        log.debug('Sprinkle update received', { sprinkleName: message.sprinkleName });
+        this.options.onSprinkleUpdate?.(message.sprinkleName, message.data);
+        break;
+
       case 'ping': {
         // Leader is pinging us — respond with pong and treat as liveness signal
         this.keepalive.receivePing();
@@ -353,7 +641,143 @@ export class FollowerSyncManager implements AgentHandle {
         setFollowerLastPingTime(Date.now());
         break;
       }
+      default: {
+        // Protocol drift safety net — mirrors the iOS follower's explicit
+        // `.unknown` case (`AppState.swift`). If the leader emits a new
+        // message type that this follower hasn't been updated to handle,
+        // log once and ignore rather than throwing or silently dropping.
+        log.debug('Unknown leader message type', {
+          type: (message as { type?: string }).type,
+        });
+        break;
+      }
     }
+  }
+
+  /**
+   * Reassemble chunked `sprinkle.content` responses and resolve the waiting
+   * fetchers. Mirrors `handleSprinkleContent` in iOS `AppState.swift` — same
+   * chunk-buffer + ordered-join + waiter-resolve flow, plus error rejection.
+   */
+  private handleSprinkleContent(
+    message: LeaderToFollowerMessage & { type: 'sprinkle.content' }
+  ): void {
+    const { requestId, sprinkleName, content, chunkIndex, totalChunks, error } = message;
+
+    if (error) {
+      log.warn('sprinkle.content error from leader', { sprinkleName, error });
+      this.pendingSprinkleFetches.delete(requestId);
+      this.inflightSprinkleByName.delete(sprinkleName);
+      // Mirror the cancel/reject/success paths: every removal from
+      // `pendingSprinkleFetches` must drop the matching `fetchEpoch`
+      // stamp too. Without this, leader-returned errors leak one Map
+      // entry per error for the session lifetime (R4 hygiene fix).
+      this.fetchEpoch.delete(requestId);
+      const waiters = this.sprinkleContentWaiters.get(sprinkleName) ?? [];
+      this.sprinkleContentWaiters.delete(sprinkleName);
+      for (const waiter of waiters) waiter.reject(new Error(error));
+      return;
+    }
+
+    // Both chunked and non-chunked paths require an outstanding fetch — a
+    // delivery for an unknown requestId is either a late post-disconnect
+    // arrival or a misbehaving leader. Drop silently in both cases; the
+    // previous chunked-branch behavior (auto-create a buffer) could let an
+    // unsolicited payload poison `sprinkleContentCache`.
+    if (!this.pendingSprinkleFetches.has(requestId)) {
+      log.debug('Dropping sprinkle.content for unknown requestId', {
+        sprinkleName,
+        requestId,
+      });
+      return;
+    }
+
+    let assembled: string | null = null;
+
+    if (chunkIndex !== undefined && totalChunks !== undefined) {
+      // Reject obviously-malformed chunk indices instead of accepting them
+      // into the buffer (a chunkIndex >= totalChunks would otherwise grow
+      // the buffer beyond the assembly threshold without ever satisfying
+      // the strict equality below).
+      if (chunkIndex < 0 || chunkIndex >= totalChunks) {
+        log.warn('Dropping sprinkle.content with out-of-range chunkIndex', {
+          sprinkleName,
+          chunkIndex,
+          totalChunks,
+        });
+        return;
+      }
+      const buffer = this.pendingSprinkleFetches.get(requestId)!;
+      buffer.totalChunks = totalChunks;
+      // Idempotent against duplicate chunks: only the FIRST delivery for a
+      // given index advances the completion count. A retry race or
+      // misbehaving leader sending two payloads for the same index does
+      // not falsely trigger early assembly.
+      if (!buffer.chunks.has(chunkIndex)) {
+        buffer.chunks.set(chunkIndex, content);
+      } else {
+        log.warn('Dropping duplicate sprinkle.content chunk', {
+          sprinkleName,
+          chunkIndex,
+        });
+      }
+      if (buffer.chunks.size >= totalChunks) {
+        const ordered: string[] = [];
+        for (let i = 0; i < totalChunks; i++) {
+          const chunk = buffer.chunks.get(i);
+          if (chunk === undefined) {
+            log.warn('Chunked sprinkle.content missing chunk after assembly', {
+              sprinkleName,
+              missingIndex: i,
+            });
+            return; // Wait for the missing chunk.
+          }
+          ordered.push(chunk);
+        }
+        assembled = ordered.join('');
+        this.pendingSprinkleFetches.delete(requestId);
+      }
+    } else {
+      // Non-chunked single response — request is known (checked above).
+      assembled = content;
+      this.pendingSprinkleFetches.delete(requestId);
+    }
+
+    if (assembled === null) return;
+
+    // Only cache if the fetch was issued in the current cache epoch — a
+    // `sprinkles.list` arriving mid-fetch advances the epoch and signals
+    // the content is from before the cache barrier. Waiters still get
+    // resolved with the content so the original caller isn't penalised
+    // (they asked for this content; the leader's later list broadcast
+    // can't retroactively unsay it). The NEXT fetch goes back on the
+    // wire instead of returning a stale cache hit.
+    const fetchedEpoch = this.fetchEpoch.get(requestId);
+    this.fetchEpoch.delete(requestId);
+    if (fetchedEpoch === this.cacheEpoch) {
+      this.sprinkleContentCache.set(sprinkleName, assembled);
+    }
+    this.inflightSprinkleByName.delete(sprinkleName);
+    const waiters = this.sprinkleContentWaiters.get(sprinkleName) ?? [];
+    this.sprinkleContentWaiters.delete(sprinkleName);
+    for (const waiter of waiters) waiter.resolve(assembled);
+  }
+
+  /**
+   * Reject every pending sprinkle fetch with the given reason. Also clears
+   * the `fetchEpoch` map — without this, a future fetch with the same
+   * requestId (e.g. across a reconnect with stale clock collisions) could
+   * see a leftover epoch stamp and write stale content to the cache.
+   */
+  private rejectPendingSprinkleFetches(reason: string): void {
+    const err = new Error(reason);
+    for (const [, waiters] of this.sprinkleContentWaiters) {
+      for (const waiter of waiters) waiter.reject(err);
+    }
+    this.sprinkleContentWaiters.clear();
+    this.pendingSprinkleFetches.clear();
+    this.inflightSprinkleByName.clear();
+    this.fetchEpoch.clear();
   }
 
   private emitEvent(event: AgentEvent): void {
@@ -437,7 +861,18 @@ export class FollowerSyncManager implements AgentHandle {
 
     try {
       const result = await transport.send('Target.createTarget', { url, background: true });
-      const targetId = result['targetId'] as string;
+      const targetId = result['targetId'];
+      // Some CDP versions / target denial paths can return without a usable
+      // targetId. Surface a meaningful error instead of forwarding "undefined"
+      // and letting the leader fail later attaching to a junk id.
+      if (typeof targetId !== 'string' || targetId.length === 0) {
+        this.sync.send({
+          type: 'tab.open.error',
+          requestId,
+          error: 'Target.createTarget did not return a usable targetId',
+        });
+        return;
+      }
       this.sync.send({ type: 'tab.opened', requestId, targetId });
       this.options.onTargetsChanged?.();
     } catch (err) {
@@ -579,7 +1014,22 @@ export class FollowerSyncManager implements AgentHandle {
       return;
     }
 
-    const responses = await handleFsRequest(vfs, request);
+    // Mirror the executeLocalCDP / executeLocalTabOpen pattern: any rejection
+    // from `handleFsRequest` (broken VFS, permission error, malformed path)
+    // becomes an `fs.response` with `ok: false` instead of an unhandled async
+    // rejection — otherwise the leader's `fsResolvers` entry would never
+    // resolve, hanging any caller awaiting the response.
+    let responses;
+    try {
+      responses = await handleFsRequest(vfs, request);
+    } catch (err) {
+      this.sync.send({
+        type: 'fs.response',
+        requestId,
+        response: { ok: false, error: err instanceof Error ? err.message : String(err) },
+      });
+      return;
+    }
     for (const response of responses) {
       this.sync.send({ type: 'fs.response', requestId, response });
     }
