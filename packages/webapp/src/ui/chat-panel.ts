@@ -219,6 +219,11 @@ export class ChatPanel {
   private messages: ChatMessage[] = [];
   private agent: AgentHandle | null = null;
   private unsubscribe: (() => void) | null = null;
+  private onLocalUserMessage?: (
+    text: string,
+    messageId: string,
+    attachments?: MessageAttachment[]
+  ) => void;
   private isStreaming = false;
   private currentStreamId: string | null = null;
   private sessionStore: SessionStore;
@@ -338,6 +343,28 @@ export class ChatPanel {
     this.unsubscribe?.();
     this.agent = agent;
     this.unsubscribe = agent.onEvent((ev) => this.handleAgentEvent(ev));
+  }
+
+  /**
+   * Wire a callback fired after the user submits a local chat message
+   * (alongside the agent handle's `sendMessage`). `page-leader-tray.ts`
+   * wires this to `LeaderSyncManager.broadcastUserMessage` so connected
+   * followers see the leader's input live as a `user_message_echo`.
+   * Without it, followers only see the leader's input after a manual
+   * snapshot refresh — agent responses stream live but the prompt that
+   * triggered them doesn't, leaving the follower chat looking like the
+   * assistant is talking to itself.
+   *
+   * Pass `undefined` to detach (e.g. when the leader tray stops).
+   * Hook exceptions are caught and logged — a broken broadcaster must
+   * not skip the local `agent.sendMessage` path or break the panel.
+   */
+  setOnLocalUserMessage(
+    handler:
+      | ((text: string, messageId: string, attachments?: MessageAttachment[]) => void)
+      | undefined
+  ): void {
+    this.onLocalUserMessage = handler;
   }
 
   /** Set a callback for terminal output events. */
@@ -1246,6 +1273,18 @@ export class ChatPanel {
 
     // Send to agent (orchestrator persists & queues if the cone is busy)
     this.agent?.sendMessage(text, msg.id, attachments);
+    // Notify the leader-tray broadcast hook so followers receive a
+    // matching `user_message_echo` live. Exception isolation: a broken
+    // broadcaster must not undo the local agent send.
+    if (this.onLocalUserMessage) {
+      try {
+        this.onLocalUserMessage(text, msg.id, attachments.length > 0 ? attachments : undefined);
+      } catch (err) {
+        log.warn('onLocalUserMessage hook threw', {
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
   }
 
   private handleAgentEvent(event: AgentEvent): void {

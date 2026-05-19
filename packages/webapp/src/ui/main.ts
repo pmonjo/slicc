@@ -2428,6 +2428,13 @@ async function mainStandaloneWorker(app: HTMLElement, isElectronOverlay: boolean
         onFollowerMessage: (text, messageId, attachments) => {
           layout.panels.chat.addUserMessage(text, attachments);
           agentHandle.sendMessage(text, messageId, attachments);
+          // Re-broadcast so OTHER connected followers also see this
+          // follower's message. The originating follower dedupes its
+          // own echo via `sentMessageIds` in `FollowerSyncManager`, so
+          // no double-display. Without this, multi-follower setups
+          // were silently single-direction: only the sender and the
+          // leader saw a follower's message; sibling followers didn't.
+          pageLeaderTray?.sync.broadcastUserMessage(text, messageId, attachments);
         },
         onFollowerAbort: () => agentHandle.stop(),
         sendWebhookEvent: (id, headers, body) => client.sendWebhookEvent(id, headers, body),
@@ -2446,6 +2453,15 @@ async function mainStandaloneWorker(app: HTMLElement, isElectronOverlay: boolean
       // `sprinkle.update` envelopes that this broadcaster emits.
       sprinkleManager.setSendToSprinkleHook((name, data) =>
         pageLeaderTray?.sync.broadcastSprinkleUpdate(name, data)
+      );
+      // Forward the leader's own chat input over the wire as
+      // `user_message_echo`. Without this hook, followers only see the
+      // leader's prompt after a snapshot refresh — agent responses
+      // stream live but the question that triggered them doesn't,
+      // leaving the follower chat looking like the assistant is
+      // talking to itself.
+      layout.panels.chat.setOnLocalUserMessage((text, messageId, attachments) =>
+        pageLeaderTray?.sync.broadcastUserMessage(text, messageId, attachments)
       );
     }
   }
