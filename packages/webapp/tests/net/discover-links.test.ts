@@ -123,3 +123,68 @@ describe('discoverLinks', () => {
     expect(result.catalog).toEqual({ a: 1 });
   });
 });
+
+// Mock the proxied-fetch module before importing the command. The discover
+// command builds its own fetcher via `createProxiedFetch()`; this lets us
+// verify that `--follow` capability fetches route through that proxied
+// fetch (and not through the browser's global `fetch`, which would CORS-
+// block most cross-origin discovery in CLI mode).
+vi.mock('../../src/shell/proxied-fetch.js', () => {
+  const calls: string[] = [];
+  const proxied = vi.fn(async (url: string, _options?: unknown) => {
+    calls.push(url);
+    if (url === 'https://example.com/') {
+      return {
+        status: 200,
+        statusText: 'OK',
+        headers: { link: '</.well-known/api-catalog>; rel="api-catalog"' },
+        body: '<html></html>',
+      };
+    }
+    if (url === 'https://example.com/.well-known/api-catalog') {
+      return {
+        status: 200,
+        statusText: 'OK',
+        headers: { 'content-type': 'application/linkset+json' },
+        body: '{"linkset":[{"anchor":"/"}]}',
+      };
+    }
+    return { status: 404, statusText: 'Not Found', headers: {}, body: '' };
+  });
+  return {
+    createProxiedFetch: () => proxied,
+    __proxiedFetchSpy: proxied,
+    __proxiedFetchCalls: calls,
+  };
+});
+
+describe('discover --follow proxied fetch routing (issue F)', () => {
+  it('routes both the primary and follow-up capability fetches through createProxiedFetch', async () => {
+    const proxiedModule = (await import('../../src/shell/proxied-fetch.js')) as unknown as {
+      __proxiedFetchSpy: ReturnType<typeof vi.fn>;
+      __proxiedFetchCalls: string[];
+    };
+    const { createDiscoverCommand } =
+      await import('../../src/shell/supplemental-commands/discover-command.js');
+
+    proxiedModule.__proxiedFetchSpy.mockClear();
+    proxiedModule.__proxiedFetchCalls.length = 0;
+
+    const cmd = createDiscoverCommand();
+    const result = await cmd.execute(['--follow', 'https://example.com/'], {
+      fs: {} as never,
+      cwd: '/',
+      env: new Map<string, string>(),
+      stdin: '',
+    });
+
+    expect(result.exitCode).toBe(0);
+    expect(proxiedModule.__proxiedFetchCalls).toContain('https://example.com/');
+    expect(proxiedModule.__proxiedFetchCalls).toContain(
+      'https://example.com/.well-known/api-catalog'
+    );
+    // The follow-up fetch went through the SAME proxied-fetch — never the
+    // global fetch. Two calls total: primary + one capability rel.
+    expect(proxiedModule.__proxiedFetchSpy).toHaveBeenCalledTimes(2);
+  });
+});

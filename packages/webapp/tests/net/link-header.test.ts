@@ -68,6 +68,16 @@ describe('parseLinkHeader — multi value', () => {
     const links = parseLinkHeader('</a>; rel="next"\n</b>; rel="prev"');
     expect(links).toHaveLength(2);
   });
+
+  it('normalizes `\\n` joiners inside array elements (CDP bag passthrough)', () => {
+    // The CDP/webRequest adapters preserve newline-joined values per element;
+    // previously only top-level string inputs were normalized, so a single
+    // array element carrying `\n`-joined Link instances silently dropped all
+    // but the first.
+    const links = parseLinkHeader(['</a>; rel="next"\n</b>; rel="prev"', '</c>; rel="last"']);
+    expect(links).toHaveLength(3);
+    expect(links.map((l) => l.href)).toEqual(['/a', '/b', '/c']);
+  });
 });
 
 describe('parseLinkHeader — RFC 8187 ext-value', () => {

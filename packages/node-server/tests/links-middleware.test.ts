@@ -75,6 +75,31 @@ describe('sliccLinksMiddleware', () => {
     expect(response.status).toBe(200);
     expect(response.headers.get('link')).toBeNull();
   });
+
+  it('bails out when an upstream middleware has already sent headers', async () => {
+    // Drive the middleware directly with a stub Response whose `headersSent`
+    // is already true — the middleware must call `next()` without touching
+    // the headers, matching the documented "skips when upstream wrote
+    // headers" contract.
+    const middleware = sliccLinksMiddleware();
+    const appended: Array<[string, string]> = [];
+    const req = {
+      path: '/api/runtime-config',
+      headers: { host: 'localhost:5710' },
+    } as unknown as Parameters<typeof middleware>[0];
+    const res = {
+      headersSent: true,
+      append: (name: string, value: string) => {
+        appended.push([name, value]);
+      },
+    } as unknown as Parameters<typeof middleware>[1];
+    let nextCalled = false;
+    middleware(req, res, () => {
+      nextCalled = true;
+    });
+    expect(nextCalled).toBe(true);
+    expect(appended).toEqual([]);
+  });
 });
 
 describe('buildLocalApiDescriptor', () => {
