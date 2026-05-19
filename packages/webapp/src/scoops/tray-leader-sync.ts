@@ -240,6 +240,35 @@ export class LeaderSyncManager {
   }
 
   /**
+   * Send a message to every connected follower. Each `follower.sync.send`
+   * is wrapped in its own try/catch so a single dead/closing channel
+   * doesn't abort the iteration and silently strand subsequent
+   * siblings without the message (`RTCDataChannel.send()` throws
+   * `InvalidStateError` for closed/closing channels and
+   * `OperationError` when the SCTP send buffer overflows).
+   *
+   * Logs at `error` level (prod gate is ERROR) with the failing
+   * follower's bootstrapId so an operator can diagnose which channel
+   * is stuck. Does NOT auto-remove the broken follower — keepalive
+   * timeout owns that decision; ripping a follower out mid-broadcast
+   * risks deadlocking the next iteration if it observes a partial
+   * `followers` map.
+   */
+  private broadcastToAllFollowers(message: LeaderToFollowerMessage): void {
+    for (const [bootstrapId, follower] of this.followers) {
+      try {
+        follower.sync.send(message);
+      } catch (err) {
+        log.error('Broadcast send to follower failed (channel may be stuck)', {
+          bootstrapId,
+          messageType: message.type,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+  }
+
+  /**
    * Broadcast an agent event to all connected followers.
    * Called from the orchestrator callback wiring in main.ts.
    */
@@ -247,9 +276,7 @@ export class LeaderSyncManager {
     if (this.followers.size === 0) return;
     const scoopJid = this.options.getScoopJid();
     const message: LeaderToFollowerMessage = { type: 'agent_event', event, scoopJid };
-    for (const follower of this.followers.values()) {
-      follower.sync.send(message);
-    }
+    this.broadcastToAllFollowers(message);
   }
 
   /**
@@ -279,9 +306,7 @@ export class LeaderSyncManager {
       scoopJid,
       attachments: safeAttachments,
     };
-    for (const follower of this.followers.values()) {
-      follower.sync.send(message);
-    }
+    this.broadcastToAllFollowers(message);
   }
 
   /**
@@ -290,9 +315,7 @@ export class LeaderSyncManager {
   broadcastStatus(status: string): void {
     if (this.followers.size === 0) return;
     const message: LeaderToFollowerMessage = { type: 'status', scoopStatus: status };
-    for (const follower of this.followers.values()) {
-      follower.sync.send(message);
-    }
+    this.broadcastToAllFollowers(message);
   }
 
   /**
@@ -392,9 +415,7 @@ export class LeaderSyncManager {
     }
     const activeScoopJid = this.options.getScoopJid();
     const message: LeaderToFollowerMessage = { type: 'scoops.list', scoops, activeScoopJid };
-    for (const follower of this.followers.values()) {
-      follower.sync.send(message);
-    }
+    this.broadcastToAllFollowers(message);
   }
 
   /**
@@ -415,9 +436,7 @@ export class LeaderSyncManager {
       return;
     }
     const message: LeaderToFollowerMessage = { type: 'sprinkles.list', sprinkles };
-    for (const follower of this.followers.values()) {
-      follower.sync.send(message);
-    }
+    this.broadcastToAllFollowers(message);
   }
 
   /**
@@ -432,9 +451,7 @@ export class LeaderSyncManager {
       sprinkleName,
       data,
     };
-    for (const follower of this.followers.values()) {
-      follower.sync.send(message);
-    }
+    this.broadcastToAllFollowers(message);
   }
 
   /** Chunk size for sprinkle content responses. Mirrors snapshot chunking. */
@@ -694,9 +711,7 @@ export class LeaderSyncManager {
     if (this.followers.size === 0) return;
     const entries = this.getConnectedEntries();
     const message: LeaderToFollowerMessage = { type: 'targets.registry', targets: entries };
-    for (const follower of this.followers.values()) {
-      follower.sync.send(message);
-    }
+    this.broadcastToAllFollowers(message);
   }
 
   /**
