@@ -47,6 +47,11 @@ import {
   startFollowerWithAutoReconnect,
 } from '../../../packages/webapp/src/scoops/tray-webrtc.js';
 import { FollowerSyncManager } from '../../../packages/webapp/src/scoops/tray-follower-sync.js';
+import { ThrottledErrorTracker } from '../../../packages/webapp/src/scoops/throttled-error-tracker.js';
+import {
+  connectOffscreenFollowerSprinkleBridge,
+  type OffscreenMessageHub,
+} from './follower-sprinkle-bridge.js';
 import { OffscreenBridge } from './offscreen-bridge.js';
 import { ServiceWorkerLeaderTraySocket } from './tray-socket-proxy.js';
 import { createLogger } from '../../../packages/webapp/src/core/index.js';
@@ -114,6 +119,7 @@ async function init(): Promise<void> {
     bridge,
     callbacks,
     skipConeBootstrap: allowProviderlessTrayJoin,
+    isExtension: true,
     logger: log,
   });
   const { orchestrator, lickManager } = host;
@@ -229,16 +235,21 @@ async function init(): Promise<void> {
     const payload = message.payload as { type?: string };
     if (payload?.type !== 'navigate-lick') return false;
     const navMsg = payload as import('./messages.js').NavigateLickMsg;
+    const body: Record<string, unknown> = {
+      url: navMsg.url,
+      verb: navMsg.verb,
+      target: navMsg.target,
+    };
+    if (navMsg.instruction != null) body.instruction = navMsg.instruction;
+    if (navMsg.branch != null) body.branch = navMsg.branch;
+    if (navMsg.path != null) body.path = navMsg.path;
+    if (navMsg.title != null) body.title = navMsg.title;
     lickManager.emitEvent({
       type: 'navigate',
       navigateUrl: navMsg.url,
       targetScoop: undefined,
       timestamp: new Date().toISOString(),
-      body: {
-        url: navMsg.url,
-        sliccHeader: navMsg.sliccHeader,
-        title: navMsg.title,
-      },
+      body,
     });
     return false;
   });
@@ -268,11 +279,17 @@ async function init(): Promise<void> {
 
     if (trayRuntimeConfig?.joinUrl) {
       let activeSync: FollowerSyncManager | null = null;
+      let activeSprinkleBridge: ReturnType<typeof connectOffscreenFollowerSprinkleBridge> | null =
+        null;
       let targetRefreshInterval: ReturnType<typeof setInterval> | null = null;
       const detachSync = () => {
         if (targetRefreshInterval) {
           clearInterval(targetRefreshInterval);
           targetRefreshInterval = null;
+        }
+        if (activeSprinkleBridge) {
+          activeSprinkleBridge.detach();
+          activeSprinkleBridge = null;
         }
         if (!activeSync) return;
         bridge.setFollowerSync(null);
@@ -291,6 +308,12 @@ async function init(): Promise<void> {
             log.info('Extension follower connected', { trayId: connection.trayId });
             detachSync();
             const runtimeId = `follower-${connection.bootstrapId}`;
+            // Track our sprinkle bridge ahead of time so the FollowerSyncManager
+            // callbacks can forward `sprinkles.list` / `sprinkle.update` to the
+            // panel without a forward declaration. Bind is wrapped in a closure
+            // so a transient bridge swap during reconnect doesn't leak stale
+            // forwards to a previous panel session.
+            let sprinkleBridgeRef: typeof activeSprinkleBridge = null;
             const sync: FollowerSyncManager = new FollowerSyncManager(connection.channel, {
               browserTransport: browser.getTransport(),
               browserAPI: browser,
@@ -299,24 +322,96 @@ async function init(): Promise<void> {
                 bridge.emitFollowerIncomingMessage(messageId, text),
               onStatus: (scoopStatus) => bridge.emitFollowerStatus(scoopStatus),
               onTargetsChanged: () => void refreshTargets(),
+              onSprinklesList: (sprinkles) => sprinkleBridgeRef?.forwardSprinklesList(sprinkles),
+              onSprinkleUpdate: (name, data) =>
+                sprinkleBridgeRef?.forwardSprinkleUpdate(name, data),
               onDisconnect: (reason) => {
                 log.warn('Follower sync disconnected', { reason });
                 detachSync();
               },
             });
+            // Wire panel↔offscreen sprinkle messages: panel `follower-sprinkle-fetch`
+            // / `follower-sprinkle-lick` enter via chrome.runtime.onMessage and are
+            // routed through `sync` (a FollowerSyncManager). Outbound forwards
+            // for `sprinkles.list` / `sprinkle.update` are bound above.
+            const hub: OffscreenMessageHub = {
+              sendToPanel: (envelope) => {
+                chrome.runtime.sendMessage(envelope).catch((err: unknown) => {
+                  // "Could not establish connection. Receiving end does not
+                  // exist" is the expected case (no panel open) — drop it.
+                  // Anything else (extension-context-invalidated, message
+                  // length exceeded, serialization errors on non-cloneable
+                  // payloads) is worth a log so the failure is observable.
+                  const msg = err instanceof Error ? err.message : String(err);
+                  if (/receiving end does not exist/i.test(msg)) return;
+                  // `error` not `warn` — prod default log level is
+                  // ERROR. The documented failure modes are all real
+                  // bugs requiring investigation.
+                  log.error('Offscreen → panel sendMessage failed', { error: msg });
+                });
+              },
+              onPanelMessage: (handler) => {
+                const listener = (msg: unknown): boolean => {
+                  if (
+                    !msg ||
+                    typeof msg !== 'object' ||
+                    !('source' in msg) ||
+                    !('payload' in msg)
+                  ) {
+                    return false;
+                  }
+                  handler(msg as { source: string; payload: unknown });
+                  return false;
+                };
+                chrome.runtime.onMessage.addListener(listener);
+                return () => chrome.runtime.onMessage.removeListener(listener);
+              },
+            };
+            sprinkleBridgeRef = connectOffscreenFollowerSprinkleBridge(hub, {
+              fetchSprinkleContent: (name: string) => sync.fetchSprinkleContent(name),
+              sendSprinkleLick: (name: string, body: unknown, targetScoop?: string) =>
+                sync.sendSprinkleLick(name, body, targetScoop),
+              cancelSprinkleFetch: (name: string, reason?: string) =>
+                sync.cancelSprinkleFetch(name, reason),
+            });
+            activeSprinkleBridge = sprinkleBridgeRef;
+            // Throttle: shared with the standalone follower and leader
+            // via `scoops/throttled-error-tracker.ts`. Without the
+            // shared helper, this site had drifted from R10/R11 fixes
+            // (Date.now instead of performance.now, log.warn instead
+            // of log.error, no recovery signal) — R12 brought it back
+            // into the symmetry the extraction was meant to enforce.
+            const cdpThrottle = new ThrottledErrorTracker(log, {
+              failureMessage:
+                'Offscreen follower CDP target listing failed (best-effort, throttled)',
+              recoveryMessage:
+                'Offscreen follower CDP target listing recovered (stable for debounce window)',
+            });
             const refreshTargets = async () => {
+              let pages: Awaited<ReturnType<typeof browser.listPages>>;
               try {
-                const pages = await browser.listPages();
-                // Bail if a reconnect swapped activeSync while listPages was in
-                // flight — otherwise we'd advertise this connection's runtimeId
-                // against the new sync (or vice versa), polluting the registry.
-                if (activeSync !== sync) return;
+                pages = await browser.listPages();
+              } catch (err) {
+                cdpThrottle.reportFailure(err);
+                return;
+              }
+              // Bail if a reconnect swapped activeSync while listPages was in
+              // flight — otherwise we'd advertise this connection's runtimeId
+              // against the new sync (or vice versa), polluting the registry.
+              if (activeSync !== sync) return;
+              cdpThrottle.reportSuccess();
+              try {
                 sync.advertiseTargets(
                   pages.map((p) => ({ targetId: p.targetId, title: p.title, url: p.url })),
                   runtimeId
                 );
-              } catch {
-                /* ignore — best-effort target advertisement */
+              } catch (err) {
+                log.error(
+                  'Offscreen follower target advertisement broadcast failed (sync.advertiseTargets threw)',
+                  {
+                    error: err instanceof Error ? err.message : String(err),
+                  }
+                );
               }
             };
             sync.onEvent((event) => bridge.emitFollowerAgentEvent(event));

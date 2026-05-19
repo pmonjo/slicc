@@ -262,6 +262,68 @@ describe('startPageLeaderTray', () => {
     expect(capturedHandler).toBeUndefined();
   });
 
+  it('refreshLeaderTargets logs at error level (not warn) exactly once across many quick failures', async () => {
+    // Covers `page-leader-tray.ts`'s integration with
+    // `ThrottledErrorTracker`. Each rejection carries a UNIQUE error
+    // string so the logger's DedupBuffer (60s window, fingerprint-
+    // keyed) does NOT collapse identical messages — that way the
+    // only thing suppressing duplicates is the
+    // `ThrottledErrorTracker.reportFailure` throttle. If a future
+    // cleanup bypasses the tracker, the suppression vanishes and
+    // this test catches it via `errorCalls.length > 1`.
+    //
+    // Uses real timers + a small refresh interval — `vi.fakeTimers`
+    // mixes badly with `vi.waitFor` and the async fetch harness.
+    const { fetchImpl, webSocketFactory, sockets } = makeLeaderFetch();
+    let rejectionCounter = 0;
+    const listPages = vi.fn(() => {
+      rejectionCounter++;
+      return Promise.reject(new Error(`CDP closed attempt-${rejectionCounter}`));
+    });
+    const browserAPI = {
+      setTrayTargetProvider: vi.fn(),
+      listPages,
+    } as unknown as Parameters<typeof startPageLeaderTray>[0]['browserAPI'];
+
+    const baseOpts = makeBaseOptions({ fetchImpl, webSocketFactory, store });
+    const opts = {
+      ...baseOpts,
+      browserAPI,
+      _refreshIntervalMs: 25, // ~40 ticks per second, plenty within a sub-second test window
+    };
+
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const handle = startPageLeaderTray(opts);
+
+      // Wait until listPages has fired at least 5 times (5 intervals = ~125ms).
+      await vi.waitFor(() => expect(listPages.mock.calls.length).toBeGreaterThanOrEqual(5), {
+        timeout: 1000,
+      });
+
+      sockets[0]?.dispatch('open', {});
+
+      // Each rejection had a distinct error message — DedupBuffer
+      // doesn't collapse. So exactly ONE log.error means the
+      // `ThrottledErrorTracker.reportFailure` throttle held against
+      // 5+ rapid failures inside the same 60s window.
+      const errorCalls = errorSpy.mock.calls.filter((args) =>
+        String(args[1] ?? '').includes('Leader CDP target refresh failed')
+      );
+      const warnCalls = warnSpy.mock.calls.filter((args) =>
+        String(args[1] ?? '').includes('Leader CDP target refresh failed')
+      );
+      expect(errorCalls.length).toBe(1);
+      expect(warnCalls.length).toBe(0);
+
+      handle.stop();
+    } finally {
+      errorSpy.mockRestore();
+      warnSpy.mockRestore();
+    }
+  });
+
   it('stop() calls leader.stop(), peers.stop(), and sync.stop()', async () => {
     const { fetchImpl, webSocketFactory, sockets } = makeLeaderFetch();
     const handle = startPageLeaderTray(makeBaseOptions({ fetchImpl, webSocketFactory, store }));

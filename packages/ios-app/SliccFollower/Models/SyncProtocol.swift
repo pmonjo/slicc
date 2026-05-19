@@ -141,8 +141,15 @@ struct TrayTargetEntry: Codable, Hashable {
 
 // MARK: - LeaderToFollowerMessage
 
-/// Mirrors LeaderToFollowerMessage from tray-sync-protocol.ts
-/// (cdp.*, tab.*, fs.*, targets.* variants omitted — not needed for basic follower)
+/// Mirrors a **subset** of `LeaderToFollowerMessage` from tray-sync-protocol.ts.
+/// Implemented here: chat, scoops, sprinkles, control, leader-initiated CDP
+/// (`cdp.request`, `targets.registry`, `tab.open`). TS-only and omitted from
+/// this enum: federated `fs.request`/`fs.response`, plus the leader→follower
+/// reply path for follower-originated requests (`cdp.response`,
+/// `cdp.event`, `tab.opened`, `tab.open.error`) — iOS never originates those
+/// so it has no need to consume the reply. See
+/// `docs/architecture.md` "Multi-Browser Sync (Tray) Architecture" for the
+/// canonical per-message matrix.
 enum LeaderToFollowerMessage: Codable {
     case snapshot(messages: [ChatMessage], scoopJid: String)
     case snapshotChunk(chunkData: String, chunkIndex: Int, totalChunks: Int, scoopJid: String)
@@ -330,8 +337,16 @@ enum LeaderToFollowerMessage: Codable {
 
 // MARK: - FollowerToLeaderMessage
 
-/// Mirrors FollowerToLeaderMessage from tray-sync-protocol.ts
-/// (cdp.*, tab.*, fs.*, targets.* variants omitted — not needed for basic follower)
+/// Mirrors a **subset** of `FollowerToLeaderMessage` from tray-sync-protocol.ts.
+/// Implemented here: chat, scoops/sprinkles, targets advertise, CDP/tab.open
+/// reply path back to the leader (`cdp.response`, `cdp.event`, `tab.opened`,
+/// `tab.openError`). TS-only and omitted: federated `fs.request`/`fs.response`,
+/// and follower-originated `cdp.request`/`tab.open` (iOS only responds to
+/// leader-initiated requests, never originates). The `tab.openError` case is
+/// declared for protocol symmetry but `CDPBridge.handleTabOpen` always sends
+/// `.tabOpened` synchronously after the navigation kickoff — there is no
+/// runtime path that emits `tab.openError`. See `docs/architecture.md`
+/// "Multi-Browser Sync (Tray) Architecture" for the canonical matrix.
 enum FollowerToLeaderMessage: Codable {
     case userMessage(text: String, messageId: String)
     case abort

@@ -12,6 +12,29 @@ import type {
   TerminalEventMsg,
 } from '../../webapp/src/shell/terminal-protocol.js';
 
+/**
+ * Local mirror of `SprinkleSummary` from
+ * `packages/webapp/src/scoops/tray-sync-protocol.ts`. Mirrored (not imported)
+ * because `tray-sync-protocol.ts` has a value import of `logger.ts`, which
+ * depends on the ambient `__DEV__` global. That global is not declared
+ * under the webapp-worker tsconfig (which only lists `["ES2022", "WebWorker"]`
+ * libs + `"types": []`) and the worker tsconfig pulls this file in via
+ * `transport-message-channel.ts`. The `TrayDataChannelLike` reference in
+ * `tray-sync-protocol.ts` is an `import type` and would erase at compile
+ * time — it's not what breaks the webapp-worker build, only the value
+ * import of `createLogger` does. The `follower-sprinkle-bridge` re-imports
+ * the canonical `SprinkleSummary` and uses it across the API boundary;
+ * this inline shape only governs the wire envelope and stays in lockstep
+ * via the compile-time assertion in the bridge.
+ */
+interface SprinkleSummaryEnvelope {
+  name: string;
+  title: string;
+  path: string;
+  open: boolean;
+  autoOpen: boolean;
+}
+
 // ---------------------------------------------------------------------------
 // Side Panel → Offscreen (via service worker relay)
 // ---------------------------------------------------------------------------
@@ -153,6 +176,50 @@ export interface SprinkleLickMsg {
 }
 
 /**
+ * Side panel → offscreen: when the extension is acting as a tray follower,
+ * request the leader's `.shtml` content for a sprinkle (which the offscreen
+ * `FollowerSyncManager` answers via `sprinkle.fetch` → chunked `sprinkle.content`
+ * reassembly). The `id` is generated panel-side and echoed back on
+ * `follower-sprinkle-fetch-result`.
+ *
+ * Intra-extension only — never crosses the WebRTC wire.
+ */
+export interface FollowerSprinkleFetchRequestMsg {
+  type: 'follower-sprinkle-fetch';
+  id: string;
+  sprinkleName: string;
+}
+
+/**
+ * Side panel → offscreen: panel-side proxy timed out on a fetch (default
+ * 15 s); ask the offscreen to drop the corresponding waiter so it doesn't
+ * accumulate across retries. The panel may have already issued a follow-up
+ * fetch for the same sprinkle name (R2-IMP-2: without this, repeated
+ * retries grow `sprinkleContentWaiters` unboundedly while the leader
+ * stays mute).
+ *
+ * Intra-extension only — never crosses the WebRTC wire.
+ */
+export interface FollowerSprinkleFetchCancelMsg {
+  type: 'follower-sprinkle-fetch-cancel';
+  sprinkleName: string;
+}
+
+/**
+ * Side panel → offscreen: in extension follower mode, forward a sprinkle lick
+ * to the leader (`sprinkle.lick` on the wire). Distinct from `sprinkle-lick`,
+ * which would route the lick to a local scoop instead of the remote leader.
+ *
+ * Intra-extension only — never crosses the WebRTC wire.
+ */
+export interface FollowerSprinkleLickMsg {
+  type: 'follower-sprinkle-lick';
+  sprinkleName: string;
+  body: unknown;
+  targetScoop?: string;
+}
+
+/**
  * Webhook event relayed from the page-side LeaderTrayManager into the
  * worker-side LickManager. The page-side leader receives `webhook.event`
  * control messages from the Cloudflare tray and forwards them here so the
@@ -254,6 +321,9 @@ export type PanelToOffscreenMessage =
   | PanelCdpCommandMsg
   | OAuthRequestMsg
   | SprinkleLickMsg
+  | FollowerSprinkleFetchRequestMsg
+  | FollowerSprinkleFetchCancelMsg
+  | FollowerSprinkleLickMsg
   | WebhookEventMsg
   | ReloadSkillsMsg
   | ToolUIActionMsg
@@ -491,15 +561,72 @@ export interface OAuthResultMsg {
 
 /**
  * Service worker → offscreen: a main-frame document response in some tab
- * carried an `x-slicc` header. Emitted by the webRequest observer.
+ * advertised a SLICC handoff `Link` rel. Emitted by the webRequest observer.
  */
 export interface NavigateLickMsg {
   type: 'navigate-lick';
+  /** The URL of the document whose response advertised the handoff. */
   url: string;
-  sliccHeader: string;
+  /** Verb identified by the link's rel: `handoff` (prose) | `upskill` (URL). */
+  verb: 'handoff' | 'upskill';
+  /** Resolved absolute URL of the link target. */
+  target: string;
+  /** Free-form prose instruction (handoff verb). */
+  instruction?: string;
+  /**
+   * Optional branch carried by the upskill rel's `branch` Link param
+   * (upskill verb only — handoff rel never sets these).
+   */
+  branch?: string;
+  /**
+   * Optional sub-path under the upskill repo carried by the `path` Link
+   * param (upskill verb only). Canonical directory form — a trailing
+   * `/SKILL.md` has already been stripped by the extractor.
+   */
+  path?: string;
+  /** Page title at the time of the response, if available. */
   title?: string;
   tabId?: number;
 }
+
+/**
+ * Offscreen → panel: in extension follower mode, the leader has sent a new
+ * sprinkle list. The panel-side `SprinkleFollowerController` reconciles this
+ * against its open set. The `sprinkles` shape mirrors `SprinkleSummary` from
+ * `tray-sync-protocol.ts` — see the `SprinkleSummaryEnvelope` comment at the
+ * top of this file for why it isn't imported directly.
+ *
+ * Intra-extension only — never crosses the WebRTC wire.
+ */
+export interface FollowerSprinklesListMsg {
+  type: 'follower-sprinkles-list';
+  sprinkles: SprinkleSummaryEnvelope[];
+}
+
+/**
+ * Offscreen → panel: in extension follower mode, the leader has pushed a
+ * `sprinkle.update` payload. The panel routes it to the matching open
+ * sprinkle's update listeners.
+ *
+ * Intra-extension only — never crosses the WebRTC wire.
+ */
+export interface FollowerSprinkleUpdateMsg {
+  type: 'follower-sprinkle-update';
+  sprinkleName: string;
+  data: unknown;
+}
+
+/**
+ * Offscreen → panel: result of a `follower-sprinkle-fetch` request. Modeled as
+ * a discriminated success/error union so the type itself enforces the "exactly
+ * one of content/error" invariant — previously a pair of `?` fields could
+ * accidentally allow `{}` or `{ content, error }`. Consumers narrow on `ok`.
+ *
+ * Intra-extension only — never crosses the WebRTC wire.
+ */
+export type FollowerSprinkleFetchResultMsg =
+  | { type: 'follower-sprinkle-fetch-result'; id: string; ok: true; content: string }
+  | { type: 'follower-sprinkle-fetch-result'; id: string; ok: false; error: string };
 
 export type OffscreenToPanelMessage =
   | OffscreenReadyMsg
@@ -516,6 +643,9 @@ export type OffscreenToPanelMessage =
   | OAuthResultMsg
   | TrayRuntimeStatusMsg
   | ClearChatAckMsg
+  | FollowerSprinklesListMsg
+  | FollowerSprinkleUpdateMsg
+  | FollowerSprinkleFetchResultMsg
   // Terminal session events emitted by the worker's `TerminalSessionHost`.
   // Consumed by the panel's `TerminalSessionClient`.
   | TerminalEventMsg;

@@ -78,6 +78,15 @@ Deep reference: `docs/kernel/process-model.md`.
 - Active surface is file tools, `bash`, and scoop/nanoclaw helpers.
 - Browser automation is intentionally routed through shell commands rather than a separate tool family.
 
+### Tray Sync (multi-browser leader/follower)
+
+- Path: `packages/webapp/src/scoops/tray-*`, plus page wiring in `packages/webapp/src/ui/page-leader-tray.ts` and `packages/webapp/src/ui/page-follower-tray.ts`.
+- `tray-sync-protocol.ts` is the **canonical wire format**. The iOS follower (`packages/ios-app/SliccFollower/Models/SyncProtocol.swift`) mirrors a **subset** — federated `fs.*` and follower-originated CDP/tab.open are TS-only. iOS DOES respond to leader-initiated `cdp.request` / `tab.open` (and sends back `cdp.response` / `cdp.event` / `tab.opened`). See `docs/architecture.md` "Multi-Browser Sync (Tray) Architecture" for the matrix, and `packages/ios-app/CLAUDE.md` for the 5-step protocol-update checklist.
+- `tray-leader-sync.ts` (`LeaderSyncManager`) — broadcasts agent events, snapshots, scoops list, sprinkle list/content/updates, federated CDP, federated FS; handles inbound requests from followers (snapshot, sprinkle.fetch, sprinkle.lick, scoops.select, CDP/FS routing).
+- `tray-follower-sync.ts` (`FollowerSyncManager`) — TS follower used by **both** the standalone browser follower (`page-follower-tray.ts`) and the extension offscreen follower (`packages/chrome-extension/src/offscreen.ts` `joinUrl` branch). Implements `AgentHandle` so a follower's `ChatPanel.setAgent(sync)` forwards user input to the leader instead of a local orchestrator.
+- The iOS native follower (`packages/ios-app/SliccFollower/`) is a **separate implementation** of the same protocol — it does NOT consume `tray-follower-sync.ts`. Match its behavior when adding follower-side rendering (e.g., sprinkle handling lives in `AppState.handleDataChannelMessage` + `AppState.fetchSprinkleContent` on the Swift side).
+- Sprinkle sync: both the TS browser follower (`SprinkleFollowerController` + `FollowerSyncManager.fetchSprinkleContent`) and the iOS follower (`AppState.fetchSprinkleContent` + `SprinkleWebView`) implement the same chunk-reassemble + waiter-dedup + lick-forward flow. Leader-side wiring lives in `page-leader-tray.ts` (`getSprinkles`, `readSprinkleContent`, `onSprinkleLick`, periodic `broadcastSprinklesList`). The leader pushes `sprinkle.update` payloads when `SprinkleManager.sendToSprinkle(name, data)` runs.
+
 ### Core Agent
 
 - Path: `packages/webapp/src/core/`
@@ -136,7 +145,7 @@ Deep reference: `docs/kernel/process-model.md`.
 - **Dual-mode compatibility**: browser features must work in both standalone/CLI and extension runtimes.
 - **Model IDs**: use pi-ai aliases such as `claude-opus-4-6`, not dated snapshot names.
 - **Provider composition**: providers are auto-discovered from pi-ai plus `packages/webapp/src/providers/built-in/`; external provider configs live in `packages/webapp/providers/`, and build-time filtering lives in `packages/dev-tools/providers.build.json`.
-- **Adobe `X-Session-Id` invariant**: every LLM call to the Adobe proxy must attach the `X-Session-Id` header (`scoops/scoop-context.ts` wires it for both the agent `streamFn` and compaction `headers`). New LLM call sites — direct `streamSimple` / `completeSimple` callers, or pi-coding-agent helpers like `generateSummary` — must attach it explicitly or the proxy session-id grouping breaks. See `docs/pitfalls.md` for the full contract, tripwire, and verification SQL.
+- **Adobe `X-Session-Id` invariant**: every LLM call to the Adobe proxy must attach the `X-Session-Id` header (`scoops/scoop-context.ts` wires it for both the agent `streamFn` and compaction `headers`). New LLM call sites — direct `streamSimple` / `completeSimple` callers, or pi-coding-agent helpers like `generateSummary` — must attach it explicitly or the proxy session-id grouping breaks. `providers/adobe.ts`'s `ensureSessionIdHeader` is a defense-in-depth net that injects a daily-rotated sentinel UUID and warns when a caller didn't attach one — fix the call site rather than relying on the fallback. See `docs/pitfalls.md` for the full contract, tripwire, and verification SQL.
 
 ## VFS API Patterns
 
@@ -181,9 +190,10 @@ The webapp consumes `@slicc/shared-ts` for secret masking primitives. `createPro
 Provider `oauthTokenDomains` is an immutable safe default; users can layer additional allowed domains per-provider:
 
 - Storage: `localStorage["slicc_oauth_extra_domains"]` → `{[providerId]: [domain, ...]}`
-- Helpers: `getExtraOAuthDomains(id)` / `setExtraOAuthDomains(id, domains)` / `getAllExtraOAuthDomains()` in `provider-settings.ts`
-- Surfaces: panel terminal `oauth-domain` command, extension options page "OAuth domains" tab
+- Helpers: `getExtraOAuthDomains(id)` / `setExtraOAuthDomains(id, domains)` / `getAllExtraOAuthDomains()` (sync, page-only) and `setExtraOAuthDomainsAsync(id, domains)` (worker-safe — routes through `panel-rpc` when no DOM, then mirrors the post-write store into the worker shim so same-session reads stay consistent) in `provider-settings.ts`
+- Surfaces: panel terminal `oauth-domain` command (worker float — uses the async setter), extension options page "OAuth domains" tab (page float — uses the sync helpers directly)
 - Merge: `saveOAuthAccount` concatenates defaults + extras, dedupes case-insensitively (defaults-first order), then pushes the merged list to the fetch-proxy / SW.
+- Worker-side write path: the kernel-worker shim's `localStorage.setItem` is page→worker only (no echo-back). Writes from the worker MUST go via `setExtraOAuthDomainsAsync` / the `oauth-extras-set` panel-rpc op, otherwise they're swallowed by the shim Map and lost on reload — see issue #701.
 
 ### Shell-env masked secret population
 

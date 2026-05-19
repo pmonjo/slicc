@@ -65,6 +65,12 @@ and build the native server: `cd packages/swift-server && swift build`
   Arc, Dia, ChatGPT Atlas, Opera, and Chromium.
 - **Launch Electron app**: Click any Electron app to attach SLICC as a
   side panel overlay. Multiple apps can run simultaneously on separate ports.
+  If the app is already running without a known SLICC debug port, Sliccstart
+  offers to restart it with remote debugging enabled. If a previously launched
+  Electron app exits, Sliccstart clears the stale running state on the next
+  refresh/click so it can be started again. Status dots are refreshed
+  periodically while Sliccstart is open and again whenever Sliccstart regains
+  focus, so quitting an Electron app externally updates the row promptly.
 - **Get extension**: Opens the Chrome Web Store listing to install the
   SLICC extension directly — no Developer Mode required.
 - **Update**: Pulls latest SLICC changes and rebuilds with one click.

@@ -11,12 +11,30 @@
  */
 
 import type { PanelRpcHandlers } from '../kernel/panel-rpc.js';
+import type { LeaderTrayRuntimeStatus } from '../scoops/tray-leader.js';
+import { getAllExtraOAuthDomains, setExtraOAuthDomains } from './provider-settings.js';
+
+/**
+ * Options threaded into the handler factory. Each callback is optional
+ * — the corresponding op rejects with a clear error when the callback
+ * is absent (e.g. tray-reset before the leader tray has booted).
+ */
+export interface StandalonePanelRpcHandlerOptions {
+  /**
+   * Reset the page-side leader tray and return the post-reset status.
+   * Wired by `mainStandaloneWorker` to `pageLeaderTray.reset()` when
+   * a leader is active; left undefined otherwise.
+   */
+  resetTray?: () => Promise<LeaderTrayRuntimeStatus>;
+}
 
 /**
  * Build a record of handlers suitable for `installPanelRpcHandler`.
  * Pure factory so the handler set is easy to test under JSDOM.
  */
-export function createStandalonePanelRpcHandlers(): PanelRpcHandlers {
+export function createStandalonePanelRpcHandlers(
+  options: StandalonePanelRpcHandlerOptions = {}
+): PanelRpcHandlers {
   return {
     'page-info': () => ({
       origin: window.location.origin,
@@ -229,6 +247,27 @@ export function createStandalonePanelRpcHandlers(): PanelRpcHandlers {
         videoinputs: all.filter((d) => d.kind === 'videoinput').map(toInfo),
         audioinputs: all.filter((d) => d.kind === 'audioinput').map(toInfo),
       };
+    },
+
+    'tray-reset': async () => {
+      if (!options.resetTray) {
+        throw new Error('host reset: no active tray session to reset');
+      }
+      return await options.resetTray();
+    },
+
+    'oauth-extras-set': ({ providerId, domains }) => {
+      // Page-side write to real `window.localStorage` for the
+      // `oauth-domain` shell command running in the kernel worker.
+      // `installPageStorageSync` patches `Storage.prototype.setItem`
+      // so this write also fans out to the worker shim — but on a
+      // different channel than the panel-rpc response, with no
+      // ordering guarantee. Returning the full post-write store lets
+      // the worker mirror it into its shim before resolving so a
+      // follow-up `oauth-domain list` in the same session sees the
+      // new value without waiting for the cross-channel forward.
+      setExtraOAuthDomains(providerId, domains);
+      return { storeAfter: getAllExtraOAuthDomains() };
     },
   };
 }

@@ -38,6 +38,9 @@
  * commands run directly there.
  */
 
+import type { OAuthExtraDomainsStore } from '@slicc/shared-ts';
+import type { LeaderTrayRuntimeStatus } from '../scoops/tray-leader.js';
+
 const PANEL_RPC_CHANNEL = 'slicc-panel-rpc';
 const DEFAULT_TIMEOUT_MS = 15_000;
 
@@ -119,7 +122,30 @@ export type PanelRpcRequest =
         warmupMs?: number;
       };
     }
-  | { op: 'enumerate-media-devices'; payload?: undefined };
+  | { op: 'enumerate-media-devices'; payload?: undefined }
+  | {
+      // Reset the page-side multi-browser-sync leader tray. The
+      // tray subsystem lives on the page (DOM, RTCPeerConnections,
+      // sync-manager state), so the worker can't drive
+      // `LeaderTrayManager.reset()` directly — it bridges through
+      // here. Result is the new runtime status after the new session
+      // is established (or an error from the leader's start flow).
+      // Handler throws when no leader tray is active.
+      op: 'tray-reset';
+      payload?: undefined;
+    }
+  | {
+      // Write the user-configured extra-OAuth-domains store for a
+      // single provider. Worker writes can't reach page localStorage
+      // directly (the kernel-worker shim is page→worker only — see
+      // `kernel-worker.ts:installLocalStorageShim`), so the
+      // `oauth-domain` command routes writes through the page handler
+      // which mutates real `localStorage`. Response carries the full
+      // post-write store so the worker can mirror it into its shim
+      // before resolving, avoiding the page→worker forward race.
+      op: 'oauth-extras-set';
+      payload: { providerId: string; domains: string[] };
+    };
 
 export interface PanelRpcResults {
   'page-info': { origin: string; href: string; title: string };
@@ -144,6 +170,8 @@ export interface PanelRpcResults {
     videoinputs: Array<{ deviceId: string; label: string; groupId?: string }>;
     audioinputs: Array<{ deviceId: string; label: string; groupId?: string }>;
   };
+  'tray-reset': LeaderTrayRuntimeStatus;
+  'oauth-extras-set': { storeAfter: OAuthExtraDomainsStore };
 }
 
 export type PanelRpcOp = PanelRpcRequest['op'];

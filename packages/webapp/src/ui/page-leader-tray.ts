@@ -43,6 +43,7 @@ import type { VirtualFS } from '../fs/virtual-fs.js';
 import { buildTrayLaunchUrl } from '../scoops/tray-runtime-config.js';
 import { getLeaderTrayRuntimeStatus, type LeaderTrayRuntimeStatus } from '../scoops/tray-leader.js';
 import { createLogger } from '../core/logger.js';
+import { ThrottledErrorTracker } from '../scoops/throttled-error-tracker.js';
 
 const log = createLogger('page-leader-tray');
 
@@ -225,17 +226,37 @@ export function startPageLeaderTray(options: StartPageLeaderTrayOptions): PageLe
 
   // Browser targets: poll local CDP for the leader's open pages and
   // push them into the sync manager as the leader's local targets.
+  // The throttle is keyed to CDP listing only — broadcast failures
+  // (the second try block below) are their own surface and shouldn't
+  // be conflated with "CDP refresh failed". See
+  // `scoops/throttled-error-tracker.ts` for the full throttle/recovery
+  // contract.
+  const cdpThrottle = new ThrottledErrorTracker(log, {
+    failureMessage: 'Leader CDP target refresh failed (best-effort, throttled)',
+    recoveryMessage: 'Leader CDP target refresh recovered (stable for debounce window)',
+  });
   const refreshLeaderTargets = async () => {
+    let pages: Awaited<ReturnType<typeof options.browserAPI.listPages>>;
     try {
-      const pages = await options.browserAPI.listPages();
+      pages = await options.browserAPI.listPages();
+    } catch (err) {
+      cdpThrottle.reportFailure(err);
+      return;
+    }
+    cdpThrottle.reportSuccess();
+    try {
       const targets: RemoteTargetInfo[] = pages.map((p) => ({
         targetId: p.targetId,
         title: p.title,
         url: p.url,
       }));
       sync.setLocalTargets(targets);
-    } catch {
-      /* ignore — browser may be unavailable transiently */
+    } catch (err) {
+      // Distinct from the CDP-failure path above so the message
+      // doesn't lie. A broadcast error doesn't mean CDP is broken.
+      log.error('Leader target broadcast failed (sync.setLocalTargets threw)', {
+        error: err instanceof Error ? err.message : String(err),
+      });
     }
   };
   intervals.push(setInterval(refreshLeaderTargets, refreshIntervalMs));
@@ -249,7 +270,14 @@ export function startPageLeaderTray(options: StartPageLeaderTrayOptions): PageLe
         sync.broadcastScoopsList();
         sync.broadcastSprinklesList();
       } catch (err) {
-        log.debug('Failed to broadcast follower lists', {
+        // `error`, not `warn` — the prod default log level is ERROR
+        // (`logger.ts`), so `warn` would also be suppressed. The inner
+        // broadcast methods have their own narrow catches around user
+        // callbacks (e.g. `getSprinkles`); anything reaching this outer
+        // catch is unexpected and an `error`-grade signal. Sustained
+        // failures otherwise leave followers staring at stale scoop /
+        // sprinkle lists for the entire session with no log signal.
+        log.error('Failed to broadcast follower lists', {
           error: err instanceof Error ? err.message : String(err),
         });
       }

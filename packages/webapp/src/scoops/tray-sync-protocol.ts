@@ -1,8 +1,24 @@
 /**
- * Typed sync protocol for tray WebRTC data channels.
+ * Typed sync protocol for tray WebRTC data channels — canonical wire format.
  *
- * Leader → Follower: snapshots of chat state + real-time agent events.
- * Follower → Leader: user input + abort requests.
+ * Leader → Follower: chat snapshots (single + chunked), streamed agent events,
+ *   user-message echoes, scoop list, sprinkle list / content / updates,
+ *   federated CDP (request + response + event), federated tab.open and its
+ *   reply pair, federated FS (request + response), liveness (ping/pong/status/error).
+ *
+ * Follower → Leader: user input, abort, snapshot/scoop selection requests,
+ *   sprinkle refresh + content fetch + lick, target advertisement, federated
+ *   CDP (request + response + event), federated tab.open and its reply pair,
+ *   federated FS (request + response), ping/pong.
+ *
+ * The iOS follower (`packages/ios-app/SliccFollower/Models/SyncProtocol.swift`)
+ * mirrors a **subset** of this file: federated `fs.*` in both directions is
+ * TS-only; iOS responds to leader-initiated `cdp.request` / `tab.open` (and
+ * sends back `cdp.response` / `cdp.event` / `tab.opened`) but does NOT
+ * originate either, so the follower-initiated CDP/tab.open paths are also
+ * TS-only. See `docs/architecture.md` "Multi-Browser Sync (Tray) Architecture"
+ * for the exact matrix and `packages/ios-app/CLAUDE.md` for the mirror-update
+ * checklist.
  */
 
 import type { AgentEvent, ChatMessage } from '../ui/types.js';

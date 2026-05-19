@@ -9,7 +9,7 @@ Drag control points on `<canvas>` — live computed output.
 ```shtml
 <canvas id="c"></canvas>
 <div id="output" style="font-family:var(--s2-font-mono);font-size:12px;margin-top:8px"></div>
-<button class="sprinkle-btn sprinkle-btn--primary" onclick="slicc.lick({action:'use-value',value:currentValue})">Use this value</button>
+<button class="sprinkle-btn sprinkle-btn--primary" onclick="slicc.lick({action:'use-value',data:{value:currentValue}})">Use this value</button>
 <script>
   const cv = document.getElementById('c');
   const ctx = cv.getContext('2d');
