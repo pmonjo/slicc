@@ -160,6 +160,15 @@ export class SprinkleManager {
    * `sync` instance alive so the hook stays functional.)
    */
   setSendToSprinkleHook(hook: ((name: string, data: unknown) => void) | undefined): void {
+    if (this.onSendToSprinkle && !hook) {
+      // Audit a defined → undefined transition. In-flight `sendToSprinkle`
+      // calls between this detach and the next attach (e.g. mid-transition
+      // from leader to follower mode) will silently drop the broadcast
+      // half — leader-local rendering still works, but followers never see
+      // the update. Logging the transition gives QA a breadcrumb when
+      // "sprinkle blank on follower after mode switch" reports come in.
+      log.info('SprinkleManager broadcast hook detached');
+    }
     this.onSendToSprinkle = hook;
   }
 
@@ -497,7 +506,11 @@ export class SprinkleManager {
       try {
         this.onSendToSprinkle(name, data);
       } catch (err) {
-        log.warn('onSendToSprinkle hook threw', {
+        // `error` not `warn` — prod default log level is ERROR. A
+        // broken broadcaster here would silently drop the agent's
+        // sprinkle push for every connected follower with no log
+        // signal.
+        log.error('onSendToSprinkle hook threw', {
           name,
           error: err instanceof Error ? err.message : String(err),
         });

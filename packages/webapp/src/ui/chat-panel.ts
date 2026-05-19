@@ -367,6 +367,14 @@ export class ChatPanel {
       | ((text: string, messageId: string, attachments?: MessageAttachment[]) => void)
       | undefined
   ): void {
+    if (this.onLocalUserMessage && !handler) {
+      // Audit a defined → undefined transition. A leader-to-follower
+      // mode switch detaches this hook before the new follower agent
+      // is wired; chat sends in that window route to the local agent
+      // with no broadcast to followers. Logging the transition makes
+      // the silent gap auditable.
+      log.info('ChatPanel onLocalUserMessage hook detached');
+    }
     this.onLocalUserMessage = handler;
   }
 
@@ -1283,7 +1291,13 @@ export class ChatPanel {
       try {
         this.onLocalUserMessage(text, msg.id, attachments.length > 0 ? attachments : undefined);
       } catch (err) {
-        log.warn('onLocalUserMessage hook threw', {
+        // `error` not `warn` — prod default log level is ERROR, so
+        // `warn` would silently swallow a broken broadcaster. The
+        // hook is the load-bearing path for follower visibility of
+        // the leader's own messages; a regression here would surface
+        // as "follower can't see what I'm typing" in QA but with no
+        // log to trace it.
+        log.error('onLocalUserMessage hook threw', {
           error: err instanceof Error ? err.message : String(err),
         });
       }

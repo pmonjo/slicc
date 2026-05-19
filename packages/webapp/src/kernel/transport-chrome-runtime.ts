@@ -58,7 +58,12 @@ export function createOffscreenChromeRuntimeTransport<Out>(): KernelTransport<
           // agent with no diagnostic anywhere.
           const msg = err instanceof Error ? err.message : String(err);
           if (/receiving end does not exist/i.test(msg)) return;
-          log.warn('Offscreen → panel transport send failed', { error: msg });
+          // `error` not `warn` — prod default log level is ERROR. The
+          // documented failure modes (extension-context-invalidated,
+          // message length exceeded, serialization failures) are all
+          // real bugs requiring investigation; suppressing them in
+          // prod leaves the panel quietly out of sync.
+          log.error('Offscreen → panel transport send failed', { error: msg });
         });
     },
   };
