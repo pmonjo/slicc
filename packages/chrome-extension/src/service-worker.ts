@@ -412,9 +412,13 @@ chrome.notifications.onClicked.addListener((notificationId: string) => {
     chrome.sidePanel.open({ windowId }).catch(() => {});
   }
   readStoredDetachedTabId()
-    .then((detachedTabId) => {
+    .then(async (detachedTabId) => {
       if (detachedTabId !== undefined) {
-        chrome.tabs.update(detachedTabId, { active: true }).catch(() => {});
+        const tab = await chrome.tabs.get(detachedTabId);
+        await chrome.tabs.update(detachedTabId, { active: true });
+        if (tab.windowId !== undefined) {
+          await chrome.windows.update(tab.windowId, { focused: true });
+        }
       }
     })
     .catch(() => {});
