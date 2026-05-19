@@ -193,8 +193,10 @@ sprinkle chat '<div class="sprinkle-action-card">
 
 Available as `slicc` in `<script>` tags and `onclick` attributes:
 
-- `slicc.lick(event)` — send a lick event to the cone (cone routes to the right scoop). **Only `action` and `data` survive** the iframe → host postMessage hop; pack any extra payload inside `data: { ... }`. Accepts either a string shortcut (`slicc.lick('cancel')` → `{ action: 'cancel' }`) or `{ action, data? }`. **Do not** put extra fields at the top level — `slicc.lick({ action: 'deploy', env: 'prod' })` silently drops `env`; use `slicc.lick({ action: 'deploy', data: { env: 'prod' } })` instead.
+- `slicc.lick(event)` — send a lick event to the cone (cone routes to the right scoop). Accepts a string shortcut (`slicc.lick('cancel')` → `{ action: 'cancel' }`) or `{ action, data? }`. See payload-shape note below.
 - `slicc.on('update', function(data) {...})` — receive data sent via `sprinkle send`.
+
+> **Payload shape:** the cone reads `event.data` as the payload — top-level extras outside `action` and `data` are silently dropped by the sprinkle bridge. Always use `slicc.lick({ action: 'deploy', data: { env: 'prod' } })`, not `slicc.lick({ action: 'deploy', env: 'prod' })`.
 - `slicc.name` — the sprinkle's name.
 - `slicc.close()` — close the sprinkle.
 - `slicc.stopCone()` — stop the cone agent.

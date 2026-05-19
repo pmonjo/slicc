@@ -14,7 +14,7 @@ allowed-tools: bash
 
 # Dips
 
-Dips are inline `shtml` code blocks in chat that hydrate into sandboxed interactive widgets. **Ephemeral** — no state persistence, no `readFile`. Only `slicc.lick(event)` is available for agent communication; pack payloads as `{ action, data: { ... } }` (extra top-level fields are silently dropped).
+Dips are inline `shtml` code blocks in chat that hydrate into sandboxed interactive widgets. **Ephemeral** — no state persistence, no `readFile`. Only `slicc.lick(event)` is available for agent communication; always pack payloads as `{ action, data: { ... } }` for a predictable shape on the cone side.
 
 **Use them generously.** A dip is the right answer any time a response could benefit from visualization, interaction, or a moment of delight. Don't reserve them for "complex" tasks — a slider that lets the user feel a number, a chart that beats a paragraph of stats, a button that's faster than typing "yes" all earn their keep.
 
@@ -141,9 +141,10 @@ slicc.lick({ action: 'sort-complete', data: { algorithm: algo, comparisons: n } 
 
 > **Payload shape:** `slicc.lick(eventOrAction)` accepts either a plain
 > action string (`slicc.lick('cancel')`) or an `{ action, data? }`
-> object. **Only `action` and `data` survive** the iframe → host
-> postMessage hop — any other top-level fields are silently dropped.
-> Pack all extra fields inside `data: { ... }` so the cone receives
-> them.
+> object. **Always pack extra fields inside `data: { ... }`** — the
+> cone reads `event.data` as the payload, so top-level extras either
+> get dropped (sprinkle bridge) or folded into `data` as the whole
+> event object (dip bridge), neither of which gives the cone a
+> predictable shape. The canonical form works identically in both.
 
 The agent receives the lick as a structured message and can respond with prose, another dip, or spawn a scoop.
