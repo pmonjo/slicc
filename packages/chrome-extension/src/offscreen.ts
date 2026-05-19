@@ -47,6 +47,7 @@ import {
   startFollowerWithAutoReconnect,
 } from '../../../packages/webapp/src/scoops/tray-webrtc.js';
 import { FollowerSyncManager } from '../../../packages/webapp/src/scoops/tray-follower-sync.js';
+import { ThrottledErrorTracker } from '../../../packages/webapp/src/scoops/throttled-error-tracker.js';
 import {
   connectOffscreenFollowerSprinkleBridge,
   type OffscreenMessageHub,
@@ -337,7 +338,10 @@ async function init(): Promise<void> {
                   // payloads) is worth a log so the failure is observable.
                   const msg = err instanceof Error ? err.message : String(err);
                   if (/receiving end does not exist/i.test(msg)) return;
-                  log.warn('Offscreen → panel sendMessage failed', { error: msg });
+                  // `error` not `warn` — prod default log level is
+                  // ERROR. The documented failure modes are all real
+                  // bugs requiring investigation.
+                  log.error('Offscreen → panel sendMessage failed', { error: msg });
                 });
               },
               onPanelMessage: (handler) => {
@@ -365,31 +369,43 @@ async function init(): Promise<void> {
                 sync.cancelSprinkleFetch(name, reason),
             });
             activeSprinkleBridge = sprinkleBridgeRef;
-            // Throttled error logging — matches `page-follower-tray.ts`.
-            // Without this a sustained CDP failure (browser crashed,
-            // permission revoked) silently stops target advertisement for
-            // the entire session. Once-per-minute is enough signal for
-            // DevTools without flooding logs on every 5 s interval.
-            let lastTargetErrorLogAt = 0;
+            // Throttle: shared with the standalone follower and leader
+            // via `scoops/throttled-error-tracker.ts`. Without the
+            // shared helper, this site had drifted from R10/R11 fixes
+            // (Date.now instead of performance.now, log.warn instead
+            // of log.error, no recovery signal) — R12 brought it back
+            // into the symmetry the extraction was meant to enforce.
+            const cdpThrottle = new ThrottledErrorTracker(log, {
+              failureMessage:
+                'Offscreen follower CDP target listing failed (best-effort, throttled)',
+              recoveryMessage:
+                'Offscreen follower CDP target listing recovered (stable for debounce window)',
+            });
             const refreshTargets = async () => {
+              let pages: Awaited<ReturnType<typeof browser.listPages>>;
               try {
-                const pages = await browser.listPages();
-                // Bail if a reconnect swapped activeSync while listPages was in
-                // flight — otherwise we'd advertise this connection's runtimeId
-                // against the new sync (or vice versa), polluting the registry.
-                if (activeSync !== sync) return;
+                pages = await browser.listPages();
+              } catch (err) {
+                cdpThrottle.reportFailure(err);
+                return;
+              }
+              // Bail if a reconnect swapped activeSync while listPages was in
+              // flight — otherwise we'd advertise this connection's runtimeId
+              // against the new sync (or vice versa), polluting the registry.
+              if (activeSync !== sync) return;
+              cdpThrottle.reportSuccess();
+              try {
                 sync.advertiseTargets(
                   pages.map((p) => ({ targetId: p.targetId, title: p.title, url: p.url })),
                   runtimeId
                 );
               } catch (err) {
-                const now = Date.now();
-                if (now - lastTargetErrorLogAt > 60_000) {
-                  lastTargetErrorLogAt = now;
-                  log.warn('Follower target advertisement failed (best-effort)', {
+                log.error(
+                  'Offscreen follower target advertisement broadcast failed (sync.advertiseTargets threw)',
+                  {
                     error: err instanceof Error ? err.message : String(err),
-                  });
-                }
+                  }
+                );
               }
             };
             sync.onEvent((event) => bridge.emitFollowerAgentEvent(event));

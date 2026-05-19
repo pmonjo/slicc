@@ -50,11 +50,34 @@ export class ThrottledErrorTracker {
   private consecutiveSuccesses = 0;
 
   constructor(logger: Logger, opts: ThrottledErrorTrackerOptions) {
+    // Validate at construction so silent suppression bugs (NaN
+    // throttle, float debounce, empty message) surface immediately
+    // rather than only on the first failure. The `-Infinity` initial
+    // state has its own dedicated comment further down because it's
+    // not validatable here.
+    if (!opts.failureMessage.trim()) {
+      throw new RangeError('ThrottledErrorTracker: failureMessage must be non-empty');
+    }
+    if (!opts.recoveryMessage.trim()) {
+      throw new RangeError('ThrottledErrorTracker: recoveryMessage must be non-empty');
+    }
+    const throttleMs = opts.throttleMs ?? 60_000;
+    if (!Number.isFinite(throttleMs) || throttleMs < 0) {
+      throw new RangeError(
+        `ThrottledErrorTracker: throttleMs must be a non-negative finite number, got ${throttleMs}`
+      );
+    }
+    const recoveryDebounceTicks = opts.recoveryDebounceTicks ?? 5;
+    if (!Number.isInteger(recoveryDebounceTicks) || recoveryDebounceTicks < 1) {
+      throw new RangeError(
+        `ThrottledErrorTracker: recoveryDebounceTicks must be a positive integer, got ${recoveryDebounceTicks}`
+      );
+    }
     this.logger = logger;
     this.failureMessage = opts.failureMessage;
     this.recoveryMessage = opts.recoveryMessage;
-    this.throttleMs = opts.throttleMs ?? 60_000;
-    this.recoveryDebounceTicks = opts.recoveryDebounceTicks ?? 5;
+    this.throttleMs = throttleMs;
+    this.recoveryDebounceTicks = recoveryDebounceTicks;
     this.now = opts.now ?? (() => performance.now());
   }
 
@@ -64,10 +87,26 @@ export class ThrottledErrorTracker {
     this.consecutiveSuccesses = 0;
     const now = this.now();
     if (now - this.lastErrorLogAt > this.throttleMs) {
+      // Attempt the log BEFORE committing the throttle counter. If the
+      // logger throws (broken transport, serialization failure, custom
+      // sink assertion), we still advance the counter — otherwise a
+      // tight retry loop would spam attempts — but we also fall back
+      // to `console.error` so the operator has at least one signal of
+      // both the underlying failure AND the logger fault. Without
+      // this, a transient logger problem could cause the throttle to
+      // suppress ALL subsequent failures for 60 s with zero log
+      // evidence the first one happened.
+      try {
+        this.logger.error(this.failureMessage, {
+          error: error instanceof Error ? error.message : String(error),
+        });
+      } catch (logErr) {
+        console.error('[throttled-error-tracker] logger.error threw', logErr, {
+          originalMessage: this.failureMessage,
+          originalError: error instanceof Error ? error.message : String(error),
+        });
+      }
       this.lastErrorLogAt = now;
-      this.logger.error(this.failureMessage, {
-        error: error instanceof Error ? error.message : String(error),
-      });
     }
   }
 
@@ -76,13 +115,24 @@ export class ThrottledErrorTracker {
     if (!this.inFailingState) return;
     this.consecutiveSuccesses++;
     if (this.consecutiveSuccesses >= this.recoveryDebounceTicks) {
+      // Same exception isolation as `reportFailure`: log first, then
+      // commit state. A logger throw on the recovery path would
+      // otherwise leave the tracker in a clean post-recovery state
+      // with the operator never seeing the recovery signal — the
+      // operator's MTTR signal vanishes silently.
+      try {
+        // `error` (not `info`) because the prod log gate is ERROR. The
+        // recovery signal is only useful if it actually reaches the
+        // same operator surface as the failure signal.
+        this.logger.error(this.recoveryMessage, { kind: 'recovery' });
+      } catch (logErr) {
+        console.error('[throttled-error-tracker] logger.error (recovery) threw', logErr, {
+          originalMessage: this.recoveryMessage,
+        });
+      }
       this.inFailingState = false;
       this.consecutiveSuccesses = 0;
       this.lastErrorLogAt = Number.NEGATIVE_INFINITY;
-      // `error` (not `info`) because the prod log gate is ERROR. The
-      // recovery signal is only useful if it actually reaches the
-      // same operator surface as the failure signal.
-      this.logger.error(this.recoveryMessage, { kind: 'recovery' });
     }
   }
 }

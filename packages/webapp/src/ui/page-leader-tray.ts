@@ -226,20 +226,11 @@ export function startPageLeaderTray(options: StartPageLeaderTrayOptions): PageLe
 
   // Browser targets: poll local CDP for the leader's open pages and
   // push them into the sync manager as the leader's local targets.
-  //
-  // Throttled error logging — same shape as `page-follower-tray.ts`'s
-  // `refreshTargets` (60s gate, `error` level so prod log gate
-  // doesn't suppress). Uses `performance.now()` not `Date.now()` so
-  // NTP backward jumps can't cause indefinite suppression. Symmetric
-  // recovery log fires on the first success after a failing streak so
-  // an operator can see MTTR rather than guessing whether silence =
-  // recovery or = suppression.
-  // Throttle: at most one error log per 60 s for sustained CDP
-  // failures, with a recovery signal on the first stable success
-  // window. See `scoops/throttled-error-tracker.ts` for the full
-  // contract. The throttle is keyed to CDP listing only — broadcast
-  // failures (the second try block below) are their own surface and
-  // shouldn't be conflated with "CDP refresh failed".
+  // The throttle is keyed to CDP listing only — broadcast failures
+  // (the second try block below) are their own surface and shouldn't
+  // be conflated with "CDP refresh failed". See
+  // `scoops/throttled-error-tracker.ts` for the full throttle/recovery
+  // contract.
   const cdpThrottle = new ThrottledErrorTracker(log, {
     failureMessage: 'Leader CDP target refresh failed (best-effort, throttled)',
     recoveryMessage: 'Leader CDP target refresh recovered (stable for debounce window)',

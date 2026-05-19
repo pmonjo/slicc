@@ -193,17 +193,9 @@ export function startPageFollowerTray(
       activeSprinkleController = sprinkleController;
     }
 
-    // Throttled error logging — `refreshTargets` runs every 5 s, so a
-    // sustained CDP failure (browser crashed, permission revoked) must not
-    // flood logs. We log at `error` (prod log gate is ERROR by default
-    // so `warn` would be suppressed) at most once per ~minute, with a
-    // symmetric recovery log on first success after a failing streak.
-    // Uses `performance.now()` not `Date.now()` so NTP backward jumps
-    // can't cause indefinite suppression.
-    // Throttle: at most one error log per 60 s for sustained CDP
-    // failures, with a recovery signal on the first stable success
-    // window. Shared with `page-leader-tray.ts` via
-    // `scoops/throttled-error-tracker.ts`.
+    // CDP target listing — throttled error path. Shared with
+    // `page-leader-tray.ts` via `scoops/throttled-error-tracker.ts`;
+    // see that file for the throttle/recovery contract.
     const cdpThrottle = new ThrottledErrorTracker(log, {
       failureMessage: 'Follower CDP target listing failed (best-effort, throttled)',
       recoveryMessage: 'Follower CDP target listing recovered (stable for debounce window)',

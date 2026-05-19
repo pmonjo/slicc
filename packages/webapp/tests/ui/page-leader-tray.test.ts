@@ -263,15 +263,14 @@ describe('startPageLeaderTray', () => {
   });
 
   it('refreshLeaderTargets logs at error level (not warn) exactly once across many quick failures', async () => {
-    // T-1: covers `page-leader-tray.ts`'s `refreshLeaderTargets`
-    // throttle (`lastTargetErrorLogAt`, `performance.now()`).
-    //
-    // Each rejection carries a UNIQUE error string so the logger's
-    // DedupBuffer (60s window, fingerprint-keyed) does NOT collapse
-    // identical messages — that way the only thing suppressing
-    // duplicates is the in-source `lastTargetErrorLogAt` gate. If
-    // a future cleanup removes that gate, the suppression vanishes
-    // and this test catches it via `errorCalls.length > 1`.
+    // Covers `page-leader-tray.ts`'s integration with
+    // `ThrottledErrorTracker`. Each rejection carries a UNIQUE error
+    // string so the logger's DedupBuffer (60s window, fingerprint-
+    // keyed) does NOT collapse identical messages — that way the
+    // only thing suppressing duplicates is the
+    // `ThrottledErrorTracker.reportFailure` throttle. If a future
+    // cleanup bypasses the tracker, the suppression vanishes and
+    // this test catches it via `errorCalls.length > 1`.
     //
     // Uses real timers + a small refresh interval — `vi.fakeTimers`
     // mixes badly with `vi.waitFor` and the async fetch harness.
@@ -307,7 +306,7 @@ describe('startPageLeaderTray', () => {
 
       // Each rejection had a distinct error message — DedupBuffer
       // doesn't collapse. So exactly ONE log.error means the
-      // in-source `lastTargetErrorLogAt > 60_000` gate held against
+      // `ThrottledErrorTracker.reportFailure` throttle held against
       // 5+ rapid failures inside the same 60s window.
       const errorCalls = errorSpy.mock.calls.filter((args) =>
         String(args[1] ?? '').includes('Leader CDP target refresh failed')
