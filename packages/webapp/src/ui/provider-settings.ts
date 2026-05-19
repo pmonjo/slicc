@@ -43,19 +43,58 @@ function isExtensionRuntime(): boolean {
 /**
  * Dispatch the `slicc:tray-join` CustomEvent and wire a one-shot
  * `slicc:tray-join-failed` listener that surfaces the half-state
- * failure in the dialog's status element. The listener self-removes
- * after firing, and a `data-dismiss-timer` attribute on the status
- * element is honored to cancel the optimistic 800ms dialog-dismiss
- * timer set by the caller — so a failure keeps the dialog open with
- * an actionable message instead of dismissing into a silent
- * half-state where the user's next chat message could route to the
- * local cone (per `ui/main.ts:mainStandaloneWorker`'s tray-join
- * handler comments).
+ * failure in the dialog's status element. Returns a cancel function
+ * so the caller can detach the listener proactively if the dialog
+ * closes before the event arrives.
+ *
+ * Each dispatch is stamped with a fresh `requestId` carried in the
+ * `slicc:tray-join` event's `detail` and echoed back on the failure
+ * event — the listener filters by `requestId` so a double-Connect
+ * doesn't bleed errors between attempts. If the user clicks
+ * "Connect" twice rapidly each click has its own correlation id.
+ *
+ * If `statusEl` is detached from the DOM by the time the failure
+ * event arrives, we log at `error` level so the half-state isn't
+ * invisible — the UX swallowing path matters because the next chat
+ * send in a half-state could route to the wrong agent.
  */
-function dispatchTrayJoinWithFailureFeedback(joinUrl: string, statusEl: HTMLElement): void {
-  const onFailure = (e: Event) => {
-    const detail = (e as CustomEvent<{ joinUrl: string; error: string }>).detail;
+/** Exposed for unit testing — not part of the public module surface. */
+export function _testOnly_dispatchTrayJoinWithFailureFeedback(
+  joinUrl: string,
+  statusEl: HTMLElement
+): () => void {
+  return dispatchTrayJoinWithFailureFeedback(joinUrl, statusEl);
+}
+
+function dispatchTrayJoinWithFailureFeedback(joinUrl: string, statusEl: HTMLElement): () => void {
+  const requestId = `tray-join-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  let removed = false;
+  const remove = () => {
+    if (removed) return;
+    removed = true;
     window.removeEventListener('slicc:tray-join-failed', onFailure);
+  };
+  const onFailure = (e: Event) => {
+    const detail = (e as CustomEvent<{ joinUrl: string; error: string; requestId?: string }>)
+      .detail;
+    // Filter by requestId so a double-Connect attempt doesn't receive
+    // the other attempt's failure. Older `slicc:tray-join` dispatchers
+    // (pre-R12) don't echo the requestId — we accept those too (legacy
+    // path) so the listener still works during a rolling upgrade of
+    // the codebase.
+    if (detail.requestId !== undefined && detail.requestId !== requestId) return;
+    remove();
+    if (!statusEl.isConnected) {
+      // Dialog dismissed before the failure event arrived — the user
+      // sees no error UX. Surface to logs at error so the half-state
+      // is at least auditable.
+      log.error('Tray-join failure arrived after dialog dismissed (UX swallowed half-state)', {
+        joinUrl,
+        error: detail.error,
+        requestId,
+      });
+      return;
+    }
     // Cancel the optimistic dismiss so the user can read the error.
     const dismissTimerStr = statusEl.dataset.dismissTimer;
     if (dismissTimerStr) {
@@ -69,9 +108,10 @@ function dispatchTrayJoinWithFailureFeedback(joinUrl: string, statusEl: HTMLElem
   window.addEventListener('slicc:tray-join-failed', onFailure);
   // Auto-cleanup the listener after 10s — much longer than the 800ms
   // optimistic dismiss, but short enough that a stale listener doesn't
-  // outlive the dialog if the dispatcher's user navigates away.
-  setTimeout(() => window.removeEventListener('slicc:tray-join-failed', onFailure), 10_000);
-  window.dispatchEvent(new CustomEvent('slicc:tray-join', { detail: { joinUrl } }));
+  // outlive the dialog if the user navigates away.
+  setTimeout(remove, 10_000);
+  window.dispatchEvent(new CustomEvent('slicc:tray-join', { detail: { joinUrl, requestId } }));
+  return remove;
 }
 
 // Storage keys

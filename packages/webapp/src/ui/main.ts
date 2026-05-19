@@ -1444,7 +1444,10 @@ async function mainExtension(app: HTMLElement, options?: { detached?: boolean })
         // observable in DevTools.
         const msg = err instanceof Error ? err.message : String(err);
         if (/receiving end does not exist/i.test(msg)) return;
-        log.warn('Panel → offscreen sendMessage failed', { error: msg });
+        // `error` not `warn` — prod default log level is ERROR. The
+        // documented failure modes are all real bugs requiring
+        // investigation.
+        log.error('Panel → offscreen sendMessage failed', { error: msg });
       });
     },
   };
@@ -2536,8 +2539,14 @@ async function mainStandaloneWorker(app: HTMLElement, isElectronOverlay: boolean
   // (The extension path uses chrome.runtime.sendMessage → `refresh-tray-runtime`
   // instead; this is the standalone equivalent.)
   window.addEventListener('slicc:tray-join', (rawEvent: Event) => {
-    const event = rawEvent as CustomEvent<{ joinUrl: string }>;
+    const event = rawEvent as CustomEvent<{ joinUrl: string; requestId?: string }>;
     const joinUrl = event.detail?.joinUrl;
+    // Echo the dispatcher's requestId (when present) on any failure
+    // event so the dispatcher's listener can filter — double-Connect
+    // attempts otherwise bleed errors between their respective UX
+    // surfaces. Legacy callers without requestId still work (the
+    // dispatcher's filter accepts undefined).
+    const requestId = event.detail?.requestId;
     if (!joinUrl) {
       // `error`, not `warn` — the only emitters are SLICC's own UI
       // surfaces, so a missing `joinUrl` is a dispatcher contract
@@ -2630,14 +2639,27 @@ async function mainStandaloneWorker(app: HTMLElement, isElectronOverlay: boolean
           error: err instanceof Error ? err.message : String(err),
         }
       );
-      window.dispatchEvent(
-        new CustomEvent('slicc:tray-join-failed', {
-          detail: {
-            joinUrl,
-            error: err instanceof Error ? err.message : String(err),
-          },
-        })
-      );
+      try {
+        window.dispatchEvent(
+          new CustomEvent('slicc:tray-join-failed', {
+            detail: {
+              joinUrl,
+              error: err instanceof Error ? err.message : String(err),
+              requestId,
+            },
+          })
+        );
+      } catch (dispatchErr) {
+        // A synchronous listener throw is absorbed by DOM dispatch,
+        // but `new CustomEvent(...)` itself can throw if `detail` is
+        // non-cloneable (theoretical — strings are cloneable today,
+        // but a future refactor that drops an Error object in
+        // `detail` would trip this). Logging here ensures the
+        // original failure is at least recorded.
+        log.error('slicc:tray-join-failed dispatch itself threw', {
+          dispatchError: dispatchErr instanceof Error ? dispatchErr.message : String(dispatchErr),
+        });
+      }
     }
   });
 
