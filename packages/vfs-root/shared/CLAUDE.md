@@ -47,7 +47,7 @@ One scoop per sprinkle, named identically. Cone MUST NOT write `.shtml` or run `
 Inline `shtml` code blocks in chat that hydrate into sandboxed widgets. Ephemeral, lick-only (no state). Cone may write these directly. Use for pickers, calculators, quick charts:
 
 ```shtml
-<button onclick="slicc.lick('choose', { value: 42 })">Pick 42</button>
+<button onclick="slicc.lick({ action: 'choose', data: { value: 42 } })">Pick 42</button>
 ```
 
 For persistent UI, use Sprinkles instead. See `/workspace/skills/dips/SKILL.md`.

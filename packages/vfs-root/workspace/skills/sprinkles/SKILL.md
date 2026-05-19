@@ -156,7 +156,7 @@ When a sprinkle button needs to do real work but the owning scoop should NOT be 
 
 Pattern:
 
-1. User clicks → `slicc.lick({action: 'lookup', q: 'foo'})`.
+1. User clicks → `slicc.lick({action: 'lookup', data: {q: 'foo'}})`.
 2. Cone sees the lick, forwards to the owning scoop with `feed_scoop`.
 3. The scoop's reply runs `agent` against a tight allow-list and writes the result back via `sprinkle send`.
 
@@ -184,7 +184,7 @@ sprinkle chat '<div class="sprinkle-action-card">
   <div class="sprinkle-action-card__header">Deploy to production?</div>
   <div class="sprinkle-action-card__actions">
     <button class="sprinkle-btn sprinkle-btn--secondary" onclick="slicc.lick({action:\"cancel\"})">Cancel</button>
-    <button class="sprinkle-btn sprinkle-btn--primary" onclick="slicc.lick({action:\"deploy\",env:\"prod\"})">Deploy</button>
+    <button class="sprinkle-btn sprinkle-btn--primary" onclick="slicc.lick({action:\"deploy\",data:{env:\"prod\"}})">Deploy</button>
   </div>
 </div>'
 ```
@@ -193,7 +193,7 @@ sprinkle chat '<div class="sprinkle-action-card">
 
 Available as `slicc` in `<script>` tags and `onclick` attributes:
 
-- `slicc.lick({action: 'refresh', data: {...}})` — send a lick event to the cone (cone routes to the right scoop).
+- `slicc.lick(event)` — send a lick event to the cone (cone routes to the right scoop). **Only `action` and `data` survive** the iframe → host postMessage hop; pack any extra payload inside `data: { ... }`. Accepts either a string shortcut (`slicc.lick('cancel')` → `{ action: 'cancel' }`) or `{ action, data? }`. **Do not** put extra fields at the top level — `slicc.lick({ action: 'deploy', env: 'prod' })` silently drops `env`; use `slicc.lick({ action: 'deploy', data: { env: 'prod' } })` instead.
 - `slicc.on('update', function(data) {...})` — receive data sent via `sprinkle send`.
 - `slicc.name` — the sprinkle's name.
 - `slicc.close()` — close the sprinkle.
