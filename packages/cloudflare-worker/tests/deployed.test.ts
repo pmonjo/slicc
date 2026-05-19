@@ -32,6 +32,7 @@ describeIfConfigured('deployed tray worker', () => {
         'GET /handoff',
         'GET /.well-known/api-catalog',
         'GET /llms.txt',
+        'GET /status',
         'GET /rel/:name',
         'GET|POST /join/:token',
         'GET|POST /controller/:token',

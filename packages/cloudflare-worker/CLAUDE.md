@@ -28,6 +28,7 @@ The worker provides tray session coordination, capability-token routing, TURN cr
 - `GET /handoff` — accepts `?upskill=<github-url>`, `?handoff=<text>`, or legacy `?msg=verb:payload` and emits an RFC 8288 `Link` response header carrying the SLICC handoff or upskill rel so SLICC can emit a `navigate` lick and show the user an approval prompt
 - `GET /.well-known/api-catalog` — RFC 9264 linkset describing every public route (`application/linkset+json`)
 - `GET /llms.txt` — markdown digest for LLM consumers (llmstxt.org spec)
+- `GET /status` — public health document (RFC 8631 status rel): `{ status, service, timestamp }`
 - `GET /rel/:name` — dereferenceable docs for the SLICC custom rel URIs (`/rel/handoff`, `/rel/upskill`)
 - `GET|POST /join/:token` — follower join and bootstrap polling flow
 - `GET|POST /controller/:token` — leader attach flow and leader WebSocket upgrade
@@ -92,7 +93,7 @@ This lives at the repo root because it coordinates the worker with browser runti
 
 - Treat the worker as coordination infrastructure, not canonical session storage.
 - The `/handoff` page is intentionally stateless; the recognised query parameters are translated into a single RFC 8288 `Link` response header and the page body is only an informational preview.
-- Every worker response is wrapped by `applySliccLinks` (see `src/links.ts`) so a standard rel set (`api-catalog`, `service-desc`, `service-doc`, `https://llmstxt.org/rel/llms-txt`, `terms-of-service`, `license`) ships on every reply alongside any route-specific Link entries.
+- Every worker response is wrapped by `applySliccLinks` (see `src/links.ts`) so a standard rel set (`api-catalog`, `service-desc`, `service-doc`, `status`, `https://llmstxt.org/rel/llms-txt`, `terms-of-service`, `license`) ships on every reply alongside any route-specific Link entries.
 - Keep signaling protocol changes aligned with the browser tray runtime in `packages/webapp/src/scoops/`.
 - **When adding or changing routes**, update ALL THREE test/config locations:
   1. `tests/index.test.ts` — unit test that checks the routes list in the root 200 response

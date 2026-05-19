@@ -15,6 +15,7 @@ import type { NextFunction, Request, Response } from 'express';
 const SLICC_BASE_REL = (origin: string): string[] => [
   `<${origin}/api>; rel="service-desc"; type="application/json"`,
   `<https://github.com/ai-ecoverse/slicc>; rel="service-doc"`,
+  `<${origin}/api/status>; rel="status"; type="application/json"`,
   `<https://github.com/ai-ecoverse/slicc#readme>; rel="terms-of-service"`,
 ];
 
@@ -70,6 +71,12 @@ export function buildLocalApiDescriptor(host: string): unknown {
         anchor: `${origin}/api/runtime-config`,
         method: 'GET',
         description: 'Runtime config for the served webapp.',
+      },
+      {
+        anchor: `${origin}/api/status`,
+        method: 'GET',
+        description:
+          'Public health document (RFC 8631 status rel). Returns JSON `{ status, service, timestamp }`.',
       },
       {
         anchor: `${origin}/api/tray-status`,

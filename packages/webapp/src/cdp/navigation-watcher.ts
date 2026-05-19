@@ -38,6 +38,16 @@ export interface NavigationEvent {
   target: string;
   /** Free-form instruction prose, when the link carried a `title` parameter. */
   instruction?: string;
+  /**
+   * Optional branch carried by the upskill rel's `branch` Link param
+   * (upskill verb only — handoff ignores it at the extractor).
+   */
+  branch?: string;
+  /**
+   * Optional sub-path carried by the upskill rel's `path` Link param
+   * (upskill verb only). Canonical directory form — `/SKILL.md` stripped.
+   */
+  path?: string;
   /** All parsed `Link` headers from the response, kept for downstream discovery. */
   links: ParsedLink[];
   /** Page title at the time of the response, if available. */
@@ -128,15 +138,18 @@ export class NavigationWatcher {
     if (!url) return;
     const { match, links } = extractHandoffFromHeaders(response.headers, url);
     if (!match) return;
-    this.onEvent({
+    const event: NavigationEvent = {
       url,
       verb: match.verb,
       target: match.target,
-      instruction: match.instruction,
       links,
-      title: state.title,
       targetId: state.targetId,
-    });
+    };
+    if (match.instruction != null) event.instruction = match.instruction;
+    if (match.branch != null) event.branch = match.branch;
+    if (match.path != null) event.path = match.path;
+    if (state.title != null) event.title = state.title;
+    this.onEvent(event);
   };
 
   constructor(transport: CDPTransport, onEvent: NavigationEventHandler) {

@@ -19,6 +19,8 @@ interface RecordedEvent {
   instruction?: string;
   url: string;
   title?: string;
+  branch?: string;
+  path?: string;
   timestamp: string;
 }
 
@@ -32,6 +34,8 @@ function makeApp(events: RecordedEvent[]) {
       instruction?: unknown;
       url?: unknown;
       title?: unknown;
+      branch?: unknown;
+      path?: unknown;
       sliccHeader?: unknown;
     };
     if (typeof payload?.sliccHeader === 'string') {
@@ -53,6 +57,18 @@ function makeApp(events: RecordedEvent[]) {
       res.status(400).json({ error: 'instruction must be a string when provided' });
       return;
     }
+    if (payload.branch != null && typeof payload.branch !== 'string') {
+      res.status(400).json({ error: 'branch must be a string when provided' });
+      return;
+    }
+    if (payload.path != null && typeof payload.path !== 'string') {
+      res.status(400).json({ error: 'path must be a string when provided' });
+      return;
+    }
+    if (payload.verb === 'handoff' && (payload.branch != null || payload.path != null)) {
+      res.status(400).json({ error: 'branch and path are only valid with verb="upskill"' });
+      return;
+    }
     events.push({
       type: 'navigate_event',
       verb: payload.verb,
@@ -61,6 +77,11 @@ function makeApp(events: RecordedEvent[]) {
       url:
         typeof payload.url === 'string' && payload.url.length > 0 ? payload.url : 'about:handoff',
       title: typeof payload.title === 'string' ? payload.title : undefined,
+      branch:
+        typeof payload.branch === 'string' && payload.branch.length > 0
+          ? payload.branch
+          : undefined,
+      path: typeof payload.path === 'string' && payload.path.length > 0 ? payload.path : undefined,
       timestamp: new Date().toISOString(),
     });
     res.json({ ok: true });
@@ -154,6 +175,65 @@ describe('POST /api/handoff', () => {
       verb: 'handoff',
       target: 'https://x.example/',
       instruction: 123,
+    });
+    expect(res.status).toBe(400);
+    expect(events).toHaveLength(0);
+  });
+
+  it('accepts an upskill payload with branch and path', async () => {
+    const res = await postJson(app, {
+      verb: 'upskill',
+      target: 'https://github.com/o/r',
+      branch: 'main',
+      path: 'skills/foo',
+    });
+    expect(res.status).toBe(200);
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({
+      verb: 'upskill',
+      target: 'https://github.com/o/r',
+      branch: 'main',
+      path: 'skills/foo',
+    });
+  });
+
+  it('rejects branch on the handoff verb (upskill-only)', async () => {
+    const res = await postJson(app, {
+      verb: 'handoff',
+      target: 'https://example.com/',
+      branch: 'main',
+    });
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error: string };
+    expect(body.error).toContain('upskill');
+    expect(events).toHaveLength(0);
+  });
+
+  it('rejects path on the handoff verb (upskill-only)', async () => {
+    const res = await postJson(app, {
+      verb: 'handoff',
+      target: 'https://example.com/',
+      path: 'skills/foo',
+    });
+    expect(res.status).toBe(400);
+    expect(events).toHaveLength(0);
+  });
+
+  it('rejects a non-string branch', async () => {
+    const res = await postJson(app, {
+      verb: 'upskill',
+      target: 'https://github.com/o/r',
+      branch: 123,
+    });
+    expect(res.status).toBe(400);
+    expect(events).toHaveLength(0);
+  });
+
+  it('rejects a non-string path', async () => {
+    const res = await postJson(app, {
+      verb: 'upskill',
+      target: 'https://github.com/o/r',
+      path: ['skills', 'foo'],
     });
     expect(res.status).toBe(400);
     expect(events).toHaveLength(0);

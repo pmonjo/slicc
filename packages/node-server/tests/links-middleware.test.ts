@@ -38,7 +38,15 @@ describe('sliccLinksMiddleware', () => {
     const link = response.headers.get('link') ?? '';
     expect(link).toContain('rel="service-desc"');
     expect(link).toContain('rel="service-doc"');
+    expect(link).toContain('rel="status"');
     expect(link).toContain('rel="terms-of-service"');
+  });
+
+  it('advertises GET /api/status via the status rel on /api responses', async () => {
+    const app = makeApp();
+    const response = await fetchInProcess(app, '/api/runtime-config');
+    const link = response.headers.get('link') ?? '';
+    expect(link).toMatch(/<http:\/\/localhost:\d+\/api\/status>; rel="status"/);
   });
 
   it('attaches Link rels to /api descriptor itself', async () => {
@@ -112,6 +120,7 @@ describe('buildLocalApiDescriptor', () => {
     const anchors = descriptor.endpoints.map((e) => e.anchor);
     expect(anchors).toContain('http://localhost:5710/api/handoff');
     expect(anchors).toContain('http://localhost:5710/api/runtime-config');
+    expect(anchors).toContain('http://localhost:5710/api/status');
   });
 
   it('describes the new /api/handoff verb-shape payload (not the legacy sliccHeader)', () => {

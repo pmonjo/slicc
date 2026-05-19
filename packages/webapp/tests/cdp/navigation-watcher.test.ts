@@ -183,6 +183,39 @@ describe('NavigationWatcher', () => {
     expect(events[0].target).toBe('https://github.com/slicc/skills-extra');
   });
 
+  it('propagates upskill branch + path Link params end-to-end into the emitted event', async () => {
+    // Wave 7 follow-up: the verifier confirmed propagation by reading the
+    // code; this test locks it in so a future refactor of either the
+    // CDP shape or the extractor can't silently drop branch/path.
+    await watcher.start();
+    transport.emit('Target.attachedToTarget', {
+      sessionId: 'sess-1',
+      targetInfo: { targetId: 'tab-1', type: 'page', url: 'https://ex.com/' },
+    });
+    await new Promise((r) => setTimeout(r, 0));
+
+    transport.emit('Network.responseReceived', {
+      sessionId: 'sess-1',
+      type: 'Document',
+      frameId: 'root-sess-1',
+      response: {
+        url: 'https://ex.com/handoff',
+        headers: {
+          link: `<https://github.com/owner/repo>; rel="${UPSKILL_REL}"; branch=feature/x; path="skills/foo"`,
+        },
+      },
+    });
+
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({
+      verb: 'upskill',
+      target: 'https://github.com/owner/repo',
+      branch: 'feature/x',
+      path: 'skills/foo',
+      targetId: 'tab-1',
+    });
+  });
+
   it('ignores subframe document responses', async () => {
     await watcher.start();
     transport.emit('Target.attachedToTarget', {

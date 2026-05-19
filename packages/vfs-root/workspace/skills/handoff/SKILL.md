@@ -25,16 +25,22 @@ You receive a message like:
   "verb": "handoff" | "upskill",
   "target": "<absolute URL — github repo for upskill, page itself for handoff>",
   "instruction": "<free-form prose, only present for handoff>",
+  "branch": "<git branch — upskill only, optional>",
+  "path": "<sub-path under the repo — upskill only, optional>",
   "title": "<page title if available>"
 }
 ```
+
+`branch` and `path` are upskill-only Link params. Their canonical wire form is `<https://github.com/owner/repo>; rel="…/upskill"; branch=main; path="skills/foo"` — the repo URL is the bare href and the scope is expressed via Link parameters. Either may be absent; when both are present, install only the named sub-path on the named branch.
 
 The verb is the rel that was matched on the response's `Link` header. SLICC only emits the navigate lick when the rel matched one of the recognised SLICC rels — anything else is ignored.
 
 ## Recognised verbs
 
-- **`handoff`** — continue a task that another agent started. The `target` is the page URL itself; the `instruction` is the free-form prose to act on.
-- **`upskill`** — install a skill from a public GitHub repo. The `target` is the GitHub repo URL.
+- **`handoff`** (rel `https://www.sliccy.ai/rel/handoff`) — continue a task that another agent started. The `target` is the page URL itself; the `instruction` is the free-form prose to act on.
+- **`upskill`** (rel `https://www.sliccy.ai/rel/upskill`) — install a skill from a public GitHub repo. The `target` is the GitHub repo URL.
+
+These are the only two custom rel URIs SLICC matches on the parsed `Link` header. Anything else is ignored at the parse layer and never reaches you.
 
 ## What to do when you receive a navigate lick
 
@@ -42,12 +48,21 @@ The verb is the rel that was matched on the response's `Link` header. SLICC only
 2. **Wait for the user to accept or dismiss.** Accept emits a `lick` with `action: 'accept'`; dismiss emits `action: 'dismiss'`.
 3. **On dismiss**: reply with a short acknowledgement and stop. Do not fetch the page. Do not run anything.
 4. **On accept**, dispatch by verb:
-   - `upskill` → run `bash: upskill <target>` (the upskill command will confirm the skill source and install it).
+   - `upskill` → run `bash: upskill <target>` (the upskill command will confirm the skill source and install it). The target may be a full GitHub URL — including `https://github.com/owner/repo/tree/<branch>/<subpath>` to install only the skills under that sub-path of that branch. When the lick body carries `branch` and/or `path`, pass them through as flags so the install honours the scope the origin asked for: `bash: upskill --branch <branch> --path <path> <target>` (each flag is independent — include only the ones present).
    - `handoff` → fetch the page body and act on it alongside the instruction:
      ```bash
      curl -sSL <target>
      ```
      Use the body as supporting context (it may be HTML, JSON, markdown, or empty). Proceed with the `instruction`. If the body is essential and the fetch fails, tell the user.
+
+## Inspecting and following up with `discover`
+
+The `discover` shell command is the safe, read-only way to look at a navigate-lick URL without acting on it, and the way to learn what else the origin advertises after the user accepts.
+
+- **Before approval** — run `bash: discover <origin-url>` to print the parsed `Link` header and any SLICC verb match as JSON. This only issues the same `GET` the user already made on their own tab; it does not fetch the target, does not run the instruction, and does not bypass the approval card. Useful when you want to double-check the verb, target, or instruction the user is being asked to accept.
+- **After approval** — run `bash: discover --follow <origin-url>` to also fetch the P0 capability docs the origin links (`api-catalog`, `service-desc`, `service-meta`, `status`, `llms.txt`). Use this when you want to know what API or documentation surface the origin exposes before deciding how to act on the handoff instruction.
+
+`discover` is JSON-only and inherits the shell's proxied fetch, so CORS and forbidden headers are handled. It is never a substitute for the approval card.
 
 ## Approval card template
 
@@ -63,7 +78,10 @@ Use this shtml block verbatim, substituting the origin URL, verb, target, and in
     <p style="margin:0 0 8px"><strong>Origin:</strong> <code>ORIGIN_URL</code></p>
     <p style="margin:0 0 8px"><strong>Verb:</strong> <code>VERB</code></p>
     <p style="margin:0 0 8px"><strong>Target:</strong> <code>TARGET_URL</code></p>
-    <p style="margin:0"><strong>Instruction:</strong> <code>INSTRUCTION_OR_NONE</code></p>
+    <p style="margin:0 0 8px"><strong>Instruction:</strong> <code>INSTRUCTION_OR_NONE</code></p>
+    <!-- Render these two rows only when the navigate lick body has the field; omit otherwise. -->
+    <p style="margin:0 0 8px"><strong>Branch:</strong> <code>BRANCH</code></p>
+    <p style="margin:0"><strong>Sub-path:</strong> <code>PATH</code></p>
   </div>
   <div class="sprinkle-action-card__actions">
     <button class="sprinkle-btn sprinkle-btn--secondary" onclick="slicc.lick({action:'dismiss'})">Dismiss</button>

@@ -28,6 +28,12 @@ const ENTRIES: CatalogEntry[] = [
       'Convenience endpoint for cross-agent handoff. Accepts ?upskill=, ?handoff=, or legacy ?msg=. Response carries an RFC 8288 Link header with the handoff or upskill rel.',
   },
   {
+    anchor: '/status',
+    methods: ['GET', 'HEAD'],
+    description:
+      'Public health document (RFC 8631 status rel). Returns JSON `{ status, service, timestamp }`.',
+  },
+  {
     anchor: '/join/:token',
     methods: ['GET', 'POST'],
     description: 'Follower join + bootstrap polling for a tray.',

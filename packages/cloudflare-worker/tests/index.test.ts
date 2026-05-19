@@ -1148,6 +1148,7 @@ describe('tray worker skeleton', () => {
         'GET /handoff',
         'GET /.well-known/api-catalog',
         'GET /llms.txt',
+        'GET /status',
         'GET /rel/:name',
         'GET|POST /join/:token',
         'GET|POST /controller/:token',
@@ -1352,6 +1353,7 @@ describe('tray worker skeleton', () => {
     const anchors = body.linkset.map((e) => e.anchor);
     expect(anchors).toContain('https://www.sliccy.ai/handoff');
     expect(anchors).toContain('https://www.sliccy.ai/tray');
+    expect(anchors).toContain('https://www.sliccy.ai/status');
   });
 
   it('serves the llms.txt digest', async () => {
@@ -1387,6 +1389,41 @@ describe('tray worker skeleton', () => {
     );
     expect(response.status).toBe(404);
   });
+
+  it('serves a public health document at GET /status', async () => {
+    const { env } = createTestHarness();
+    const response = await handleWorkerRequest(new Request('https://www.sliccy.ai/status'), env);
+    expect(response.status).toBe(200);
+    expect(response.headers.get('Content-Type')).toContain('application/json');
+    expect(response.headers.get('Cache-Control')).toBe('no-store');
+    const body = (await response.json()) as {
+      status: string;
+      service: string;
+      timestamp: string;
+    };
+    expect(body.status).toBe('ok');
+    expect(body.service).toBe('slicc-tray-hub');
+    expect(typeof body.timestamp).toBe('string');
+    expect(Number.isNaN(Date.parse(body.timestamp))).toBe(false);
+  });
+
+  it('responds to HEAD /status with the same headers and no body', async () => {
+    const { env } = createTestHarness();
+    const response = await handleWorkerRequest(
+      new Request('https://www.sliccy.ai/status', { method: 'HEAD' }),
+      env
+    );
+    expect(response.status).toBe(200);
+    expect(response.headers.get('Content-Type')).toContain('application/json');
+  });
+
+  it('advertises GET /status via the status rel on every response', async () => {
+    const idx = await import('../src/index.js');
+    const { env } = createTestHarness();
+    const response = await idx.default.fetch(new Request('https://www.sliccy.ai/llms.txt'), env);
+    const linkValues = response.headers.get('Link') ?? '';
+    expect(linkValues).toMatch(/<https:\/\/www\.sliccy\.ai\/status>; rel="status"/);
+  });
 });
 
 describe('standard Link header set', () => {
@@ -1394,7 +1431,7 @@ describe('standard Link header set', () => {
   // unit tests above call handleWorkerRequest directly, which intentionally
   // does NOT add the standard set so individual route assertions stay
   // focused. This test exercises the wrapped path via the default worker.
-  it('attaches api-catalog, service-desc, service-doc, llms-txt rels to every response', async () => {
+  it('attaches api-catalog, service-desc, service-doc, status, llms-txt rels to every response', async () => {
     const idx = await import('../src/index.js');
     const { env } = createTestHarness();
     const response = await idx.default.fetch(new Request('https://www.sliccy.ai/llms.txt'), env);
@@ -1402,6 +1439,7 @@ describe('standard Link header set', () => {
     expect(linkValues).toContain('rel="api-catalog"');
     expect(linkValues).toContain('rel="service-desc"');
     expect(linkValues).toContain('rel="service-doc"');
+    expect(linkValues).toContain('rel="status"');
     expect(linkValues).toContain('rel="https://llmstxt.org/rel/llms-txt"');
     expect(linkValues).toContain('rel="terms-of-service"');
   });

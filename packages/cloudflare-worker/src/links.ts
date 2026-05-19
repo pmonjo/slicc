@@ -12,6 +12,7 @@ const STANDARD_RELS_TEMPLATE = (origin: string): string[] => [
   `<${origin}/.well-known/api-catalog>; rel="api-catalog"`,
   `<${origin}/.well-known/api-catalog>; rel="service-desc"; type="application/linkset+json"`,
   `<https://github.com/ai-ecoverse/slicc>; rel="service-doc"`,
+  `<${origin}/status>; rel="status"; type="application/json"`,
   `<${origin}/llms.txt>; rel="https://llmstxt.org/rel/llms-txt"; type="text/markdown"`,
   `<https://github.com/ai-ecoverse/slicc/blob/main/LICENSE>; rel="license"`,
   `<https://github.com/ai-ecoverse/slicc#readme>; rel="terms-of-service"`,

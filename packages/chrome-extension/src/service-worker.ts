@@ -443,6 +443,8 @@ chrome.webRequest.onHeadersReceived.addListener(
       tabId: details.tabId >= 0 ? details.tabId : undefined,
     };
     if (match.instruction) payload.instruction = match.instruction;
+    if (match.branch) payload.branch = match.branch;
+    if (match.path) payload.path = match.path;
     const tabId = details.tabId;
     const dispatch = (title?: string) => {
       if (title) payload.title = title;

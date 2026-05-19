@@ -503,6 +503,17 @@ export interface NavigateLickMsg {
   target: string;
   /** Free-form prose instruction (handoff verb). */
   instruction?: string;
+  /**
+   * Optional branch carried by the upskill rel's `branch` Link param
+   * (upskill verb only — handoff rel never sets these).
+   */
+  branch?: string;
+  /**
+   * Optional sub-path under the upskill repo carried by the `path` Link
+   * param (upskill verb only). Canonical directory form — a trailing
+   * `/SKILL.md` has already been stripped by the extractor.
+   */
+  path?: string;
   /** Page title at the time of the response, if available. */
   title?: string;
   tabId?: number;

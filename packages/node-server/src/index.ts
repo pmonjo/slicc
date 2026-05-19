@@ -830,6 +830,18 @@ async function main() {
     res.json(buildLocalApiDescriptor(host));
   });
 
+  // Public health document — advertised via the `status` rel (RFC 8631) in
+  // the standard Link header set so any consumer that walks the rels can
+  // probe liveness without hard-coding a path.
+  app.get('/api/status', (_req, res) => {
+    res.set('Cache-Control', 'no-store');
+    res.json({
+      status: 'ok',
+      service: 'slicc-node-server',
+      timestamp: new Date().toISOString(),
+    });
+  });
+
   // Tray status API — forwards to browser to get leader tray join info
   app.get('/api/tray-status', async (_req, res) => {
     try {
@@ -975,6 +987,8 @@ async function main() {
       instruction?: unknown;
       url?: unknown;
       title?: unknown;
+      branch?: unknown;
+      path?: unknown;
       // Detect legacy x-slicc-style payloads for a clear error message.
       sliccHeader?: unknown;
     };
@@ -997,6 +1011,22 @@ async function main() {
       res.status(400).json({ error: 'instruction must be a string when provided' });
       return;
     }
+    // `branch` / `path` mirror the upskill rel's Link params and are
+    // ignored on the handoff verb (its target is the page itself, not a
+    // repo). Reject the wrong-shape combo loudly so emitters notice
+    // rather than silently dropping the scope.
+    if (payload.branch != null && typeof payload.branch !== 'string') {
+      res.status(400).json({ error: 'branch must be a string when provided' });
+      return;
+    }
+    if (payload.path != null && typeof payload.path !== 'string') {
+      res.status(400).json({ error: 'path must be a string when provided' });
+      return;
+    }
+    if (payload.verb === 'handoff' && (payload.branch != null || payload.path != null)) {
+      res.status(400).json({ error: 'branch and path are only valid with verb="upskill"' });
+      return;
+    }
     broadcastLickEvent({
       type: 'navigate_event',
       verb: payload.verb,
@@ -1005,6 +1035,11 @@ async function main() {
       url:
         typeof payload.url === 'string' && payload.url.length > 0 ? payload.url : 'about:handoff',
       title: typeof payload.title === 'string' ? payload.title : undefined,
+      branch:
+        typeof payload.branch === 'string' && payload.branch.length > 0
+          ? payload.branch
+          : undefined,
+      path: typeof payload.path === 'string' && payload.path.length > 0 ? payload.path : undefined,
       timestamp: new Date().toISOString(),
     });
     res.json({ ok: true });
