@@ -1,6 +1,12 @@
 ---
 name: handoff
-description: React to navigate lick events (RFC 8288 Link handoff/upskill rels) with a yes/no approval card
+description: |
+  Use this when you receive a Navigate Event lick — emitted whenever the user
+  opens a tab whose main-frame response advertises a SLICC handoff via an
+  RFC 8288 `Link` header. This skill renders the yes/no approval card the
+  user must accept before anything happens. Covers the `handoff:` and
+  `upskill:` verb prefixes and the security rules (never auto-accept, never
+  fetch before approval).
 allowed-tools: bash
 ---
 

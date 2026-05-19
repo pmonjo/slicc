@@ -21,6 +21,15 @@ const baseCoverageExclude = [
 ];
 
 export default defineConfig({
+  resolve: {
+    alias: {
+      // Workspace `@slicc/shared-ts` — resolve to source so tests do not require
+      // `packages/shared-ts/dist/` to exist. All four vitest projects inherit
+      // this via `extends: true`. The package's exports.types already
+      // points at src; this matches the runtime side under vitest.
+      '@slicc/shared-ts': resolve(workspaceRoot, 'packages/shared-ts/src/index.ts'),
+    },
+  },
   test: {
     globals: true,
     environment: 'node',
@@ -64,17 +73,17 @@ export default defineConfig({
             http: resolve(webappDir, 'src/shims/http.ts'),
             https: resolve(webappDir, 'src/shims/https.ts'),
             http2: resolve(webappDir, 'src/shims/http2.ts'),
-            '@mariozechner/pi-coding-agent/dist/core/compaction/compaction.js': resolve(
+            '@earendil-works/pi-coding-agent/dist/core/compaction/compaction.js': resolve(
               workspaceRoot,
-              'node_modules/@mariozechner/pi-coding-agent/dist/core/compaction/compaction.js'
+              'node_modules/@earendil-works/pi-coding-agent/dist/core/compaction/compaction.js'
             ),
-            '@mariozechner/pi-ai/dist/providers/transform-messages.js': resolve(
+            '@earendil-works/pi-ai/dist/providers/transform-messages.js': resolve(
               workspaceRoot,
-              'node_modules/@mariozechner/pi-ai/dist/providers/transform-messages.js'
+              'node_modules/@earendil-works/pi-ai/dist/providers/transform-messages.js'
             ),
-            '@mariozechner/pi-ai/dist/providers/simple-options.js': resolve(
+            '@earendil-works/pi-ai/dist/providers/simple-options.js': resolve(
               workspaceRoot,
-              'node_modules/@mariozechner/pi-ai/dist/providers/simple-options.js'
+              'node_modules/@earendil-works/pi-ai/dist/providers/simple-options.js'
             ),
           },
         },
@@ -93,6 +102,13 @@ export default defineConfig({
           name: 'node-server',
           include: ['packages/node-server/tests/**/*.test.ts'],
           exclude: ['packages/node-server/tests/integration/**/*.test.ts'],
+        },
+      },
+      {
+        extends: true,
+        test: {
+          name: 'shared',
+          include: ['packages/shared-ts/tests/**/*.test.ts'],
         },
       },
       {

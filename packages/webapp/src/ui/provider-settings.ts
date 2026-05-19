@@ -6,7 +6,7 @@
 
 import { getProviders, getModels, getModel, createLogger } from '../core/index.js';
 import type { Model } from '../core/index.js';
-import type { Api } from '@mariozechner/pi-ai';
+import type { Api } from '@earendil-works/pi-ai';
 import { storeTrayJoinUrl, hasStoredTrayJoinUrl } from '../scoops/tray-runtime-config.js';
 import { describeInvalidJoinUrl } from './tray-join-url.js';
 
@@ -43,7 +43,6 @@ function isExtensionRuntime(): boolean {
 // Storage keys
 const ACCOUNTS_KEY = 'slicc_accounts';
 const MODEL_KEY = 'selected-model';
-
 // Legacy keys — deleted on load, no migration
 const LEGACY_KEYS = [
   'slicc_provider',
@@ -68,6 +67,7 @@ export interface Account {
   tokenExpiresAt?: number;
   userName?: string;
   userAvatar?: string;
+  maskedValue?: string;
 }
 
 // Delete legacy keys on first access
@@ -174,7 +174,7 @@ export function getProviderModels(providerId: string): Model<Api>[] {
     const providerConfig = getProviderConfig(providerId);
     if (providerConfig.getModelIds) {
       // Provider specifies its own model list — resolve against all pi-ai registries
-      let modelIds: Array<{ id: string; name?: string }>;
+      let modelIds: ReturnType<NonNullable<ProviderConfig['getModelIds']>>;
       try {
         modelIds = providerConfig.getModelIds();
       } catch (err) {
@@ -196,7 +196,7 @@ export function getProviderModels(providerId: string): Model<Api>[] {
       }
       return modelIds.map((pm) => {
         // Determine API type from metadata: 'openai' or 'anthropic' (default)
-        const apiType = (pm as any).api === 'openai' ? 'openai' : 'anthropic';
+        const apiType = pm.api === 'openai' ? 'openai' : 'anthropic';
         const customApi = `${providerId}-${apiType}` as Api;
         const base = modelMap.get(pm.id);
         const model: Record<string, any> = base
@@ -218,10 +218,12 @@ export function getProviderModels(providerId: string): Model<Api>[] {
               reasoning: true,
             };
 
-        // Apply modelOverrides (layer 2) then getModelIds metadata (layer 3)
+        // Apply modelOverrides (layer 2) then getModelIds metadata (layer 3).
+        // pm is a superset of ModelMetadata (adds id/name) — applyModelMetadata
+        // reads only the fields it knows about and ignores extras.
         const overrides = providerConfig.modelOverrides?.[pm.id];
         if (overrides) applyModelMetadata(model, overrides);
-        applyModelMetadata(model, pm as any);
+        applyModelMetadata(model, pm);
 
         return model as unknown as Model<Api>;
       });
@@ -252,6 +254,7 @@ export function getProviderModels(providerId: string): Model<Api>[] {
 
 export function getOAuthAccountInfo(providerId: string): {
   token: string;
+  maskedValue?: string;
   expiresAt?: number;
   userName?: string;
   userAvatar?: string;
@@ -262,6 +265,7 @@ export function getOAuthAccountInfo(providerId: string): {
   const expired = !!account.tokenExpiresAt && Date.now() > account.tokenExpiresAt - 60000;
   return {
     token: account.accessToken,
+    maskedValue: account.maskedValue,
     expiresAt: account.tokenExpiresAt,
     userName: account.userName,
     userAvatar: account.userAvatar,
@@ -388,6 +392,47 @@ export function getAccounts(): Account[] {
   }
 }
 
+/**
+ * User-configured extra OAuth-token domains, per-provider.
+ *
+ * The provider's hardcoded `oauthTokenDomains` defines the safe defaults.
+ * Users can extend (not replace) that list per-provider via these helpers
+ * — `saveOAuthAccount` merges defaults + extras + dedupes. To activate a
+ * newly-added domain on an existing token, reload the page so
+ * `oauth-bootstrap` re-pushes the replica with the merged list.
+ *
+ * Storage impl lives in `@slicc/shared-ts` so the chrome-extension options
+ * page (`secrets-entry.ts`) and the side panel share a single parser. The
+ * shared module accepts a `LocalStorageLike` for DI; we bind it to the
+ * page's `localStorage`. The standalone kernel-worker reads the same key
+ * via its Map-backed shim (`kernel-worker.ts:installLocalStorageShim`),
+ * kept in sync by `installPageStorageSync`.
+ */
+import {
+  readOAuthExtras as sharedReadOAuthExtras,
+  writeOAuthExtras as sharedWriteOAuthExtras,
+  type OAuthExtraDomainsStore,
+} from '@slicc/shared-ts';
+
+export function getExtraOAuthDomains(providerId: string): string[] {
+  return sharedReadOAuthExtras(localStorage)[providerId] ?? [];
+}
+
+export function setExtraOAuthDomains(providerId: string, domains: string[]): void {
+  const store = sharedReadOAuthExtras(localStorage);
+  const cleaned = domains.map((d) => d.trim()).filter((d) => d.length > 0);
+  if (cleaned.length === 0) {
+    delete store[providerId];
+  } else {
+    store[providerId] = cleaned;
+  }
+  sharedWriteOAuthExtras(localStorage, store);
+}
+
+export function getAllExtraOAuthDomains(): OAuthExtraDomainsStore {
+  return sharedReadOAuthExtras(localStorage);
+}
+
 function saveAccounts(accounts: Account[]): void {
   localStorage.setItem(ACCOUNTS_KEY, JSON.stringify(accounts));
 }
@@ -408,7 +453,33 @@ export function addAccount(
   saveAccounts(accounts);
 }
 
-export function removeAccount(providerId: string): void {
+export async function removeAccount(providerId: string): Promise<void> {
+  // Clear the replica BEFORE wiping the local Account
+  const isExtension = typeof chrome !== 'undefined' && !!chrome?.runtime?.id;
+  try {
+    if (isExtension) {
+      await chrome.storage.local.remove([
+        `oauth.${providerId}.token`,
+        `oauth.${providerId}.token_DOMAINS`,
+      ]);
+    } else {
+      const r = await fetch(`/api/secrets/oauth/${providerId}`, { method: 'DELETE' });
+      // 404 is benign (already deleted). Anything else non-2xx means the
+      // server still has the OAuth token in its OauthSecretStore — surface
+      // for operational visibility so the user knows local clear ≠ server
+      // clear in that path.
+      if (!r.ok && r.status !== 404) {
+        log.warn('OAuth replica DELETE non-ok', { providerId, status: r.status });
+      }
+    }
+  } catch (err) {
+    log.error('OAuth replica removal failed', {
+      providerId,
+      isExtension,
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+
   saveAccounts(getAccounts().filter((a) => a.providerId !== providerId));
   // Clear the stored `selected-model` if it pointed at the deleted
   // account. Without this, header dropdowns and the next message
@@ -425,7 +496,7 @@ export function removeAccount(providerId: string): void {
 }
 
 /** Save an OAuth account (used by external providers after token exchange). */
-export function saveOAuthAccount(opts: {
+export async function saveOAuthAccount(opts: {
   providerId: string;
   accessToken: string;
   refreshToken?: string;
@@ -433,7 +504,7 @@ export function saveOAuthAccount(opts: {
   userName?: string;
   userAvatar?: string;
   baseUrl?: string;
-}): void {
+}): Promise<void> {
   const existing = getAccounts().find((a) => a.providerId === opts.providerId);
   const accounts = getAccounts().filter((a) => a.providerId !== opts.providerId);
   accounts.push({
@@ -447,13 +518,139 @@ export function saveOAuthAccount(opts: {
     baseUrl: opts.baseUrl ?? existing?.baseUrl,
   });
   saveAccounts(accounts);
+
+  // Sync to replica (CLI: node-server /api/secrets/oauth-update; Extension: SW via chrome.storage.local + runtime.sendMessage)
+  const cfg = getProviderConfig(opts.providerId);
+  const defaults = cfg?.oauthTokenDomains ?? [];
+  const extras = getExtraOAuthDomains(opts.providerId);
+  // Merge + dedupe (case-insensitive, preserve provider-default order).
+  const seen = new Set<string>();
+  const domains: string[] = [];
+  for (const d of [...defaults, ...extras]) {
+    const key = d.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    domains.push(d);
+  }
+  if (domains.length === 0) return;
+
+  const isExtension = typeof chrome !== 'undefined' && !!chrome?.runtime?.id;
+  try {
+    if (isExtension) {
+      await chrome.storage.local.set({
+        [`oauth.${opts.providerId}.token`]: opts.accessToken,
+        [`oauth.${opts.providerId}.token_DOMAINS`]: domains.join(','),
+      });
+      const resp = await new Promise<{ maskedValue?: string; error?: string }>((resolve) => {
+        chrome.runtime.sendMessage(
+          { type: 'secrets.mask-oauth-token', providerId: opts.providerId },
+          (r: any) => {
+            // Chrome sets `lastError` AND invokes the callback with
+            // `undefined` when the SW is unreachable / message port closed /
+            // listener crashed. Without explicit handling the empty
+            // resolve looks identical to "SW returned no maskedValue".
+            if (chrome.runtime.lastError) {
+              log.error('SW mask-oauth-token transport failed', {
+                providerId: opts.providerId,
+                error: chrome.runtime.lastError.message,
+              });
+            }
+            resolve(r ?? {});
+          }
+        );
+      });
+      // The SW handler returns `{ maskedValue: undefined, error: '<msg>' }`
+      // on pipeline-build failure (see service-worker.ts secrets.mask-oauth-token
+      // catch). Surface that — matching the CLI branch's "OAuth replica POST
+      // non-ok" logging — so a failure isn't invisible from the page side.
+      if (resp.error) {
+        log.warn('SW mask-oauth-token returned error', {
+          providerId: opts.providerId,
+          error: resp.error,
+        });
+      }
+      if (resp.maskedValue) {
+        const accounts = getAccounts();
+        const acct = accounts.find((a) => a.providerId === opts.providerId);
+        if (acct) {
+          acct.maskedValue = resp.maskedValue;
+          saveAccounts(accounts);
+        }
+      }
+    } else {
+      const r = await fetch('/api/secrets/oauth-update', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          providerId: opts.providerId,
+          accessToken: opts.accessToken,
+          domains,
+        }),
+      });
+      if (r.ok) {
+        const data = await r.json();
+        const accounts = getAccounts();
+        const acct = accounts.find((a) => a.providerId === opts.providerId);
+        if (acct && typeof data.maskedValue === 'string') {
+          acct.maskedValue = data.maskedValue;
+          saveAccounts(accounts);
+        }
+      } else {
+        // Server reachable but rejected the push (auth, validation, 5xx).
+        // The local Account is saved either way (fail-open per spec), but
+        // without surfacing this the user gets a confusing "no masked
+        // value" error from oauth-token / git-token-write later with no
+        // breadcrumb. Bootstrap-on-init retries on the next page load.
+        log.warn('OAuth replica POST non-ok', {
+          providerId: opts.providerId,
+          status: r.status,
+        });
+      }
+    }
+  } catch (err) {
+    log.error('OAuth replica sync failed', {
+      providerId: opts.providerId,
+      isExtension,
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
 }
 
-export function getApiKeyForProvider(providerId: string): string | null {
+/** Fallback returned by getApiKeyForProvider for providers with
+ *  `optionalApiKey: true` when the user hasn't stored one. Local LLM
+ *  servers ignore the value but pi-ai's openai-completions stream and
+ *  the scoop init guard require something non-null. */
+const OPTIONAL_API_KEY_PLACEHOLDER = 'local';
+
+/** What the user actually typed (or the OAuth flow stored). Returns null
+ *  when the account has no key — does NOT inject the optional-provider
+ *  placeholder. Use this from code that needs to round-trip the user's
+ *  intent (e.g. `local-llm discover` upserting back into Settings); use
+ *  {@link getApiKeyForProvider} from code that needs a non-null value to
+ *  pass downstream (scoop init, pi-ai's stream). */
+export function getRawApiKeyForProvider(providerId: string): string | null {
   const account = getAccounts().find((a) => a.providerId === providerId);
   if (!account) return null;
   // OAuth providers use accessToken instead of apiKey
   return account.accessToken || account.apiKey || null;
+}
+
+export function getApiKeyForProvider(providerId: string): string | null {
+  const account = getAccounts().find((a) => a.providerId === providerId);
+  // No account configured at all — return null so the scoop init guard
+  // defers agent creation until the user sets the provider up.
+  if (!account) return null;
+  const stored = account.accessToken || account.apiKey;
+  if (stored) return stored;
+  // Account exists but the user left the key blank: providers that mark
+  // the key optional get a placeholder so the scoop init guard and pi-ai's
+  // stream don't fail. NOTE: the literal 'local' placeholder must match
+  // local-llm.ts's PLACEHOLDER_API_KEY — they're independent guards at
+  // different layers but must agree.
+  if (getProviderConfig(providerId).optionalApiKey) {
+    return OPTIONAL_API_KEY_PLACEHOLDER;
+  }
+  return null;
 }
 
 export function getBaseUrlForProvider(providerId: string): string | null {
@@ -529,9 +726,9 @@ export function setApiKey(key: string): void {
   addAccount(provider, key, baseUrl ?? undefined);
 }
 
-export function clearApiKey(): void {
+export async function clearApiKey(): Promise<void> {
   const provider = getSelectedProvider();
-  removeAccount(provider);
+  await removeAccount(provider);
 }
 
 export function getBaseUrl(): string | null {
@@ -541,7 +738,10 @@ export function getBaseUrl(): string | null {
 
 export function setBaseUrl(url: string): void {
   const provider = getSelectedProvider();
-  const apiKey = getApiKeyForProvider(provider);
+  // Use the raw stored key — passing through getApiKeyForProvider would
+  // resolve the optionalApiKey placeholder ('local') and durably persist
+  // it as the user's apiKey, shadowing the placeholder fallback.
+  const apiKey = getRawApiKeyForProvider(provider);
   if (apiKey) {
     addAccount(provider, apiKey, url || undefined);
   }
@@ -549,7 +749,7 @@ export function setBaseUrl(url: string): void {
 
 export function clearBaseUrl(): void {
   const provider = getSelectedProvider();
-  const apiKey = getApiKeyForProvider(provider);
+  const apiKey = getRawApiKeyForProvider(provider);
   if (apiKey) {
     addAccount(provider, apiKey);
   }
@@ -589,7 +789,15 @@ export function downloadProviders(): void {
 }
 
 // Clear all provider settings
-export function clearAllSettings(): void {
+export async function clearAllSettings(): Promise<void> {
+  // Fan out the per-account replica clears in parallel — sequential `await`
+  // makes a single slow proxy (e.g. node-server unreachable, hitting the
+  // default fetch timeout) block every subsequent removal, so the UI hangs
+  // for N×timeout seconds. allSettled because each remove already swallows
+  // its own errors (fail-open) and a single transient failure shouldn't
+  // gate the rest.
+  const accounts = getAccounts();
+  await Promise.allSettled(accounts.map((a) => removeAccount(a.providerId)));
   localStorage.removeItem(ACCOUNTS_KEY);
   localStorage.removeItem(MODEL_KEY);
   for (const key of LEGACY_KEYS) {
@@ -873,8 +1081,8 @@ export function showProviderSettings(options?: ShowProviderSettingsOptions): Pro
             deleteBtn.style.color = 'var(--s2-content-secondary)';
             deleteBtn.style.borderColor = 'var(--s2-border-subtle)';
           });
-          deleteBtn.addEventListener('click', () => {
-            removeAccount(account.providerId);
+          deleteBtn.addEventListener('click', async () => {
+            await removeAccount(account.providerId);
             renderAccountsList();
           });
           actions.appendChild(deleteBtn);
@@ -1062,7 +1270,7 @@ export function showProviderSettings(options?: ShowProviderSettingsOptions): Pro
           // Clean up pre-login baseUrl placeholder if no account existed before
           if (!hadAccountBefore) {
             try {
-              removeAccount(pid);
+              await removeAccount(pid);
             } catch {
               /* best-effort cleanup */
             }
@@ -1205,9 +1413,11 @@ export function showProviderSettings(options?: ShowProviderSettingsOptions): Pro
           saveBtn.style.display = 'none';
         } else {
           oauthSection.style.display = 'none';
-          apiKeyLabel.textContent = `API Key${providerConfig.apiKeyEnvVar ? ` (${providerConfig.apiKeyEnvVar})` : ''}:`;
+          const keyLabel = providerConfig.requiresApiKey ? 'API Key' : 'API Key (optional)';
+          apiKeyLabel.textContent = `${keyLabel}${providerConfig.apiKeyEnvVar ? ` (${providerConfig.apiKeyEnvVar})` : ''}:`;
           apiKeyInput.placeholder = providerConfig.apiKeyPlaceholder || 'API key';
-          apiKeySection.style.display = providerConfig.requiresApiKey ? '' : 'none';
+          const showApiKey = providerConfig.requiresApiKey || providerConfig.optionalApiKey;
+          apiKeySection.style.display = showApiKey ? '' : 'none';
           baseUrlInput.placeholder = providerConfig.baseUrlPlaceholder || 'https://...';
           baseUrlDesc.textContent = providerConfig.baseUrlDescription || '';
           baseUrlSection.style.display = providerConfig.requiresBaseUrl ? '' : 'none';

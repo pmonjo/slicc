@@ -14,7 +14,7 @@ Chrome extension Manifest V3 blocks dynamic code construction on extension pages
 
 **The Solution: Sandbox Iframe**
 
-All dynamic code execution (JavaScript tool, `node -e`) routes through a sandboxed iframe (`sandbox.html`) exempt from extension CSP. Sprinkles and inline widgets use a separate sandbox (`sprinkle-sandbox.html`).
+All dynamic code execution (JavaScript tool, `node -e`) routes through a sandboxed iframe (`sandbox.html`) exempt from extension CSP. Sprinkles and dips use a separate sandbox (`sprinkle-sandbox.html`).
 
 | Component           | CLI Behavior                                          | Extension Behavior                                          |
 | ------------------- | ----------------------------------------------------- | ----------------------------------------------------------- |
@@ -113,6 +113,93 @@ File: `packages/chrome-extension/vite.config.ts` `closeBundle` hook must:
 2. Bundle ImageMagick WASM to `dist/extension/magick.wasm`
 3. Ensure manifest `web_accessible_resources` includes all assets
 
+## emscripten WASM Heap Views: Copy Inside the Callback
+
+WASM modules built with emscripten — magick-wasm, Pyodide, sql.js — hand
+JavaScript callbacks `Uint8Array` views **into the WASM linear memory**, not
+owned buffers. After the callback returns, the runtime is free to reuse that
+memory region for other allocations. Holding the raw view across any
+subsequent `await` (or simply waiting for the next emscripten operation) lets
+later allocations clobber the bytes you thought you captured.
+
+The `convert` command had exactly this bug: `image.write(format, (data) => {
+outputData = data; })` followed by `await ctx.fs.writeFile(path, outputData)`.
+The output JPEG landed on disk as 1192 KB of UTF-8 text with CRLF terminators
+— emscripten's housekeeping output that had reused the memory slot in the
+meantime. Symptom only surfaced in extension/offscreen mode because of
+allocator timing.
+
+**The rule**: snapshot inside the callback with `new Uint8Array(data)` before
+the closure returns.
+
+| Site                                             | Status                                                                             |
+| ------------------------------------------------ | ---------------------------------------------------------------------------------- |
+| `shell/supplemental-commands/convert-command.ts` | Snapshots via `new Uint8Array(data)`; regression test in `convert-command.test.ts` |
+| `core/image-processor.ts`                        | Snapshots via `new Uint8Array(data)`                                               |
+| `cdp/browser-api.ts`                             | Consumes the view inside the callback to build base64 (no escape)                  |
+
+## Python Realm: VFS Sync Is Diff-Aware and Size-Capped
+
+**File**: `packages/webapp/src/kernel/realm/py-realm-shared.ts`
+
+Pre- and post-execution sync between the VFS and Pyodide's emscripten FS uses
+two bulk RPCs — `vfs.walkTree` (host → realm: paths + sizes + content) and
+`vfs.writeBatch` (realm → host: mkdirs + file writes). The naive per-file
+`readDir`/`stat`/`readFile` chatter took minutes on workspace-sized cwds; the
+bulk path collapses that to two round-trips regardless of file count.
+
+| Behavior                             | Why                                                                                                                                                                                                                                                                                                                                                                                    |
+| ------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **10 MB file-size cap**              | Files above the cap are listed (Python sees the directory entry + the `size` field) but their content is not pre-loaded. `open()` raises ENOENT. Cap-exceeded files are **silently** skipped — a documented constraint, not an error worth surfacing on every invocation. Files that are within the cap but fail to read from the host DO warn so the user can debug the real failure. |
+| **Size-only diff**                   | Post-sync compares Pyodide-FS size against the pre-execution snapshot; same-size content changes can slip through. The trade-off is intentional; if it ever flips to hash-based diffing, the test pinning this should be updated, not deleted.                                                                                                                                         |
+| **Binary content via Uint8Array**    | `walkTree`/`writeBatch` carry content as `Uint8Array`, not `string`, so PNG / PDF / wheel / sqlite files in cwd round-trip byte-for-byte. The previous string-based path silently corrupted any non-UTF-8 byte via `TextDecoder()` on the way out.                                                                                                                                     |
+| **Per-entry write failures surface** | `writeBatch` returns `{ failedFiles, failedMkdirs }`; the realm pushes each into stderr so a Python script's `open('x','w').write(...)` failure can't disappear into the void.                                                                                                                                                                                                         |
+
+When extending the sync (attribute mirroring, hash-based diffing, etc.), keep
+the two-RPC shape — adding round-trips inside the loop reintroduces the
+minutes-long stall — and keep `content: Uint8Array` so binary outputs don't
+regress to the TextDecoder corruption path.
+
+## Runtime Detection: Workers Have No `window` Either
+
+**The Problem**
+
+`typeof window === 'undefined'` looks like a Node-vs-browser check but is actually a
+"no DOM" check — and a DedicatedWorker has no `window` either. The CLI standalone
+kernel runs in a DedicatedWorker (`packages/webapp/src/kernel/kernel-worker.ts`),
+the realm runners run in DedicatedWorkers in both floats, and the offscreen
+document does have a `window`. So `typeof window === 'undefined'` does NOT
+distinguish "Node" from "browser worker."
+
+The historical pattern in three resolvers — Pyodide indexURL, ImageMagick
+`magick.wasm`, `sql.js` — used this check to switch between local `node_modules`
+and the CDN. In CLI standalone, the agent shell runs in the kernel-worker (no
+`window`), so the check resolved to `/node_modules/<pkg>/`, which Vite's dev
+server doesn't serve — it returns the SPA fallback (`<!DOCTYPE …>`), and the
+worker then tries to load the HTML as a WASM/JS module with the obvious error:
+
+```
+WebAssembly.instantiate(): expected magic word 00 61 73 6d, found 3c 21 44 4f
+Failed to fetch dynamically imported module: …/pyodide.asm.js (MIME text/html)
+```
+
+**The Fix**
+
+Use the helpers in `packages/webapp/src/shell/supplemental-commands/shared.ts`:
+
+| Helper                 | True when…                                                                                    |
+| ---------------------- | --------------------------------------------------------------------------------------------- |
+| `isNodeRuntime()`      | `typeof process !== 'undefined' && process.versions?.node` — vitest, node-server tooling      |
+| `isExtensionRuntime()` | `typeof chrome !== 'undefined' && chrome?.runtime?.id` — extension origin (incl. its workers) |
+
+Branch order must be **extension → node → browser CDN**: extension wins because
+extension workers also have `process`-less, `window`-less contexts where the CDN
+branch would be wrong (extension CSP blocks CDN), and Node wins over the
+browser-CDN fallback because vitest must not hit jsdelivr for unit tests.
+
+See `resolvePyodideIndexURL()` in `kernel/realm/realm-factory.ts` and
+`getMagick()` / `getSqlJs()` for the canonical pattern.
+
 ## Node Command: Three-Branch Path
 
 **File**: `packages/webapp/src/shell/supplemental-commands/node-command.ts`
@@ -123,6 +210,40 @@ File: `packages/chrome-extension/vite.config.ts` `closeBundle` hook must:
 | **CLI**       | Default                                                  | Uses constructor directly, accesses VirtualFS via `ctx.fs` bridge                           |
 
 The extension branch (lines 145–228) rebuilds the node shimmed environment inside the sandbox iframe because the sandbox has no access to the shell context.
+
+## JS Realm require(): Native-Package Guard + Pre-Fetch Timeout
+
+`require()` resolution in JS realms goes through two guard rails before
+the actual CDN fetch — without them, a stray `require('sharp')` parked the
+realm for minutes on a transitive `.node` loader fetch that never settled.
+
+1. **`NODE_NATIVE_PACKAGES` hard-fail set** — packages that ship C++
+   bindings via node-gyp/prebuild (sharp, canvas, sqlite3, better-sqlite3,
+   bcrypt, fsevents, robotjs, puppeteer, sass-embedded, tree-sitter, …).
+   The shim throws at pre-fetch time with a clear error and a hint
+   pointing the caller at a WASM-backed shell command — `convert` for
+   images, `sqlite3` for SQL, `crypto.subtle` for hashing.
+
+2. **`LOAD_MODULE_TIMEOUT_MS` (15 s)** — caps every actual `loadModule(id)`
+   so a CDN stub that stalls on a transitive import can't park
+   `Promise.allSettled` indefinitely. The rejection includes the
+   specifier and elapsed seconds so the agent knows what to drop.
+
+**One canonical source + two hand-mirrors must stay in lockstep.** Adding
+a package to the native set means updating all three. Worker JS realm
+(`js-realm-shared.ts`) imports the canonical module, so it doesn't need
+hand-syncing.
+
+| Site                                                 | Notes                                                                                                                                          |
+| ---------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
+| `packages/webapp/src/kernel/realm/require-guards.ts` | **Canonical** TS module; helpers + sets unit-tested in `require-guards.test.ts`. Worker JS realm imports from here, no drift surface.          |
+| `packages/chrome-extension/sandbox.html`             | Hand-mirror — extension iframe realm bundled outside the TS module graph. Pinned in `node-command-loadmodule.test.ts` + the parity test below. |
+| `packages/webapp/src/shell/bsh-watchdog.ts`          | Hand-mirror — `.bsh` runtime injected into target page via CDP `Runtime.evaluate`. Pinned in `bsh-watchdog.test.ts`.                           |
+
+The mirror-parity test in `bsh-watchdog.test.ts` walks every entry from
+the canonical `NODE_NATIVE_PACKAGES` and asserts both hand-mirrors carry
+it. A package added to the canonical set without mirroring fails CI
+rather than silently re-enabling the 5-minute realm hang.
 
 ## RestrictedFS Path Behavior
 
@@ -238,12 +359,124 @@ Host the real leader tray `WebSocket` in `packages/chrome-extension/src/service-
 
 ## Fetch Proxy: CORS & CSP
 
-| Mode          | Fetch Strategy | CORS Handling                                                   |
-| ------------- | -------------- | --------------------------------------------------------------- |
-| **CLI**       | Direct fetch   | Cross-origin requests proxy through `/api/fetch-proxy` endpoint |
-| **Extension** | Direct fetch   | Uses `host_permissions` in manifest; no server proxy needed     |
+| Mode          | Fetch Strategy                                       | CORS Handling                                                                                |
+| ------------- | ---------------------------------------------------- | -------------------------------------------------------------------------------------------- |
+| **CLI**       | `createProxiedFetch()` → `/api/fetch-proxy`          | Cross-origin requests proxy through Express endpoint with secret unmask/scrub                |
+| **Extension** | `createProxiedFetch()` → `fetch-proxy.fetch` SW Port | Routes through service worker Port handler with secret unmask/scrub; uses `host_permissions` |
 
-**Git CORS**: Same rules apply to isomorphic-git HTTP requests (clone, push, pull).
+**Git CORS**: Same rules apply to isomorphic-git HTTP requests (clone, push, pull). Both modes now route through `createProxiedFetch()`.
+
+## Kernel-Worker Fetch Bypass: Same-Origin Only
+
+`packages/webapp/src/kernel/kernel-worker.ts` wraps `globalThis.fetch` to
+stamp `x-bypass-llm-proxy: 1` so the page-installed LLM-proxy SW doesn't
+re-route worker-issued requests. The wrapper is **scoped to same-origin
+requests only** — helper extracted to
+`packages/webapp/src/kernel/kernel-worker-fetch-bypass.ts` and unit-tested
+in `kernel-worker-fetch-bypass.test.ts`.
+
+Why the same-origin gate? Custom headers on cross-origin requests force a
+CORS preflight, and strict CDNs (jsdelivr, sql.js.org, …) reject the
+preflight because their `Access-Control-Allow-Headers` list doesn't include
+`x-bypass-llm-proxy`. Pyodide and ImageMagick used to noisily fall back to
+non-streaming WASM instantiation every load until the wrapper was scoped.
+
+Cross-origin worker fetches are intentionally left bare so the SW can route
+them through `/api/fetch-proxy` (one server hop). For one-shot wasm/asset
+payloads the round-trip cost is acceptable. `proxiedFetch` already targets
+same-origin `/api/fetch-proxy` directly, so LLM API streaming is unaffected.
+
+## SW respondWith: Wrap Proxy Responses to Preserve the Request URL
+
+`llm-proxy-sw.ts`'s `forwardThroughProxy()` cannot return the
+`fetch('/api/fetch-proxy')` Response directly. When the consumer of the
+intercepted request is an ESM module loader, the browser uses
+`response.url` as the base URL for resolving relative sub-imports. If the
+SW responds with the proxy fetch verbatim, `response.url` is
+`http://localhost:5710/api/fetch-proxy`, and a response body that contains
+`import './x.mjs'` lands at `http://localhost:5710/x.mjs` — Vite's SPA
+fallback then returns `text/html` and the import fails with "Failed to
+load module script".
+
+Wrap in a synthetic `new Response(body, { status, statusText, headers })`.
+The SW contract resolves `response.url` to the **original request URL**
+for synthetic responses, so relative imports point back at the cross-origin
+host (where they're re-intercepted and proxied again). Body stays a
+streamed `ReadableStream` so SSE token-by-token UX for LLM completions is
+unchanged.
+
+## Response Status Code Constraints
+
+**The Problem**
+
+`new Response('', { status: 0 })` throws `RangeError: Failed to construct 'Response': Invalid status code (0)`. The Fetch API requires status codes in range 200-599.
+
+**The Solution**
+
+Use `413 Payload Too Large` for oversized requests instead of `status: 0`. The SW `fetch-proxy.fetch` handler uses a 32MB request-body cap and returns 413 when exceeded.
+
+```typescript
+// WRONG
+return new Response('', { status: 0 });
+
+// RIGHT
+return new Response('Request body exceeds 32MB limit', { status: 413 });
+```
+
+## Chrome Port: onMessage Listener Must Attach Synchronously
+
+**The Problem**
+
+When an MV3 service worker handles a `chrome.runtime.onConnect` event, page-side callers will routinely call `port.postMessage(...)` immediately after `chrome.runtime.connect({name})` resolves. Chrome **drops port messages that arrive before any `port.onMessage` listener is attached**. If the SW's `onConnect` callback awaits anything (e.g. an async pipeline build) before attaching the listener, the page's first message is silently lost — the caller's promise hangs forever waiting for a response that never comes.
+
+This is exactly what bit the secret-aware fetch proxy: the SW's original handler did `buildSecretsPipeline()` (involving `chrome.storage.local` reads) inside `.then(...)` and attached the listener afterward. `curl` from the extension panel terminal hung with no error and no disconnect.
+
+**The Solution**
+
+Attach `port.onMessage.addListener(...)` **synchronously** inside the `onConnect` callback, and `await` any async setup INSIDE that listener:
+
+```typescript
+chrome.runtime.onConnect.addListener((port) => {
+  if (port.name !== 'my-channel') return;
+  const pipelinePromise = buildPipeline(); // kick off async work
+  port.onMessage.addListener(async (msg) => {
+    // <-- ATTACHED SYNC
+    const pipeline = await pipelinePromise; // <-- AWAIT INSIDE
+    // ... handle msg using pipeline
+  });
+});
+```
+
+See `packages/chrome-extension/src/fetch-proxy-shared.ts:handleFetchProxyConnectionAsync` for the production pattern. Regression test: `packages/chrome-extension/tests/fetch-proxy-shared.test.ts` — "handleFetchProxyConnectionAsync — synchronous listener attach".
+
+## Offscreen Documents: Smaller chrome.\* Surface than the SW
+
+**The Problem**
+
+MV3 offscreen documents inherit only a subset of the manifest's `permissions`. Notably, **`chrome.storage` is NOT exposed in offscreen documents** — even when the manifest grants `"storage"` and the SW has it. Code paths that work in the SW (where `chrome.storage.local.get(null)` returns instantly) throw `Cannot read properties of undefined (reading 'local')` when they end up running in offscreen.
+
+This was hit by the `secret list` shell command: the panel-terminal `WasmShellHeadless` is hosted in the offscreen document (via `createPanelTerminalHost`), and `chrome.storage.local.get(...)` from inside the supplemental command callback throws.
+
+**The Solution**
+
+For management operations that must touch `chrome.storage.local`, **route through the SW via `chrome.runtime.sendMessage`**. The SW has full storage access. Add a handler in `service-worker.ts:onMessage` that performs the storage call and replies via `sendResponse`. See the `secrets.list` / `secrets.set` / `secrets.delete` handlers there for the canonical pattern. Always `return true` from the listener for async work, and always include `chrome.runtime.lastError` handling on the caller side.
+
+## SecretsPipeline Mutation Pitfall
+
+**The Problem**
+
+`SecretsPipeline.unmaskHeaders(headers, hostname)` mutates its input parameter in place. This matches the legacy `SecretProxyManager` semantics but is easy to miss.
+
+**The Solution**
+
+Expect the mutation. If you need the original headers preserved, clone them first:
+
+```typescript
+const originalHeaders = { ...headers };
+pipeline.unmaskHeaders(headers, hostname); // headers is now mutated
+```
+
+This design choice preserves compatibility with existing node-server callers that rely on in-place mutation.
 
 ## Two TypeScript Targets
 
@@ -466,39 +699,37 @@ The service worker must only import **types** (erased at compile time) from othe
 
 In extension mode, there are **two separate WasmShell instances** running in different execution contexts:
 
-| Context                | Location                                         | Shell purpose                    | Window globals                        |
-| ---------------------- | ------------------------------------------------ | -------------------------------- | ------------------------------------- |
-| **Side panel**         | `packages/webapp/src/ui/main.ts` (mainExtension) | Terminal tab — user-facing shell | Has Layout, `__slicc_debug_tabs`, DOM |
-| **Offscreen document** | `packages/chrome-extension/src/offscreen.ts`     | Agent's bash tool — LLM-driven   | Has Orchestrator, no DOM/Layout       |
+| Context                | Location                                         | Shell purpose                    | Window globals                  |
+| ---------------------- | ------------------------------------------------ | -------------------------------- | ------------------------------- |
+| **Side panel**         | `packages/webapp/src/ui/main.ts` (mainExtension) | Terminal tab — user-facing shell | Has Layout + DOM                |
+| **Offscreen document** | `packages/chrome-extension/src/offscreen.ts`     | Agent's bash tool — LLM-driven   | Has Orchestrator, no DOM/Layout |
 
 These contexts share IndexedDB (VFS, sessions) but **NOT** window globals, DOM, or Layout instances. They communicate via `chrome.runtime` messages routed through the service worker.
 
 **The Pattern: UI-Affecting Shell Commands**
 
-Shell commands that need to affect the side panel UI (e.g., `debug on` toggling tabs) must handle both contexts:
+When a shell command run by the agent (offscreen context) needs to drive the side panel UI, use the dual-context pattern:
 
 1. **Direct hook** (panel context): check `window.__slicc_*` — if present, call directly
-2. **Message relay** (offscreen context): send `chrome.runtime.sendMessage({ source: 'offscreen', payload: { type: '...', ... } })` → service worker routes to panel → `OffscreenClient` handles in `setupMessageListener()`
+2. **Message relay** (offscreen context): send `chrome.runtime.sendMessage({ source: 'offscreen', payload: { type: '...', ... } })` → service worker routes to panel → `OffscreenClient` handles in `setupMessageListener()` and dispatches to the appropriate Layout/panel API.
 
 ```typescript
 // Pattern: try direct hook, fall back to message relay
-const toggle = (window as any).__slicc_debug_tabs;
+const toggle = (window as any).__slicc_someUiOp;
 if (toggle) {
-  toggle(show); // Running in panel context
+  toggle(arg); // Running in panel context
 } else {
-  chrome.runtime.sendMessage({ source: 'offscreen', payload: { type: 'debug-tabs', show } });
+  chrome.runtime.sendMessage({ source: 'offscreen', payload: { type: 'some-ui-op', arg } });
 }
 ```
 
-**Current example**: `debug-command.ts` uses this pattern. Panel registers hook in `main.ts`; `offscreen-client.ts` handles the relay message.
+No built-in supplemental command currently uses this hook+relay shape — the previous example (`debug-command.ts`) was removed when Terminal/Memory became unconditional in the rail. The sprinkle subsystem solves a related problem differently (a `globalThis.__slicc_sprinkleManager` proxy interface published in both realms, dispatching `sprinkle-op` request/response RPCs), and is the right reference for new code that needs full bidirectional dispatch rather than a fire-and-forget UI side effect.
 
 **Related Files**
 
-- `packages/webapp/src/shell/supplemental-commands/debug-command.ts` (dual-context command, tries hook then relay)
-- `packages/webapp/src/ui/main.ts` line 187 (registers `__slicc_debug_tabs` hook)
-- `packages/webapp/src/ui/offscreen-client.ts` line 235 (relays `debug-tabs` message to hook)
-- `packages/webapp/src/ui/layout.ts` `setDebugTabs()` (UI state — adds/removes tabs dynamically)
-- `packages/webapp/src/ui/tabbed-ui.ts` `setHiddenTabs()` (persistence — saves to localStorage)
+- `packages/chrome-extension/src/sprinkle-proxy.ts` (offscreen-side proxy that publishes `globalThis.__slicc_sprinkleManager` and relays via `sprinkle-op`)
+- `packages/webapp/src/ui/main.ts` (`client.setSprinkleOpHandler(...)` — where the panel-side handler is registered)
+- `packages/webapp/src/ui/offscreen-client.ts` `setupMessageListener()` (routes `sprinkle-op` payloads to the registered handler)
 
 ## Dual-Mode Testing Checklist
 
@@ -513,7 +744,7 @@ When adding a feature that touches:
 
 - [ ] New pure-logic code has unit tests (run in Node)
 - [ ] Code has three-branch detection if behavior differs (Node/Extension/Browser)
-- [ ] Fetch uses `/api/fetch-proxy` in CLI, direct fetch in extension
+- [ ] Both modes proxy via `createProxiedFetch` (CLI to `/api/fetch-proxy`, extension to `fetch-proxy.fetch` Port)
 - [ ] WASM loading uses `chrome.runtime.getURL()` in extension mode
 - [ ] No dynamic code construction on extension pages
 
@@ -523,3 +754,137 @@ When adding a feature that touches:
 - [ ] Test in extension mode (`npm run build -w @slicc/chrome-extension` → load in chrome://extensions)
 - [ ] If added WASM, verify bundled path in extension build
 - [ ] If added command, test in both terminal modes
+
+## Adobe Proxy `X-Session-Id` on LLM Call Paths
+
+**The Problem**
+
+Every request from SLICC to the Adobe LLM proxy must carry an
+`X-Session-Id` HTTP header. The proxy uses it to group requests into
+one logical session for usage telemetry. When the header is absent,
+the proxy falls back to a content-derived `sha256(userId +
+firstHumanText[:200])` — a 64-char hex hash that fragments multi-turn
+conversations across many session ids and leaves them unclassified in
+the dashboard. Every individual event is still captured correctly;
+only session-level grouping breaks.
+
+The header rides on `pi-ai`'s `StreamOptions.headers`, which every
+provider's `streamSimple` honors. Any code path that calls the LLM
+without going through the agent loop or the compaction transformer
+will silently bypass it — and the resulting events can't be re-grouped
+after the fact.
+
+**The Enforcement Points**
+
+| Code path                                     | Wiring                                           | Where                                                               |
+| --------------------------------------------- | ------------------------------------------------ | ------------------------------------------------------------------- |
+| Agent loop (cone, scoops, tool turns)         | `streamFn` wrapper passed to `Agent` constructor | `packages/webapp/src/scoops/scoop-context.ts` `streamWithSessionId` |
+| Compaction summaries (Pi packed-conversation) | `headers` config on `createCompactContext`       | `packages/webapp/src/scoops/scoop-context.ts` `compactionHeaders`   |
+| Ad-hoc UI quick-LLM calls                     | Inline `getQuickLlmAdobeSessionId()` header set  | `packages/webapp/src/ui/quick-llm.ts`                               |
+| Session freezer (new-session flow)            | Inline `getDailyAdobeUuid(...)` header set       | `packages/webapp/src/ui/new-session.ts`                             |
+| Provider-level fallback (defense-in-depth)    | `ensureSessionIdHeader` in Adobe stream funcs    | `packages/webapp/providers/adobe.ts`                                |
+
+The first four paths attach a meaningful identifier from
+`getAdobeSessionId(scoop, coneJid)` in
+`packages/webapp/src/scoops/llm-session-id.ts` (a daily-rotating UUID
+for the cone, `<uuid>/<hash(folder, uuid)>` for scoops) or a
+purpose-anchored variant. Other providers receive no header.
+
+The last row is the defense-in-depth net: `streamAdobe` and
+`streamSimpleAdobe` both run `ensureSessionIdHeader` before forwarding
+to pi-ai, so any future call site that forgets to attach a header
+still gets a daily-rotated fallback UUID anchored on the sentinel
+`'adobe-provider-fallback'`. The fallback collides across all unwrapped
+paths within a browser-day — that is intentional. It tells the proxy
+"the dev forgot the wrapper" rather than legitimizing the call.
+`ensureSessionIdHeader` also emits a deduped `console.warn` per call
+site identifier so the missing wrapper surfaces in development.
+
+**Adding a New LLM Call Site**
+
+If you add code that calls `pi-ai`'s `streamSimple` / `completeSimple`
+directly — or any helper from `@earendil-works/pi-coding-agent` that
+routes there (compaction, branch summarization, etc.) — you MUST
+attach `X-Session-Id` for the Adobe provider. The cleanest pattern is
+to take a `headers: Record<string, string>` parameter and let the
+caller inject it the same way `createCompactContext` does. Don't
+replicate the Adobe-provider check at every site — push it up to
+whoever owns the call. If you skip the wiring, the provider-level
+fallback prevents the proxy from falling back to content hashing, but
+your call site will land in a generic "unwrapped" bucket rather than
+the cone's session.
+
+**The pi-coding-agent Stub Tripwire**
+
+`pi-coding-agent`'s `generateSummary` is positional, and our local
+ambient stub at
+`packages/webapp/src/types/pi-coding-agent-compaction.d.ts` shadows
+resolution to upstream's `.d.ts` under `moduleResolution: bundler`.
+Upstream 0.63.0 inserted `headers?` at slot 4 and shifted `signal?`
+to slot 5. Our stub kept the pre-0.63 shape, so our positional caller
+silently routed the AbortSignal into the new `headers` slot — and we
+lost the header on every compaction summary for ~6 weeks before proxy
+telemetry surfaced it.
+
+The compile-time contract at
+`packages/webapp/src/types/pi-coding-agent-compaction.contract.ts`
+pins slot 4 (`headers`) and slot 5 (`signal`). If a future stub edit
+shifts those positions, `tsc` fails. It does **not** catch
+upstream-only drift (a renovate bump that ships without any stub
+edit) — that requires either an upstream PR exposing `./compaction` in
+pi-coding-agent's exports map (so we can drop the stub) or a tsconfig
+`paths` mapping bypassing the exports map. The upstream PR is in
+flight; tracked separately.
+
+**Verifying a Fix**
+
+After deploying anything that touches LLM call paths or the session-id
+wiring, query the LLM-monitoring D1:
+
+```sql
+SELECT date(created_at) AS day, COUNT(*) AS hex_events
+FROM usage_events
+WHERE created_at >= '<deploy-day>T00:00:00Z'
+  AND length(session_id) = 64
+  AND session_id GLOB '[0-9a-f]*'
+  AND session_id NOT LIKE '%-%'
+GROUP BY day ORDER BY day DESC;
+```
+
+`hex_events` should be ~0 on new days. If it spikes after a change
+that touched LLM call paths, a new code path is bypassing the wiring.
+
+**Related**
+
+- Bug fix: PR #600 attached `X-Session-Id` to compaction; PR #378
+  attached it to the agent loop. Provider-level fallback added after
+  the 2026-05-19 cron/standalone-Pi-chat residual report.
+- Tripwire: PR #600 added the positional contract.
+- Coverage: `tests/scoops/scoop-context.session-id.test.ts` asserts
+  both wiring points use the same identifier; gates against future
+  reverts. `tests/providers/adobe-provider.test.ts` covers the
+  provider-level `ensureSessionIdHeader` fallback behavior.
+
+## Detached popout: boot is the lock event
+
+The detached popout flow accepts three entry paths: the side-panel
+"Pop out" button, direct URL navigation (paste/bookmark), and
+Chrome's tab restore. ALL three converge on the detached tab's boot
+emitting a `detached-claim` envelope to the SW — the button is a
+convenience, not a trust signal. Spec:
+`docs/superpowers/specs/2026-05-13-extension-detached-popout-design.md`.
+
+## Detached popout: claim URL validation
+
+The SW's claim handler parses `sender.url` as a URL and validates
+`origin`, pathname (`/index.html` or `/`), and
+`searchParams.get('detached') === '1'`. Substring matches on
+`sender.url` MUST NOT be used — they are brittle to query reordering.
+
+## Detached popout: top-frame requirement for claim emission
+
+`detached-claim` MUST be sent from the detached tab's top frame
+because validation uses the sender document URL; a nested
+sprinkle iframe will not carry `?detached=1` and the claim will
+be rejected. Future code that moves the claim-emit point must
+preserve this.

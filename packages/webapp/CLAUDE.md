@@ -27,6 +27,19 @@ User → ChatPanel → Orchestrator → ScoopContext.prompt() → pi-agent-core 
 
 ## Key Subsystems
 
+### Kernel Host
+
+- Path: `packages/webapp/src/kernel/`
+- `host.ts` — `createKernelHost(config)` factory. Single boot sequence shared by the offscreen document (extension), the standalone DedicatedWorker, and tests: orchestrator + lick-manager + agent-bridge + tray subs + cone bootstrap + BshWatchdog + `/proc` mount. Returns `{ orchestrator, browser, bridge, lickManager, sharedFs, processManager, dispose }`.
+- `kernel-worker.ts` — DedicatedWorker entry. The standalone path defaults to this since the inline orchestrator path was removed; `?inline=1` no longer exists.
+- `process-manager.ts` — `ProcessManager` tracks every long-running async unit: scoop turns, tool calls, shell execs, jsh/python scripts. Pids are uint32 from 1024+; `signal(pid, sig)` honors SIGINT/SIGTERM/SIGKILL/SIGSTOP/SIGCONT (SIGKILL escalates uncatchably).
+- `proc-mount.ts` — read-only `procfs`-shaped view, mounted at `/proc` via `vfs.mountInternal` (scoop-invisible, not persisted). `cat /proc/<pid>/{status,cmdline,cwd,stat}` works from any panel terminal.
+- `realm/` — generalized hard-killable runner for `node` / `.jsh` / `python`. `runInRealm({ kind: 'js' \| 'py', … })` spawns a per-task `DedicatedWorker` (standalone JS + both-mode Python) or sandbox iframe (extension JS); SIGKILL → `worker.terminate()` / `iframe.remove()`, exit 137. Kernel-side `realm-host` proxies `vfs` / `exec` / `fetch` RPC over the realm's port so realm code stays sandboxed.
+- `terminal-session-{host,client}.ts` — terminal RPC over the kernel transport. Each panel-typed command spawns a `kind:'shell'` process; SIGINT routes to `pm.signal`.
+- `remote-terminal-view.ts` — page-side xterm. Pre-intercepts `mount /<path>` so the keystroke gesture can drive `showDirectoryPicker` (the worker has no `window`).
+
+Deep reference: `docs/kernel/process-model.md`.
+
 ### Orchestrator
 
 - Path: `packages/webapp/src/scoops/`
@@ -76,13 +89,23 @@ User → ChatPanel → Orchestrator → ScoopContext.prompt() → pi-agent-core 
 
 - Path: `packages/webapp/src/core/context-compaction.ts`
 - Handles large-context summarization, image resizing, and overflow recovery.
+- When `onMemoryUpdates` is wired on `CompactionConfig` (cone only — see `scoop-context.ts` wiring), compaction makes a second LLM call that shares the same system prompt to extract durable memories. The system prompt embeds the serialized conversation so Anthropic prompt caching hits on the prefix and the memory call is near-free. Memory bullets land in `/shared/CLAUDE.md` via `orchestrator.appendGlobalMemory`. Memory extraction is best-effort and never blocks compaction.
+- `runOneOffCompactionCall` is the reusable primitive — same shared-system-prompt shape, single call. Used by the "New session" freezer to generate a title and extract memories over the live cone session.
+
+### Frozen Sessions ("New session" flow)
+
+- Path: `packages/webapp/src/ui/session-freezer.ts`, `packages/webapp/src/ui/new-session.ts`
+- The avatar-popover "New session" entry and thread-header refresh button both run the freezer over the cone session, then clear only the cone (scoops survive). The freezer writes `/sessions/<timestamp>-<slug>.md` (YAML frontmatter + an HTML-commented `slicc:session-data` block carrying the structured `ChatMessage[]` + a human-readable markdown body) and prepends an entry to `/sessions/index.json`.
+- `scoops-panel.ts` renders the index as a frozen-sessions section below the live scoops list (standalone only — extension hides the rail). Clicking an entry reads the archive, parses it via `parseFrozenArchive`, and hands the messages to `ChatPanel.displayFrozenSession` for a read-only render — same affordance as clicking a live scoop.
+- Clearing semantics: `OffscreenClient.clearAllMessages()` is cone-only. It awaits the bridge's `clear-chat-ack` before resolving so the panel can `location.reload()` without racing the offscreen agent context (which survives the panel reload in extension mode).
 
 ### UI
 
 - Path: `packages/webapp/src/ui/`
 - Vanilla TypeScript; no framework.
 - `main.ts` boots standalone mode or delegates to the extension offscreen client.
-- `layout.ts`, `tabbed-ui.ts`, and `tab-zone.ts` manage the main container model.
+- `layout.ts`, `tabbed-ui.ts`, and `tab-zone.ts` manage the main container model. `Layout(root, isExtension)` constructs the shell; the `isExtension` flag is not styling-only — it toggles scoops-rail visibility, scoop-switcher use, rail full-page behavior, and avatar location. The detached popout mode (see `docs/superpowers/specs/2026-05-13-extension-detached-popout-design.md`) uses `isExtension=false` so a popped-out tab gets the full standalone rail UX, not a stretched side panel.
+- `runtime-mode.ts` defines `UiRuntimeMode` (`'standalone' | 'extension' | 'electron-overlay' | 'extension-detached'`) — `resolveUiRuntimeMode()` inspects `window.location.href` and the extension flag to pick the boot path in `main.ts`.
 - `preview-sw.ts` serves `/preview/*` content from VFS and is built as a standalone IIFE.
 - **Design-time chat fixture**: load the app with `?ui-fixture=1` (also accepts `?ui-fixture` or `?ui-fixture=true`) to swap the chat view for a synthetic session covering every message variant — user/assistant bubbles, markdown + code blocks, all four tool-call states, the six lick channels, delegation, queued messages, and a streaming tail. Messages live in `chat-fixture.ts` (pure `createChatFixture()`) and persist to a dedicated `session-ui-fixture` id so real scoop storage is untouched; clicking any real scoop cleanly exits fixture mode. Vite HMR picks up CSS changes live against the fixture. When adding new message UI variants, extend `createChatFixture()` and the matching assertion in `tests/ui/chat-fixture.test.ts` so the harness stays comprehensive.
 
@@ -113,6 +136,7 @@ User → ChatPanel → Orchestrator → ScoopContext.prompt() → pi-agent-core 
 - **Dual-mode compatibility**: browser features must work in both standalone/CLI and extension runtimes.
 - **Model IDs**: use pi-ai aliases such as `claude-opus-4-6`, not dated snapshot names.
 - **Provider composition**: providers are auto-discovered from pi-ai plus `packages/webapp/src/providers/built-in/`; external provider configs live in `packages/webapp/providers/`, and build-time filtering lives in `packages/dev-tools/providers.build.json`.
+- **Adobe `X-Session-Id` invariant**: every LLM call to the Adobe proxy must attach the `X-Session-Id` header (`scoops/scoop-context.ts` wires it for both the agent `streamFn` and compaction `headers`). New LLM call sites — direct `streamSimple` / `completeSimple` callers, or pi-coding-agent helpers like `generateSummary` — must attach it explicitly or the proxy session-id grouping breaks. `providers/adobe.ts`'s `ensureSessionIdHeader` is a defense-in-depth net that injects a daily-rotated sentinel UUID and warns when a caller didn't attach one — fix the call site rather than relying on the fallback. See `docs/pitfalls.md` for the full contract, tripwire, and verification SQL.
 
 ## VFS API Patterns
 
@@ -130,6 +154,7 @@ User → ChatPanel → Orchestrator → ScoopContext.prompt() → pi-agent-core 
 - Command name is the basename without `.jsh`.
 - `packages/webapp/src/shell/script-catalog.ts` shares discovery across `WasmShell`, `which`, and other lookup paths. Raw scanning still comes from `jsh-discovery.ts`, which scans `/workspace/skills` first, then the wider VFS.
 - Scripts run in an async wrapper: prefer top-level `await` and always `await fs.*` operations.
+- Stdin from upstream pipelines is fully buffered (no streaming) and exposed via `process.stdin`. `read()` drains the buffer with Node-like EOF semantics (returns the buffered string the first time, `null` thereafter) and shares that consumed state with `for await (const chunk of process.stdin)`. `String(process.stdin)` is a non-consuming view. `process.stdin.isTTY` is always `false`. `node`'s read-from-stdin branch (when stdin is the script source) hands the inner script an empty stdin so it can't read its own source. Stdin is intentionally NOT exposed as a top-level identifier so user scripts can keep declaring `const stdin = …` without colliding.
 
 ### `.bsh` browser scripts
 
@@ -142,9 +167,32 @@ User → ChatPanel → Orchestrator → ScoopContext.prompt() → pi-agent-core 
 - Optional `// @match` directives in the first 10 lines narrow matching further.
 - `BshWatchdog` uses `ScriptCatalog` for matching and reads script content from VFS before evaluating it in the target page via CDP.
 
+## Secret-Aware Fetch Proxy
+
+The webapp consumes `@slicc/shared-ts` for secret masking primitives. `createProxiedFetch()` in `packages/webapp/src/shell/proxied-fetch.ts` routes agent-initiated HTTP through the fetch proxy. In extension mode, the extension branch is Port-based (`chrome.runtime.connect({ name: 'fetch-proxy.fetch' })`) instead of direct fetch, providing full secret-injection coverage equivalent to CLI mode.
+
+### OAuth flow + page-side bootstrap
+
+- `packages/webapp/src/ui/oauth-bootstrap.ts` is awaited in `main()` before the kernel-worker scoops start. For each non-expired account it re-pushes the masked replica; for each expiring/expired one it invokes the provider's optional `onSilentRenew` hook (page context has `window`, so the IMS popup/iframe flow works there). Bounded by a 10s soft timeout to avoid deadlocking the UI on a hung IMS popup. The worker reads the freshly-renewed token from its `localStorage` shim once it boots.
+- `provider.onSilentRenew` is the new hook on `ProviderConfig` — providers that support silent renewal implement it (Adobe does via `silentRenewToken`). The worker-side `silentRenewToken` short-circuits with `if (typeof window === 'undefined') return null;` so a stale-token stream attempt from the worker surfaces a clean "session expired" error instead of `window is not defined`.
+
+### Per-provider extra allowed domains
+
+Provider `oauthTokenDomains` is an immutable safe default; users can layer additional allowed domains per-provider:
+
+- Storage: `localStorage["slicc_oauth_extra_domains"]` → `{[providerId]: [domain, ...]}`
+- Helpers: `getExtraOAuthDomains(id)` / `setExtraOAuthDomains(id, domains)` / `getAllExtraOAuthDomains()` in `provider-settings.ts`
+- Surfaces: panel terminal `oauth-domain` command, extension options page "OAuth domains" tab
+- Merge: `saveOAuthAccount` concatenates defaults + extras, dedupes case-insensitively (defaults-first order), then pushes the merged list to the fetch-proxy / SW.
+
+### Shell-env masked secret population
+
+`scoop-context.ts` (agent shell) and `main.ts` (panel terminal `RemoteTerminalView`) both call `fetchSecretEnvVars()` from `packages/webapp/src/core/secret-env.ts` and pass the result as `env`. The function filters secret names to POSIX-valid identifiers (`/^[A-Za-z_][A-Za-z0-9_]*$/`) so dot-namespaced internal secrets (`s3.<profile>.*`, `oauth.<id>.token`) stay out of `$ENV` / `printenv`.
+
 ## Related Guides
 
 - `packages/chrome-extension/CLAUDE.md` for extension runtime constraints
 - `packages/node-server/CLAUDE.md` for the CLI/Electron float
+- `packages/shared-ts/CLAUDE.md` for secret masking primitives
 - `docs/architecture.md` for repo-wide file maps and deeper subsystem inventories
 - `docs/shell-reference.md` for command-by-command shell behavior

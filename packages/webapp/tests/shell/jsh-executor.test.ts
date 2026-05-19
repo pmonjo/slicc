@@ -112,14 +112,15 @@ function createMockCtx(
   execFn?: (
     command: string,
     options: { cwd?: string }
-  ) => Promise<{ stdout: string; stderr: string; exitCode: number }>
+  ) => Promise<{ stdout: string; stderr: string; exitCode: number }>,
+  stdin = ''
 ): CommandContext {
   const env = new Map<string, string>(Object.entries(envVars));
   const ctx: CommandContext = {
     fs: createMockFs(files),
     cwd: '/workspace',
     env,
-    stdin: '',
+    stdin,
   };
   if (execFn) {
     ctx.exec = execFn as CommandContext['exec'];
@@ -316,25 +317,11 @@ describe('executeJshFile', () => {
     expect(result.stdout).toContain('not pre-loaded');
   });
 
-  it('require returns pre-cached module', async () => {
-    // Pre-populate cache before execution
-    const { nodeRuntimeState } = await import('../../src/shell/supplemental-commands/shared.js');
-    nodeRuntimeState.__requireCache = Object.create(null);
-    (nodeRuntimeState.__requireCache as Record<string, unknown>)['test-sentinel-pkg'] = {
-      hello: 'world',
-    };
-
-    const ctx = createMockCtx({
-      '/workspace/req-cached.jsh':
-        'const mod = require("test-sentinel-pkg"); console.log(JSON.stringify(mod));',
-    });
-    const result = await executeJshFile('/workspace/req-cached.jsh', [], ctx);
-    expect(result.exitCode).toBe(0);
-    expect(result.stdout).toContain('{"hello":"world"}');
-
-    // Clean up
-    delete nodeRuntimeState.__requireCache;
-  });
+  // Phase-8 removed the kernel-side `nodeRuntimeState.__requireCache`.
+  // Each realm task fetches its own modules via esm.sh; there's no
+  // shared cache to pre-populate from outside the realm. The
+  // require-pre-loaded path is covered by the negative test above
+  // (`require throws for non-pre-scanned dynamic specifiers`).
 
   it('require("fs") returns the fs bridge', async () => {
     const ctx = createMockCtx({
@@ -510,5 +497,239 @@ describe('exec bridge', () => {
     expect(result.exitCode).toBe(0);
     expect(result.stderr.trim()).toBe('permission denied');
     expect(result.stdout.trim()).toBe('1');
+  });
+});
+
+describe('jsh-executor — process manager wiring', () => {
+  it('registers a kind:"jsh" process for executeJshFile and exits with the script exit code', async () => {
+    const { ProcessManager } = await import('../../src/kernel/process-manager.js');
+    const pm = new ProcessManager();
+    const ctx = createMockCtx({
+      '/workspace/hi.jsh': 'console.log("hi")',
+    });
+    await executeJshFile('/workspace/hi.jsh', ['a', 'b'], ctx, {
+      processManager: pm,
+      owner: { kind: 'cone' },
+      getParentPid: () => 5000,
+    });
+    const procs = pm.list();
+    expect(procs).toHaveLength(1);
+    expect(procs[0].kind).toBe('jsh');
+    expect(procs[0].argv).toEqual(['node', '/workspace/hi.jsh', 'a', 'b']);
+    expect(procs[0].ppid).toBe(5000);
+    expect(procs[0].exitCode).toBe(0);
+    expect(procs[0].status).toBe('exited');
+  });
+
+  it('records process.exit(N) as the kind:"jsh" exit code', async () => {
+    const { ProcessManager } = await import('../../src/kernel/process-manager.js');
+    const pm = new ProcessManager();
+    const ctx = createMockCtx({
+      '/workspace/fail.jsh': 'process.exit(7);',
+    });
+    const result = await executeJshFile('/workspace/fail.jsh', [], ctx, {
+      processManager: pm,
+      owner: { kind: 'system' },
+    });
+    expect(result.exitCode).toBe(7);
+    expect(pm.list()[0].exitCode).toBe(7);
+  });
+
+  it('exits 1 on a thrown script error', async () => {
+    const { ProcessManager } = await import('../../src/kernel/process-manager.js');
+    const pm = new ProcessManager();
+    const ctx = createMockCtx({
+      '/workspace/throw.jsh': 'throw new Error("boom");',
+    });
+    const result = await executeJshFile('/workspace/throw.jsh', [], ctx, {
+      processManager: pm,
+      owner: { kind: 'system' },
+    });
+    expect(result.exitCode).toBe(1);
+    expect(pm.list()[0].exitCode).toBe(1);
+  });
+
+  it('does not register processes when no pmConfig is supplied (backwards compatible)', async () => {
+    const ctx = createMockCtx({
+      '/workspace/hi.jsh': 'console.log("hi")',
+    });
+    const result = await executeJshFile('/workspace/hi.jsh', [], ctx);
+    expect(result.exitCode).toBe(0);
+  });
+});
+
+describe('stdin in .jsh scripts', () => {
+  it('exposes piped stdin via process.stdin.read()', async () => {
+    const ctx = createMockCtx(
+      {
+        '/workspace/cat.jsh': 'const data = process.stdin.read(); process.stdout.write(data);',
+      },
+      {},
+      undefined,
+      'hello from upstream\n'
+    );
+    const result = await executeJshFile('/workspace/cat.jsh', [], ctx);
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toBe('hello from upstream\n');
+  });
+
+  it('returns the byte length when stdin is read as a string', async () => {
+    const ctx = createMockCtx(
+      { '/workspace/read.jsh': 'console.log(process.stdin.read().length);' },
+      {},
+      undefined,
+      'abcdef'
+    );
+    const result = await executeJshFile('/workspace/read.jsh', [], ctx);
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout.trim()).toBe('6');
+  });
+
+  it('supports `for await (const chunk of process.stdin)` iteration', async () => {
+    const ctx = createMockCtx(
+      {
+        '/workspace/iter.jsh':
+          'let total = ""; for await (const c of process.stdin) total += c; console.log(total.toUpperCase());',
+      },
+      {},
+      undefined,
+      'hi'
+    );
+    const result = await executeJshFile('/workspace/iter.jsh', [], ctx);
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout.trim()).toBe('HI');
+  });
+
+  it('returns null on subsequent process.stdin.read() calls (Node EOF semantics)', async () => {
+    const ctx = createMockCtx(
+      {
+        '/workspace/eof.jsh':
+          'const a = process.stdin.read(); const b = process.stdin.read(); console.log(JSON.stringify({ a, b }));',
+      },
+      {},
+      undefined,
+      'data'
+    );
+    const result = await executeJshFile('/workspace/eof.jsh', [], ctx);
+    expect(result.exitCode).toBe(0);
+    expect(JSON.parse(result.stdout.trim())).toEqual({ a: 'data', b: null });
+  });
+
+  it('shares EOF state between read() and the async iterator', async () => {
+    const ctx = createMockCtx(
+      {
+        '/workspace/shared-eof.jsh':
+          'process.stdin.read(); let n = 0; for await (const _ of process.stdin) n++; console.log(n);',
+      },
+      {},
+      undefined,
+      'data'
+    );
+    const result = await executeJshFile('/workspace/shared-eof.jsh', [], ctx);
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout.trim()).toBe('0');
+  });
+
+  it('async iterator yields once then ends', async () => {
+    const ctx = createMockCtx(
+      {
+        '/workspace/iter-twice.jsh': [
+          'let first = ""; for await (const c of process.stdin) first += c;',
+          'let second = ""; for await (const c of process.stdin) second += c;',
+          'console.log(JSON.stringify({ first, second }));',
+        ].join('\n'),
+      },
+      {},
+      undefined,
+      'once'
+    );
+    const result = await executeJshFile('/workspace/iter-twice.jsh', [], ctx);
+    expect(result.exitCode).toBe(0);
+    expect(JSON.parse(result.stdout.trim())).toEqual({ first: 'once', second: '' });
+  });
+
+  it('process.stdin.toString() is a non-consuming view', async () => {
+    const ctx = createMockCtx(
+      {
+        '/workspace/view.jsh': [
+          'const view = String(process.stdin);',
+          'const read = process.stdin.read();',
+          'console.log(JSON.stringify({ view, read }));',
+        ].join('\n'),
+      },
+      {},
+      undefined,
+      'data'
+    );
+    const result = await executeJshFile('/workspace/view.jsh', [], ctx);
+    expect(result.exitCode).toBe(0);
+    expect(JSON.parse(result.stdout.trim())).toEqual({ view: 'data', read: 'data' });
+  });
+
+  it('exposes null + empty defaults when no stdin is piped', async () => {
+    const ctx = createMockCtx({
+      '/workspace/empty.jsh':
+        'console.log(JSON.stringify({ first: process.stdin.read(), second: process.stdin.read(), tty: process.stdin.isTTY }));',
+    });
+    const result = await executeJshFile('/workspace/empty.jsh', [], ctx);
+    expect(result.exitCode).toBe(0);
+    // Even with no piped input, the first read drains the (empty) buffer
+    // and subsequent reads return null — same behavior as a real EOF stream.
+    expect(JSON.parse(result.stdout.trim())).toEqual({
+      first: '',
+      second: null,
+      tty: false,
+    });
+  });
+
+  it('preserves binary-shaped (latin1) stdin bytes verbatim', async () => {
+    // just-bash threads non-UTF-8 binary as a latin1 string (one JS char
+    // per byte). The realm must hand it back to user code byte-identical.
+    const bytes = String.fromCharCode(0x00, 0xff, 0x7f, 0x80, 0xc3, 0xa9);
+    const ctx = createMockCtx(
+      {
+        '/workspace/echo.jsh':
+          'const data = process.stdin.read(); const codes = []; for (const c of data) codes.push(c.charCodeAt(0)); console.log(codes.join(","));',
+      },
+      {},
+      undefined,
+      bytes
+    );
+    const result = await executeJshFile('/workspace/echo.jsh', [], ctx);
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout.trim()).toBe('0,255,127,128,195,169');
+  });
+
+  it('does not collide with scripts that declare their own `stdin` identifier', async () => {
+    // Earlier drafts of this feature injected `stdin` as a 9th
+    // AsyncFunction parameter. That would have made the line below a
+    // strict-mode SyntaxError (duplicate declaration). Surfacing only
+    // via `process.stdin` keeps the identifier free for user code.
+    const ctx = createMockCtx(
+      {
+        '/workspace/local-name.jsh': [
+          'const stdin = "user-owned name";',
+          'console.log(stdin);',
+        ].join('\n'),
+      },
+      {},
+      undefined,
+      'piped'
+    );
+    const result = await executeJshFile('/workspace/local-name.jsh', [], ctx);
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout.trim()).toBe('user-owned name');
+  });
+
+  it('does not break scripts that ignore stdin', async () => {
+    const ctx = createMockCtx(
+      { '/workspace/quiet.jsh': 'console.log("ok");' },
+      {},
+      undefined,
+      'some piped input the script will never read'
+    );
+    const result = await executeJshFile('/workspace/quiet.jsh', [], ctx);
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toBe('ok\n');
   });
 });

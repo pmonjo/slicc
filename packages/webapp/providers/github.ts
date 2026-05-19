@@ -27,20 +27,21 @@ import {
   streamOpenAICompletions,
   streamSimpleOpenAICompletions,
   createAssistantMessageEventStream,
-} from '@mariozechner/pi-ai';
+} from '@earendil-works/pi-ai';
 import type {
   Api,
   Model,
   Context,
   SimpleStreamOptions,
   OpenAICompletionsOptions,
-} from '@mariozechner/pi-ai';
-import { saveOAuthAccount, getAccounts } from '../src/ui/provider-settings.js';
+} from '@earendil-works/pi-ai';
+import { saveOAuthAccount, getAccounts, getOAuthAccountInfo } from '../src/ui/provider-settings.js';
 import {
   exchangeOAuthCode,
   revokeOAuthToken,
   getWorkerBaseUrl,
 } from '../src/providers/oauth-code-exchange.js';
+import { getOAuthPageOrigin } from '../src/providers/oauth-service.js';
 import { GLOBAL_FS_DB_NAME } from '../src/fs/global-db.js';
 
 // ── Config ─────────────────────────────────────────────────────────
@@ -431,6 +432,13 @@ export const config: ProviderConfig = {
   requiresBaseUrl: false,
   isOAuth: true,
   defaultModelId: 'gpt-4.1', // substring-matched against openai/gpt-4.1
+  oauthTokenDomains: [
+    'github.com',
+    '*.github.com',
+    'api.github.com',
+    'raw.githubusercontent.com',
+    'models.github.ai',
+  ],
 
   getModelIds: () => GITHUB_MODELS,
 
@@ -450,9 +458,14 @@ export const config: ProviderConfig = {
     // reads the `state` param (source=local|extension) and forwards to the
     // correct final destination. Using one registered URL per OAuth App lets
     // GitHub OAuth Apps (single-callback) work for both CLI and extension.
+    //
+    // The CLI branch resolves `origin` / `href` via `getOAuthPageOrigin()` so
+    // the same code works when `onOAuthLogin` is invoked from a shell command
+    // running inside the kernel `DedicatedWorker` (which has no `window`).
+    const pageInfo = isExtension ? null : await getOAuthPageOrigin();
     const redirectUri = isExtension
       ? `${getWorkerBaseUrl()}/auth/callback`
-      : `${runtimeWorkerBaseUrl ?? window.location.origin}/auth/callback`;
+      : `${runtimeWorkerBaseUrl ?? pageInfo!.origin}/auth/callback`;
 
     const nonce = crypto.randomUUID();
     const extensionId = isExtension
@@ -461,7 +474,7 @@ export const config: ProviderConfig = {
     const stateData = isExtension
       ? { source: 'extension', extensionId, path: '/github', nonce }
       : {
-          port: parseInt(new URL(window.location.href).port || '5710', 10),
+          port: parseInt(new URL(pageInfo!.href).port || '5710', 10),
           path: '/auth/callback',
           nonce,
         };
@@ -514,15 +527,21 @@ export const config: ProviderConfig = {
     const userProfile = await fetchUserProfile(tokenResult.access_token);
 
     // Save account
-    saveOAuthAccount({
+    await saveOAuthAccount({
       providerId: 'github',
       accessToken: tokenResult.access_token,
       userName: userProfile.name,
       userAvatar: userProfile.avatar,
     });
 
-    // Bridge token to isomorphic-git
-    await writeGitToken(tokenResult.access_token);
+    // Bridge token to isomorphic-git — use the masked value, not the real token
+    const info = getOAuthAccountInfo('github');
+    const masked = info?.maskedValue;
+    if (masked) {
+      await writeGitToken(masked);
+    } else {
+      await clearGitToken();
+    }
 
     // Seed git user.name / user.email so commits are attributed to the
     // authenticated GitHub identity instead of the placeholder
@@ -546,7 +565,7 @@ export const config: ProviderConfig = {
     // Clear git token from VFS
     await clearGitToken();
     // Clear account
-    saveOAuthAccount({ providerId: 'github', accessToken: '' });
+    await saveOAuthAccount({ providerId: 'github', accessToken: '' });
   },
 };
 

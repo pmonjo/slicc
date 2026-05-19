@@ -227,11 +227,47 @@ describe('OffscreenClient', () => {
     expect(envelope.payload.type).toBe('request-state');
   });
 
-  it('sends clear-chat', () => {
-    client.clearAllMessages();
+  it('sends clear-chat with a requestId and resolves once the ack arrives', async () => {
+    const pending = client.clearAllMessages();
 
     const envelope = sentMessages[0] as { source: string; payload: any };
     expect(envelope.payload.type).toBe('clear-chat');
+    expect(typeof envelope.payload.requestId).toBe('string');
+    expect(envelope.payload.requestId.length).toBeGreaterThan(0);
+
+    // Mirror the bridge's ack so the awaited Promise resolves.
+    simulateMessage('offscreen', {
+      type: 'clear-chat-ack',
+      requestId: envelope.payload.requestId,
+    });
+    await pending;
+  });
+
+  it('clear-chat resolves on timeout if no ack arrives', async () => {
+    vi.useFakeTimers();
+    try {
+      const pending = client.clearAllMessages();
+      // 5s timeout backs out cleanly so the panel can reload anyway.
+      vi.advanceTimersByTime(5000);
+      await pending;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('blocks outbound messages when locked', () => {
+    // updateModel() is a public method that calls this.send({ type: 'refresh-model' }).
+    // Source: packages/webapp/src/ui/offscreen-client.ts updateModel() at ~line 222.
+    client.updateModel();
+    const beforeLockCount = sentMessages.length;
+
+    client.setLocked(true);
+    client.updateModel();
+    expect(sentMessages.length).toBe(beforeLockCount); // no new send
+
+    client.setLocked(false);
+    client.updateModel();
+    expect(sentMessages.length).toBeGreaterThan(beforeLockCount);
   });
 
   it('ignores messages from non-offscreen sources', () => {
@@ -344,6 +380,29 @@ describe('OffscreenClient', () => {
       activeScoopJid: null,
     });
     expect(onReady).toHaveBeenCalled();
+  });
+
+  it('resets ready and re-requests state when offscreen restarts mid-session', () => {
+    const onReady = vi.fn();
+    const c2 = new OffscreenClient({ ...callbacks, onReady });
+
+    // First boot: offscreen-ready → request-state → state-snapshot → ready
+    simulateMessage('offscreen', { type: 'offscreen-ready' });
+    simulateMessage('offscreen', { type: 'state-snapshot', scoops: [], activeScoopJid: null });
+    expect(c2.isReady()).toBe(true);
+    expect(onReady).toHaveBeenCalledTimes(1);
+    sentMessages.length = 0;
+
+    // Offscreen restarts: second offscreen-ready while already ready
+    simulateMessage('offscreen', { type: 'offscreen-ready' });
+    expect(c2.isReady()).toBe(false);
+    const requestStateMsg = (sentMessages[0] as { payload: any })?.payload;
+    expect(requestStateMsg?.type).toBe('request-state');
+
+    // New state-snapshot arrives → onReady fires again
+    simulateMessage('offscreen', { type: 'state-snapshot', scoops: [], activeScoopJid: null });
+    expect(c2.isReady()).toBe(true);
+    expect(onReady).toHaveBeenCalledTimes(2);
   });
 
   it('handles tool_start and tool_end events', () => {

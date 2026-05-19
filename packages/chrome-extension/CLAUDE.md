@@ -12,7 +12,7 @@ The extension keeps the agent alive when the side panel closes by splitting resp
 
 ```text
 Side Panel (UI)
-  offscreen-client.ts, tabbed UI, terminal shell
+  offscreen-client.ts, side panel UI, terminal shell
         ↓ chrome.runtime messages
 Service Worker Relay
   service-worker.ts, chrome.debugger proxy, tab grouping
@@ -26,6 +26,43 @@ Offscreen Document
 - **Side panel**: user-visible UI, terminal tab, reconnect logic.
 - **Service worker**: routes messages between panel and offscreen, proxies CDP to `chrome.debugger`.
 - **Offscreen document**: runs the agent engine, orchestrator, VFS, and tool execution loop.
+
+## Detached Popout
+
+The extension supports popping the side panel out into a full-page tab
+via a "Pop out" button in the side panel header, or by opening
+`chrome-extension://<id>/index.html?detached=1` directly.
+
+**Mutual exclusion** is global across all Chrome windows: at most one
+detached tab exists at a time, and while it does the side panel is
+disabled. The service worker is the sole coordinator and persists
+the locked tab ID in `chrome.storage.session`.
+
+**Boot reconciliation:** `reconcileDetachedLockOnBoot()` runs at
+top-level + `onStartup` + `onInstalled`, so MV3 SW eviction and
+browser cold-start cannot leave the lock half-applied.
+
+**Three-layer mutual exclusion** on the panel side. In code,
+`enterDetachedActiveState` executes them in this order:
+
+1. `window.close()` — happy path.
+2. `OffscreenClient.setLocked(true)` — short-circuits the private
+   `send()` chokepoint so no user-action message reaches offscreen
+   even if `window.close()` doesn't take effect. Done BEFORE the
+   overlay paints so a still-visible send button can't leak traffic
+   in the interim.
+3. `Layout.showDetachedActiveOverlay()` — non-dismissible visual
+   feedback with a "Close this window" button.
+
+Separately, the SW makes a best-effort `chrome.sidePanel.close({ windowId })`
+call per window after broadcasting `detached-active` (Chrome 141+).
+This is independent of `enterDetachedActiveState`.
+
+**Non-detached `index.html` tabs** (e.g., the local QA recipe surface)
+are treated as side-panel-equivalent: they DO listen for `detached-active`
+and self-close, but DO NOT count as the canonical detached tab.
+
+**Spec:** `docs/superpowers/specs/2026-05-13-extension-detached-popout-design.md`.
 
 ## Key Files
 
@@ -45,7 +82,7 @@ Offscreen Document
 - `tool-ui-sandbox.html` and related HTML shells exist for specialized extension UI surfaces.
 - When loading bundled assets, prefer `chrome.runtime.getURL(...)`.
 - **External CDN scripts in sprinkles** are fetch-and-inlined by `sprinkle-renderer.ts` (full-doc) or via `sprinkle-fetch-script` parent relay (partial-content). Never use `<script src="https://...">` directly in sandbox HTML.
-- **npm packages in `node -e`** use esm.sh `?bundle` + indirect Function constructor. Never use `import()` with external URLs in sandbox context.
+- **npm packages in `node -e`** are pre-fetched by the per-task realm iframe via `cdn.jsdelivr.net/npm/<id>` + indirect `Function` constructor (the sandbox CSP allows `Function` but not cross-origin `import()`). The realm runtime owns this path now (see `kernel/realm/`), not the legacy inline node-command code.
 - **Extension-relative scripts** must load statically in `<head>`, not via dynamic `createElement('script').src` (opaque origin blocks runtime loads).
 - See `docs/pitfalls.md` "Extension Sandbox: External Scripts & Opaque Origin" for the full reference.
 
@@ -63,7 +100,7 @@ If a shell command needs to affect the panel UI, use the dual-context pattern:
 1. try a direct `window.__slicc_*` hook when running in the panel
 2. fall back to `chrome.runtime.sendMessage(...)` when running from offscreen
 
-`debug on` is the canonical example of this pattern.
+No supplemental command currently uses this exact hook+relay shape — the previous example (`debug-command.ts`) was removed when Terminal/Memory became unconditional in the rail. The sprinkle subsystem solves a related problem with a proxy-interface approach (`globalThis.__slicc_sprinkleManager` published in both realms with different implementations, dispatching `sprinkle-op` request/response RPCs); see `docs/pitfalls.md` "Extension Dual-Shell Context" for the full reference.
 
 ## Runtime Conventions
 
@@ -168,8 +205,88 @@ pkill -f "Google Chrome.*slicc-ext-profile"
 The same `EXT` and `PROFILE` paths can be reused on the next run, but
 re-running step 1 + step 3 is the safest way to pick up code changes.
 
+### Detached popout QA scenarios
+
+Build with `SLICC_EXT_DEV=1` (as above) and launch Chrome for Testing
+with the recipe. Then verify each scenario:
+
+1. **Click popout button from side panel.**
+   - Side panel header shows "Pop out" button.
+   - Click → new tab opens at
+     `chrome-extension://<id>/index.html?detached=1`.
+   - Side panel closes itself.
+   - Chat history is intact in the detached tab.
+
+2. **Toolbar icon while detached open.**
+   - Click toolbar icon → existing detached tab focuses, side panel
+     does NOT open.
+   - If detached tab is in another window, the window also focuses.
+
+3. **Close detached → return to side panel.**
+   - Close the detached tab.
+   - Click toolbar icon → side panel opens normally.
+
+4. **Direct URL access.**
+   - Paste `chrome-extension://<id>/index.html?detached=1` into a new
+     tab.
+   - It boots into detached mode and locks the side panel.
+
+5. **Reload detached tab.**
+   - Ctrl-R the detached tab.
+   - It rehydrates into detached mode (idempotent claim, no extra tabs).
+
+6. **Browser restart with "Continue where you left off."**
+   - Close all Chrome for Testing windows with the detached tab open.
+   - Relaunch.
+   - When the restored detached tab activates, the lock re-applies.
+   - Verify the discarded-state caveat: if Chrome restores the tab as
+     discarded, side panel may briefly be available; once the user
+     focuses the detached tab, lock applies.
+
+7. **Drag detached tab to a new window.**
+   - Drag tab out of its window.
+   - In the new window, click the toolbar icon → existing detached
+     tab focuses (in the other window).
+
+8. **Extension-page capability differences.**
+   - In the detached tab, run a mount command that uses
+     `showDirectoryPicker()` (e.g., `mount /workspace/scratch`).
+     Verify it works under a normal tab gesture context, since the
+     detached tab is a normal tab not a side panel.
+   - Verify mic/voice input behaves the same as in the side panel
+     (or note differences for follow-up).
+
+9. **Tray runtime config survives popout.**
+   - In the side panel, configure tray runtime (paste join URL).
+   - Click popout.
+   - In the detached tab, verify the tray runtime is still connected
+     and `refresh-tray-runtime` relays work.
+
+## Secret-Aware Fetch Proxy
+
+The service worker handles `fetch-proxy.fetch` Port connections for secret-aware HTTP proxying. The Port `onMessage` listener attaches **synchronously** in `onConnect` (via `handleFetchProxyConnectionAsync` — the pipeline is awaited INSIDE the listener); the previous "await build → then add listener" pattern silently dropped the page's immediate `request` message, which made `curl` hang. See `docs/pitfalls.md` "Chrome Port: onMessage Listener Must Attach Synchronously".
+
+The SW also exposes message handlers:
+
+- `secrets.list-masked-entries` — used by the page's `fetchSecretEnvVars()` to populate the agent shell env with masked values
+- `secrets.mask-oauth-token` — round-trip mask for an OAuth provider after `saveOAuthAccount`
+- `secrets.list` / `secrets.set` / `secrets.delete` — management ops for the panel-terminal `secret` shell command. Offscreen documents don't expose `chrome.storage` (MV3 quirk), so these proxy the storage call through the SW. See `docs/pitfalls.md` "Offscreen Documents: Smaller chrome.\* Surface than the SW".
+
+The webapp's `createProxiedFetch()` extension branch uses the Port handler instead of direct fetch, providing full secret injection equivalent to CLI mode.
+
+### OAuth-token extra allowed domains
+
+Each provider's hardcoded `oauthTokenDomains` is the immutable default safelist. Users can layer additional allowed domains per-provider via:
+
+- the panel-terminal `oauth-domain` shell command
+- the **OAuth domains** tab on the options page (`secrets.html`)
+- direct `localStorage` edit of `slicc_oauth_extra_domains` at the extension origin
+
+The extras are read by `saveOAuthAccount` in `provider-settings.ts` and merged with provider defaults (deduped case-insensitively) before being pushed to `chrome.storage.local`'s `oauth.<id>.token_DOMAINS`. Page-side `oauth-bootstrap` re-pushes the merged list on every page load, so newly-added extras apply on next side-panel reload.
+
 ## Related Guides
 
 - `packages/webapp/CLAUDE.md` for shared browser architecture
+- `packages/shared-ts/CLAUDE.md` for secret masking primitives
 - `docs/architecture.md` for the detailed extension message flow and persistence model
 - `docs/pitfalls.md` for extension-specific gotchas

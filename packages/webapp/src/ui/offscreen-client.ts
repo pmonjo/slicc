@@ -31,6 +31,9 @@ import type {
 import { createLogger } from '../core/logger.js';
 import { setLeaderTrayRuntimeStatus } from '../scoops/tray-leader.js';
 import { setFollowerTrayRuntimeStatus } from '../scoops/tray-follower-status.js';
+import type { KernelClientFacade, KernelTransport } from '../kernel/types.js';
+import { createPanelChromeRuntimeTransport } from '../kernel/transport-chrome-runtime.js';
+import type { TerminalEventMsg } from '../shell/terminal-protocol.js';
 
 const log = createLogger('offscreen-client');
 
@@ -51,9 +54,19 @@ export interface OffscreenClientCallbacks {
   ) => void;
   /** Called when the offscreen engine is ready and state has been received. */
   onReady?: () => void;
+  /**
+   * Fired when a scoop's compaction transformer enters or leaves a
+   * phase. The panel uses this to render a ghost-bubble affordance
+   * while the agent is silent on summarize / memory-extract calls;
+   * `'idle'` clears the affordance.
+   */
+  onCompactionStateChange?: (
+    scoopJid: string,
+    state: 'summarizing' | 'extracting-memory' | 'idle'
+  ) => void;
 }
 
-export class OffscreenClient {
+export class OffscreenClient implements KernelClientFacade {
   private eventListeners = new Set<(event: UIAgentEvent) => void>();
   private callbacks: OffscreenClientCallbacks;
   private scoops: RegisteredScoop[] = [];
@@ -62,12 +75,38 @@ export class OffscreenClient {
   private ready = false;
   private stateRetryTimer: ReturnType<typeof setInterval> | null = null;
   private localFs: VirtualFS | null = null;
+  /**
+   * Pending `clear-chat` requests awaiting the bridge's ack. Keyed by
+   * `requestId`; resolved when a `clear-chat-ack` envelope arrives.
+   */
+  private pendingClearAcks = new Map<string, () => void>();
+  /**
+   * KernelTransport — defaults to the chrome.runtime adapter.
+   * A `MessageChannel`-backed transport can be passed via the
+   * constructor so the standalone panel can drive the same client
+   * over the kernel worker. The transport delivers raw
+   * `ExtensionMessage` envelopes either way so the existing source
+   * filter and special-case routing (`sprinkle-op`) stay intact.
+   */
+  private transport: KernelTransport<ExtensionMessage, PanelToOffscreenMessage>;
 
   /** Currently selected scoop JID (set by the UI). */
   selectedScoopJid: string | null = null;
 
-  constructor(callbacks: OffscreenClientCallbacks) {
+  private locked = false;
+
+  /**
+   * Optional transport injection. If omitted (today's extension
+   * panel), the chrome.runtime adapter is constructed. Standalone
+   * passes a `MessageChannel`-backed transport bound to the kernel
+   * worker.
+   */
+  constructor(
+    callbacks: OffscreenClientCallbacks,
+    transport?: KernelTransport<ExtensionMessage, PanelToOffscreenMessage>
+  ) {
     this.callbacks = callbacks;
+    this.transport = transport ?? createPanelChromeRuntimeTransport<PanelToOffscreenMessage>();
     this.setupMessageListener();
   }
 
@@ -201,6 +240,16 @@ export class OffscreenClient {
   }
 
   /**
+   * Mark this client as locked. While locked, all outbound traffic
+   * via send() is dropped and an error is surfaced to the UI.
+   * Used by the detached-popout flow to prevent a soon-to-close
+   * panel from sending duplicate user actions.
+   */
+  setLocked(locked: boolean): void {
+    this.locked = locked;
+  }
+
+  /**
    * Update a scoop's reasoning / thinking level on the offscreen
    * orchestrator. Mirrors the standalone-mode
    * `Orchestrator.setScoopThinkingLevel` call:
@@ -218,12 +267,37 @@ export class OffscreenClient {
     this.send({ type: 'set-thinking-level', scoopJid: jid, level });
   }
 
+  /**
+   * Cone-only chat clear. Sends a `clear-chat` envelope to the bridge
+   * and resolves only after the bridge's `clear-chat-ack` lands — so
+   * callers can `await` this before `location.reload()` without
+   * racing the offscreen document (which survives the panel reload in
+   * extension mode). A 5-second timeout backs out cleanly in the rare
+   * case the bridge is wedged; reload still proceeds.
+   */
   async clearAllMessages(): Promise<void> {
-    this.send({ type: 'clear-chat' });
+    const requestId = `clear-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const ack = new Promise<void>((resolve) => {
+      this.pendingClearAcks.set(requestId, resolve);
+    });
+    this.send({ type: 'clear-chat', requestId });
+    await Promise.race([ack, new Promise<void>((resolve) => setTimeout(resolve, 5000))]);
+    this.pendingClearAcks.delete(requestId);
   }
 
   clearFilesystem(): void {
     this.send({ type: 'clear-filesystem' });
+  }
+
+  /**
+   * Ask the worker for the canonical chat history of a scoop. The
+   * worker translates from the live `AgentMessage[]` and replies with
+   * a `scoop-messages-replaced` event the panel handler can swap in.
+   * Fire-and-forget — the worker may also no-op if the scoop is gone
+   * or has no history yet.
+   */
+  requestScoopMessages(scoopJid: string): void {
+    this.send({ type: 'request-scoop-messages', scoopJid } as PanelToOffscreenMessage);
   }
 
   /** Request full state from offscreen. Retries until state arrives. */
@@ -255,56 +329,75 @@ export class OffscreenClient {
   // Internal
   // -------------------------------------------------------------------------
 
-  private sprinkleOpHandler: ((payload: any) => void) | null = null;
+  private sprinkleOpHandler: ((payload: unknown) => void) | null = null;
 
   /** Send a sprinkle lick event to the offscreen orchestrator. */
   sendSprinkleLick(sprinkleName: string, body: unknown, targetScoop?: string): void {
-    this.send({ type: 'sprinkle-lick', sprinkleName, body, targetScoop } as any);
+    this.send({
+      type: 'sprinkle-lick',
+      sprinkleName,
+      body,
+      targetScoop,
+    } as PanelToOffscreenMessage);
+  }
+
+  /**
+   * Relay a webhook event from the page-side `LeaderTrayManager` into the
+   * worker-side `LickManager`. The leader receives `webhook.event` control
+   * messages from the Cloudflare tray; this method forwards them across the
+   * bridge so the lick manager (which lives in the kernel worker post-refactor)
+   * can route to the registered scoop. Fire-and-forget — no ack expected.
+   */
+  sendWebhookEvent(webhookId: string, headers: Record<string, string>, body: unknown): void {
+    this.send({
+      type: 'lick-webhook-event',
+      webhookId,
+      headers,
+      body,
+    } as PanelToOffscreenMessage);
   }
 
   /** Register a handler for sprinkle-op messages from the offscreen proxy. */
-  setSprinkleOpHandler(handler: (payload: any) => void): void {
+  setSprinkleOpHandler(handler: (payload: unknown) => void): void {
     this.sprinkleOpHandler = handler;
   }
 
+  /**
+   * Send a raw `PanelToOffscreenMessage` over the wire. Used by
+   * `installPageStorageSync` to forward `local-storage-{set,remove,clear}`
+   * events to the worker. Marked `@internal` because higher-level
+   * facade methods cover normal traffic; this is for cases where the
+   * page needs to push a typed envelope outside the orchestrator-shim API.
+   */
+  sendRaw(message: PanelToOffscreenMessage): void {
+    this.send(message);
+  }
+
   private setupMessageListener(): void {
-    chrome.runtime.onMessage.addListener(
-      (
-        message: unknown,
-        _sender: ChromeMessageSender,
-        _sendResponse: (response?: unknown) => void
-      ) => {
-        if (!isExtMsg(message)) return false;
-        const msg = message as ExtensionMessage;
-
-        if (msg.source === 'offscreen') {
-          const payload = msg.payload as any;
-          // Route debug-tabs toggle to the panel's Layout
-          if (payload?.type === 'debug-tabs') {
-            const toggle = (window as any).__slicc_debug_tabs as
-              | ((show: boolean) => void)
-              | undefined;
-            toggle?.(!!payload.show);
-          } else if (payload?.type === 'sprinkle-op' && this.sprinkleOpHandler) {
-            this.sprinkleOpHandler(payload);
-          } else {
-            this.handleOffscreenMessage(msg.payload as OffscreenToPanelMessage | StateSnapshotMsg);
-          }
-        }
-
-        return false;
+    this.transport.onMessage((msg) => {
+      if (msg.source !== 'offscreen') return;
+      const payload = msg.payload as { type?: string };
+      if (payload?.type === 'sprinkle-op' && this.sprinkleOpHandler) {
+        this.sprinkleOpHandler(payload);
+      } else {
+        this.handleOffscreenMessage(msg.payload as OffscreenToPanelMessage | StateSnapshotMsg);
       }
-    );
+    });
   }
 
   private handleOffscreenMessage(msg: OffscreenToPanelMessage | StateSnapshotMsg): void {
     switch (msg.type) {
       case 'offscreen-ready':
-        log.info('Offscreen engine ready');
-        if (!this.ready) {
-          // Request state now that offscreen is confirmed ready
-          this.send({ type: 'request-state' });
+        if (this.ready) {
+          // Offscreen restarted while panel was open (e.g. MV3 SW killed and
+          // recreated the offscreen doc). Reset so the state-snapshot handler
+          // treats the next snapshot as a first-ready and fires onReady again.
+          log.warn('Offscreen restarted — re-requesting state');
+          this.ready = false;
+        } else {
+          log.info('Offscreen engine ready');
         }
+        this.send({ type: 'request-state' });
         break;
 
       case 'agent-event':
@@ -314,6 +407,19 @@ export class OffscreenClient {
       case 'scoop-status':
         this.handleScoopStatus(msg as ScoopStatusMsg);
         break;
+
+      case 'compaction-state':
+        this.callbacks.onCompactionStateChange?.(msg.scoopJid, msg.state);
+        break;
+
+      case 'clear-chat-ack': {
+        const resolve = this.pendingClearAcks.get(msg.requestId);
+        if (resolve) {
+          this.pendingClearAcks.delete(msg.requestId);
+          resolve();
+        }
+        break;
+      }
 
       case 'scoop-created':
         this.handleScoopCreated(msg as ScoopCreatedMsg);
@@ -346,7 +452,44 @@ export class OffscreenClient {
         applyTrayRuntimeStatusSnapshot(m.leader, m.follower);
         break;
       }
+
+      // Terminal session events route to subscribers registered via
+      // `onTerminalEvent`. Not chat-related, so they don't go through
+      // `emitToUI` / `agent-event` plumbing.
+      case 'terminal-status':
+      case 'terminal-output':
+      case 'terminal-media-preview':
+      case 'terminal-exit':
+      case 'terminal-cleared': {
+        for (const handler of this.terminalEventListeners) {
+          try {
+            handler(msg);
+          } catch (err) {
+            log.error('terminal event listener error', {
+              error: err instanceof Error ? err.message : String(err),
+            });
+          }
+        }
+        break;
+      }
     }
+  }
+
+  // -------------------------------------------------------------------------
+  // Terminal event subscribers
+  // -------------------------------------------------------------------------
+
+  private terminalEventListeners = new Set<(event: TerminalEventMsg) => void>();
+
+  /**
+   * Subscribe to inbound terminal session events. Returns an
+   * unsubscribe function. Used by `TerminalSessionClient` and any
+   * future panel-side terminal-view to receive output / media-
+   * preview / status / exit envelopes routed by session id.
+   */
+  onTerminalEvent(handler: (event: TerminalEventMsg) => void): () => void {
+    this.terminalEventListeners.add(handler);
+    return () => this.terminalEventListeners.delete(handler);
   }
 
   private handleAgentEvent(msg: AgentEventMsg): void {
@@ -534,25 +677,19 @@ export class OffscreenClient {
   }
 
   private send(payload: PanelToOffscreenMessage): void {
-    chrome.runtime
-      .sendMessage({
-        source: 'panel' as const,
-        payload,
-      })
-      .catch((err) => {
-        log.error('Failed to send to offscreen', {
-          error: err instanceof Error ? err.message : String(err),
-        });
+    if (this.locked) {
+      this.emitToUI({
+        type: 'error',
+        error: 'This window is detached. Close it and use the detached tab.',
       });
+      return;
+    }
+    this.transport.send(payload);
   }
 }
 
 function uid(): string {
   return Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
-}
-
-function isExtMsg(msg: unknown): boolean {
-  return typeof msg === 'object' && msg !== null && 'source' in msg && 'payload' in msg;
 }
 
 /**

@@ -1,6 +1,4 @@
 import { describe, it, expect } from 'vitest';
-import { version as pyodidePackageVersion } from 'pyodide/package.json';
-import rootPackageJson from '../../../../../package.json';
 import {
   toPreviewUrl,
   isLikelyUrl,
@@ -11,10 +9,12 @@ import {
   isSafeServeEntry,
   resolveServeEntryPath,
   resolveNodePackageBaseUrl,
-  PYODIDE_CDN,
-  PYODIDE_VERSION,
   resolvePinnedPackageVersion,
+  isNodeRuntime,
+  isExtensionRuntime,
 } from '../../../src/shell/supplemental-commands/shared.js';
+import { resolvePyodideIndexURL } from '../../../src/kernel/realm/realm-factory.js';
+import { PYODIDE_CDN } from '../../../src/kernel/realm/py-realm-shared.js';
 
 describe('toPreviewUrl', () => {
   it('returns localhost preview URL in non-extension environment', () => {
@@ -208,20 +208,92 @@ describe('resolveNodePackageBaseUrl', () => {
   });
 });
 
-describe('Pyodide version resolution', () => {
-  it('uses the installed pyodide package version for the browser CDN fallback', () => {
-    expect(PYODIDE_VERSION).toBe(pyodidePackageVersion);
-    expect(PYODIDE_CDN).toBe(`https://cdn.jsdelivr.net/pyodide/v${pyodidePackageVersion}/full/`);
-  });
-
-  it('keeps the root pyodide dependency pinned to the installed package version', () => {
-    const pyodideVersion = rootPackageJson.dependencies.pyodide;
-    expect(pyodideVersion).toBe(pyodidePackageVersion);
-  });
-
+describe('resolvePinnedPackageVersion', () => {
   it('rejects version ranges so CDN assets cannot drift from the npm loader', () => {
     expect(() => resolvePinnedPackageVersion('pyodide', '^0.29.3')).toThrow(
       'pyodide must use an exact semver version in package.json'
     );
+  });
+});
+
+describe('isNodeRuntime', () => {
+  it('detects the vitest runner as Node', () => {
+    expect(isNodeRuntime()).toBe(true);
+  });
+});
+
+describe('isExtensionRuntime', () => {
+  it('returns false in plain Node (no chrome global)', () => {
+    expect(isExtensionRuntime()).toBe(false);
+  });
+
+  it('returns true when chrome.runtime.id is present', () => {
+    const savedChrome = (globalThis as { chrome?: unknown }).chrome;
+    (globalThis as { chrome?: unknown }).chrome = { runtime: { id: 'test-ext-id' } };
+    try {
+      expect(isExtensionRuntime()).toBe(true);
+    } finally {
+      (globalThis as { chrome?: unknown }).chrome = savedChrome;
+    }
+  });
+});
+
+describe('resolvePyodideIndexURL', () => {
+  it('returns a node_modules pathname in the vitest Node runner', () => {
+    expect(resolvePyodideIndexURL()).toContain('/node_modules/pyodide/');
+  });
+
+  it('uses chrome.runtime.getURL when running in an extension', () => {
+    const savedChrome = (globalThis as { chrome?: unknown }).chrome;
+    (globalThis as { chrome?: unknown }).chrome = {
+      runtime: {
+        id: 'test-ext-id',
+        getURL: (path: string) => `chrome-extension://test-ext-id/${path}`,
+      },
+    };
+    try {
+      expect(resolvePyodideIndexURL()).toBe('chrome-extension://test-ext-id/pyodide/');
+    } finally {
+      (globalThis as { chrome?: unknown }).chrome = savedChrome;
+    }
+  });
+
+  it('falls back to the CDN for browser/worker runtimes (no chrome, no process)', () => {
+    // Simulate a DedicatedWorker: no `chrome`, no `process`. We have
+    // to fake both because vitest itself is Node — these branches are
+    // exactly what the CLI standalone kernel-worker hits at runtime.
+    const savedChrome = (globalThis as { chrome?: unknown }).chrome;
+    const savedProcess = (globalThis as { process?: unknown }).process;
+    (globalThis as { chrome?: unknown }).chrome = undefined;
+    (globalThis as { process?: unknown }).process = undefined;
+    try {
+      expect(resolvePyodideIndexURL()).toBe(PYODIDE_CDN);
+    } finally {
+      (globalThis as { chrome?: unknown }).chrome = savedChrome;
+      (globalThis as { process?: unknown }).process = savedProcess;
+    }
+  });
+
+  it('extension precedence wins when BOTH chrome.runtime.id and process.versions.node are set', () => {
+    // Pins commit df93808b's branch order (extension → node → CDN).
+    // Vitest's own runtime has `process` set, so without faking the
+    // chrome global we'd never exercise the precedence. A future
+    // refactor that flips the order to (node → extension → CDN) must
+    // fail this test, not silently route the extension's runtime
+    // through the wrong branch.
+    const savedChrome = (globalThis as { chrome?: unknown }).chrome;
+    (globalThis as { chrome?: unknown }).chrome = {
+      runtime: {
+        id: 'test-ext-id',
+        getURL: (path: string) => `chrome-extension://test-ext-id/${path}`,
+      },
+    };
+    try {
+      // `process` is real (vitest is Node) — both predicates would
+      // succeed individually. Assert extension wins.
+      expect(resolvePyodideIndexURL()).toBe('chrome-extension://test-ext-id/pyodide/');
+    } finally {
+      (globalThis as { chrome?: unknown }).chrome = savedChrome;
+    }
   });
 });

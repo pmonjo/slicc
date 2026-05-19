@@ -28,7 +28,7 @@ import {
   getModels,
   getProviders,
   createAssistantMessageEventStream,
-} from '@mariozechner/pi-ai';
+} from '@earendil-works/pi-ai';
 import type {
   Api,
   Model,
@@ -36,12 +36,14 @@ import type {
   SimpleStreamOptions,
   AnthropicOptions,
   OpenAICompletionsOptions,
-} from '@mariozechner/pi-ai';
+} from '@earendil-works/pi-ai';
 import {
   saveOAuthAccount,
   getAccounts,
   getBaseUrlForProvider,
 } from '../src/ui/provider-settings.js';
+import { getOAuthPageOrigin } from '../src/providers/oauth-service.js';
+import { getDailyAdobeUuid } from '../src/scoops/llm-session-id.js';
 
 // ── Config ──────────────────────────────────────────────────────────
 
@@ -115,7 +117,9 @@ async function fetchProxyConfig(proxyEndpoint: string): Promise<ProxyConfig> {
   const cached = proxyConfigCache.get(proxyEndpoint);
   if (cached) return cached;
   try {
-    const res = await fetch(`${proxyEndpoint}/v1/config`);
+    const res = await fetch(`${proxyEndpoint}/v1/config`, {
+      headers: { [SLICC_VERSION_HEADER]: __SLICC_VERSION__ },
+    });
     if (res.ok) {
       const config = (await res.json()) as ProxyConfig;
       proxyConfigCache.set(proxyEndpoint, config);
@@ -232,6 +236,13 @@ export const config: ProviderConfig = {
   baseUrlDescription: 'Anthropic-compatible proxy endpoint',
   isOAuth: true,
   defaultModelId: 'sonnet',
+  oauthTokenDomains: [
+    'ims-na1.adobelogin.com',
+    'ims-na1-stg1.adobelogin.com',
+    '*.adobelogin.com',
+    '*.adobe.io',
+    'firefall.adobe.io',
+  ],
 
   getModelIds: () => {
     // Helper to propagate metadata from cache
@@ -298,16 +309,20 @@ export const config: ProviderConfig = {
     const scopes = resolveScopes(proxyConfig);
     const imsEnv = resolveImsEnvironment(proxyConfig);
 
+    // Resolve the page origin via panel-RPC when invoked from the kernel
+    // `DedicatedWorker` (no `window`); the page-context login path still
+    // reads `window.location.*` directly through the helper.
+    const pageInfo = isExtension ? null : await getOAuthPageOrigin();
     const redirectUri = isExtension
       ? (adobeConfig.extensionRedirectUri ??
         `https://${(chrome as any).runtime.id}.chromiumapp.org/`)
-      : (adobeConfig.redirectUri ?? `${window.location.origin}/auth/callback`);
+      : (adobeConfig.redirectUri ?? `${pageInfo!.origin}/auth/callback`);
 
     // Build OAuth state with port and CSRF nonce for the sliccy.ai relay (CLI only)
     const oauthState = !isExtension
       ? btoa(
           JSON.stringify({
-            port: parseInt(new URL(window.location.href).port || '5710', 10),
+            port: parseInt(new URL(pageInfo!.href).port || '5710', 10),
             path: '/auth/callback',
             nonce: crypto.randomUUID(),
           })
@@ -353,12 +368,17 @@ export const config: ProviderConfig = {
 
     const userProfile = await fetchUserProfile(tokenInfo.accessToken, imsEnv);
 
-    saveOAuthAccount({
+    await saveOAuthAccount({
       providerId: 'adobe',
       accessToken: tokenInfo.accessToken,
       tokenExpiresAt: Date.now() + tokenInfo.expiresIn * 1000,
       userName: userProfile.name,
       userAvatar: userProfile.avatar,
+      // Only pin baseUrl when there is no bundled adobe-config.json (npm
+      // distribution). When the config is bundled, getProxyEndpoint() can
+      // always read it fresh, so persisting the URL would block deploy-time
+      // proxy endpoint changes from taking effect.
+      baseUrl: adobeConfig.proxyEndpoint ? undefined : proxyEndpoint,
     });
 
     // Fetch the full model list now that we're authenticated.
@@ -403,7 +423,13 @@ export const config: ProviderConfig = {
         );
       }
     }
-    saveOAuthAccount({ providerId: 'adobe', accessToken: '' });
+    await saveOAuthAccount({ providerId: 'adobe', accessToken: '' });
+  },
+
+  onSilentRenew: async () => {
+    const account = getAdobeAccount();
+    if (!account?.accessToken) return null;
+    return silentRenewToken();
   },
 };
 
@@ -457,6 +483,13 @@ function isTokenExpired(): boolean {
  * Returns the new access token on success, or null if renewal failed.
  */
 async function silentRenewToken(): Promise<string | null> {
+  // Silent renewal needs a DOM (popup/iframe) to drive the IMS authorize
+  // flow. The kernel-worker has no `window`, so bail out cleanly here and
+  // let getValidAccessToken surface "session expired — please log in again"
+  // back to the page. The page-side oauth-bootstrap is responsible for
+  // pre-renewing tokens before the worker streams.
+  if (typeof window === 'undefined') return null;
+
   // Deduplicate concurrent renewal attempts
   if (renewalInProgress) return renewalInProgress;
 
@@ -523,14 +556,17 @@ async function silentRenewToken(): Promise<string | null> {
       const tokenInfo = extractTokenFromUrl(redirectUrl);
       if (!tokenInfo) return null;
 
-      // Save the renewed token
+      // Save the renewed token. Preserve the baseUrl so getProxyEndpoint()
+      // continues to resolve after a page reload wipes the in-memory cache.
+      // Only pin when there is no bundled config — same rationale as onOAuthLogin.
       const account = getAdobeAccount();
-      saveOAuthAccount({
+      await saveOAuthAccount({
         providerId: 'adobe',
         accessToken: tokenInfo.accessToken,
         tokenExpiresAt: Date.now() + tokenInfo.expiresIn * 1000,
         userName: account?.userName,
         userAvatar: account?.userAvatar,
+        baseUrl: adobeConfig.proxyEndpoint ? undefined : proxyEndpoint,
       });
 
       console.log('[adobe] Token renewed silently');
@@ -558,6 +594,94 @@ async function silentRenewToken(): Promise<string | null> {
   })();
 
   return renewalInProgress;
+}
+
+// ── SLICC version header ─────────────────────────────────────────────
+
+/**
+ * Name of the header used to attribute Adobe LLM proxy traffic to a
+ * specific SLICC build. Applied to every fetch the Adobe provider makes
+ * against the proxy (`/v1/config`, `/v1/models`, and all LLM stream
+ * requests) — IMS calls (`adobelogin.com`) intentionally don't get it.
+ */
+const SLICC_VERSION_HEADER = 'X-Slicc-Version';
+
+/**
+ * Merge the SLICC version header into the caller's stream options.
+ * Caller-set headers (e.g. `X-Session-Id` from `scoop-context.ts`) are
+ * preserved; the version header always wins on conflict so callers
+ * cannot accidentally spoof it. HTTP headers are case-insensitive, so
+ * we drop any case-variant of `X-Slicc-Version` from caller headers
+ * before injecting ours — otherwise `fetch` would send both values
+ * joined by `, ` and the proxy would see a spoofed value alongside ours.
+ */
+function withSliccVersionHeader<T extends { headers?: Record<string, string> }>(options: T): T {
+  const merged: Record<string, string> = {};
+  const versionKeyLower = SLICC_VERSION_HEADER.toLowerCase();
+  if (options.headers) {
+    for (const [key, value] of Object.entries(options.headers)) {
+      if (key.toLowerCase() !== versionKeyLower) merged[key] = value;
+    }
+  }
+  merged[SLICC_VERSION_HEADER] = __SLICC_VERSION__;
+  return { ...options, headers: merged };
+}
+
+// ── X-Session-Id defense-in-depth ───────────────────────────────────
+
+/**
+ * Sentinel anchor for the daily-rotated UUID used when a caller didn't
+ * attach `X-Session-Id`. Shared with the other purpose-anchored
+ * fallbacks (`'ui-quick-llm'`, `'ui-new-session'`) — same shape, same
+ * rotation cadence, no per-user info encoded.
+ */
+const ADOBE_PROVIDER_FALLBACK_ANCHOR = 'adobe-provider-fallback';
+
+/** Dedup developer warnings per call site so hot paths don't spam the console. */
+const warnedCallSites = new Set<string>();
+
+/**
+ * Defense-in-depth: every Adobe-bound LLM call MUST carry `X-Session-Id`.
+ * The intended wiring attaches an anchor-specific id at the call site —
+ * `scoop-context.ts` for cone/scoop traffic, `quick-llm.ts` for ad-hoc UI
+ * labels, `new-session.ts` for the freezer, etc. If a new call site
+ * slips through without one, fall back to a daily-rotated sentinel UUID
+ * so the proxy can still group requests, rather than letting it hash
+ * the content into an opaque hex id. The fallback intentionally collides
+ * across all unwrapped paths within a browser-day — the value is "the
+ * dev forgot the wrapper, fix it" not "this is a legitimate session."
+ *
+ * Caller-supplied values (any case variant) are always preserved.
+ */
+function ensureSessionIdHeader<T extends { headers?: Record<string, string> }>(
+  options: T,
+  callSite: string
+): T {
+  if (options.headers) {
+    for (const key of Object.keys(options.headers)) {
+      if (key.toLowerCase() === 'x-session-id') return options;
+    }
+  }
+  if (!warnedCallSites.has(callSite)) {
+    warnedCallSites.add(callSite);
+    console.warn(
+      `[adobe] Missing X-Session-Id from ${callSite} — using daily fallback. ` +
+        `Attach an X-Session-Id header at the call site (see scoop-context.ts ` +
+        `streamWithSessionId or docs/pitfalls.md).`
+    );
+  }
+  return {
+    ...options,
+    headers: {
+      ...(options.headers ?? {}),
+      'X-Session-Id': getDailyAdobeUuid(ADOBE_PROVIDER_FALLBACK_ANCHOR),
+    },
+  };
+}
+
+/** Test-only: clear the dedup set so warning-emission tests stay independent. */
+export function __resetAdobeSessionIdWarningCacheForTests(): void {
+  warnedCallSites.clear();
 }
 
 // ── Stream functions (reuse pi-ai's Anthropic provider) ─────────────
@@ -609,10 +733,13 @@ const streamAdobe = (
           api: 'openai-completions' as Api,
           compat: { ...(model as any).compat, supportsStore: false, supportsDeveloperRole: false },
         };
-        const inner = streamOpenAICompletions(proxyModel as any, context, {
-          ...options,
-          apiKey: accessToken,
-        } as any);
+        const inner = streamOpenAICompletions(
+          proxyModel as any,
+          context,
+          withSliccVersionHeader(
+            ensureSessionIdHeader({ ...options, apiKey: accessToken }, 'streamAdobe[openai]')
+          ) as any
+        );
         for await (const event of inner) stream.push(event as any);
       } else {
         // Route to Anthropic Messages API
@@ -621,10 +748,13 @@ const streamAdobe = (
           baseUrl: getProxyEndpoint(),
           api: 'anthropic-messages' as Api,
         };
-        const inner = streamAnthropic(proxyModel as any, context, {
-          ...options,
-          apiKey: accessToken,
-        });
+        const inner = streamAnthropic(
+          proxyModel as any,
+          context,
+          withSliccVersionHeader(
+            ensureSessionIdHeader({ ...options, apiKey: accessToken }, 'streamAdobe[anthropic]')
+          )
+        );
         for await (const event of inner) stream.push(event as any);
       }
       stream.end();
@@ -654,10 +784,13 @@ const streamSimpleAdobe = (model: Model<Api>, context: Context, options?: Simple
           api: 'openai-completions' as Api,
           compat: { ...(model as any).compat, supportsStore: false, supportsDeveloperRole: false },
         };
-        const inner = streamSimpleOpenAICompletions(proxyModel as any, context, {
-          ...options,
-          apiKey: accessToken,
-        } as any);
+        const inner = streamSimpleOpenAICompletions(
+          proxyModel as any,
+          context,
+          withSliccVersionHeader(
+            ensureSessionIdHeader({ ...options, apiKey: accessToken }, 'streamSimpleAdobe[openai]')
+          ) as any
+        );
         for await (const event of inner) stream.push(event as any);
       } else {
         // Route to Anthropic Messages API
@@ -666,10 +799,16 @@ const streamSimpleAdobe = (model: Model<Api>, context: Context, options?: Simple
           baseUrl: getProxyEndpoint(),
           api: 'anthropic-messages' as Api,
         };
-        const inner = streamSimpleAnthropic(proxyModel as any, context, {
-          ...options,
-          apiKey: accessToken,
-        } as any);
+        const inner = streamSimpleAnthropic(
+          proxyModel as any,
+          context,
+          withSliccVersionHeader(
+            ensureSessionIdHeader(
+              { ...options, apiKey: accessToken },
+              'streamSimpleAdobe[anthropic]'
+            )
+          ) as any
+        );
         for await (const event of inner) stream.push(event as any);
       }
       stream.end();
@@ -692,7 +831,10 @@ async function fetchProxyModels(): Promise<Model<Api>[]> {
     const accessToken = await getValidAccessToken();
     const endpoint = getProxyEndpoint();
     const res = await fetch(`${endpoint}/v1/models`, {
-      headers: { Authorization: `Bearer ${accessToken}` },
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        [SLICC_VERSION_HEADER]: __SLICC_VERSION__,
+      },
     });
     if (res.ok) {
       const data = (await res.json()) as { data?: Array<any> };

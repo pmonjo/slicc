@@ -25,6 +25,7 @@ import { VirtualFS, FsWatcher } from '../fs/index.js';
 import { RestrictedFS } from '../fs/restricted-fs.js';
 import type { BrowserAPI } from '../cdp/index.js';
 import { createDefaultSharedFiles, createDefaultSkills } from './skills.js';
+import type { ProcessManager } from '../kernel/process-manager.js';
 import { buildActiveLicksError, type LickManager } from './lick-manager.js';
 import { SessionStore } from '../core/session.js';
 import { formatPromptWithAttachments, imageContentFromAttachments } from '../core/attachments.js';
@@ -62,6 +63,16 @@ export interface OrchestratorCallbacks {
   onSendMessage: (targetJid: string, text: string) => void;
   /** Called when scoop status changes */
   onStatusChange: (scoopJid: string, status: ScoopTabState['status']) => void;
+  /**
+   * Called when the scoop's compaction pass enters / leaves a phase. The
+   * UI uses this to render a ghost-bubble affordance while the agent is
+   * silent during the summarize + memory-extract round-trips. `'idle'`
+   * clears the affordance.
+   */
+  onCompactionStateChange?: (
+    scoopJid: string,
+    state: 'summarizing' | 'extracting-memory' | 'idle'
+  ) => void;
   /** Called on error */
   onError: (scoopJid: string, error: string) => void;
   /** Get the BrowserAPI used by browser automation commands */
@@ -113,7 +124,7 @@ export class Orchestrator {
   private container: HTMLElement;
   private callbacks: OrchestratorCallbacks;
   private config: AssistantConfig;
-  private pollInterval: number | null = null;
+  private pollInterval: ReturnType<typeof setInterval> | null = null;
   private scheduler: TaskScheduler | null = null;
   private globalMemoryCache: string = '';
   private sharedFs: VirtualFS | null = null;
@@ -163,6 +174,15 @@ export class Orchestrator {
    * mid-wait.
    */
   private completionWaiters: Map<string, Array<(summary: string | null) => void>> = new Map();
+  /**
+   * Process manager threaded into each `ScoopContext` so prompts
+   * and tool calls show up as named processes. Set via
+   * {@link setProcessManager} (mirrors `setLickManager`); the
+   * kernel-worker boot path wires it. Inline standalone / extension
+   * paths can leave it `null` — `ScoopContext` falls back to its
+   * untracked-prompt behavior (plain AbortController).
+   */
+  private processManager: ProcessManager | null = null;
 
   constructor(
     container: HTMLElement,
@@ -172,6 +192,24 @@ export class Orchestrator {
     this.container = container;
     this.callbacks = callbacks;
     this.config = config;
+  }
+
+  /**
+   * Inject the process manager. New `ScoopContext`s created after
+   * this point pick it up. Existing contexts are unaffected —
+   * restart the agent to see them in `ps`.
+   */
+  setProcessManager(pm: ProcessManager): void {
+    this.processManager = pm;
+  }
+
+  /**
+   * Read-only accessor — `ps` / `kill` shell commands look up
+   * the manager via this getter (or via the kernel-worker
+   * `globalThis.__slicc_pm` fallback for code that can't accept DI).
+   */
+  getProcessManager(): ProcessManager | null {
+    return this.processManager;
   }
 
   /** Initialize orchestrator and load saved scoops */
@@ -340,6 +378,29 @@ export class Orchestrator {
     log.info('Global memory updated');
   }
 
+  /**
+   * Append a block of auto-extracted memory bullets to /shared/CLAUDE.md.
+   * Used by the compaction memory-extraction pass and by the "New session"
+   * freezer flow.
+   *
+   * Inserts a dated heading so auto-extracted memories are attributable and
+   * easy to prune by hand. The `source` field is included in the heading
+   * (e.g., "compaction", "new-session") so the user can see why a block
+   * was added.
+   */
+  async appendGlobalMemory(bullets: string, meta: { source: string }): Promise<void> {
+    if (!this.sharedFs) return;
+    const trimmed = bullets.trim();
+    if (!trimmed) return;
+    const current = await this.getGlobalMemory();
+    const date = new Date().toISOString().slice(0, 10);
+    const heading = `## Auto-extracted (${date}, ${meta.source})`;
+    const separator = current.length === 0 || current.endsWith('\n') ? '' : '\n';
+    const block = `${separator}\n${heading}\n\n${trimmed}\n`;
+    await this.setGlobalMemory(current + block);
+    log.info('Global memory appended', { source: meta.source, length: trimmed.length });
+  }
+
   /** Get the shared VirtualFS */
   getSharedFS(): VirtualFS | null {
     return this.sharedFs;
@@ -361,6 +422,18 @@ export class Orchestrator {
     (globalThis as any).__slicc_lick_handler = (event: any) => {
       this.lickManager?.emitEvent(event);
     };
+  }
+
+  /**
+   * Relay a webhook event into the LickManager. Used by `OffscreenBridge`
+   * when the page-side `LeaderTrayManager` forwards a tray `webhook.event`
+   * across the bridge (see `lick-webhook-event` message type). Pre-regression
+   * this was a direct page-side call; post-refactor the tray sits on the
+   * page and the lick manager sits in the worker, so the page relays the
+   * event over the bridge and the orchestrator dispatches it locally.
+   */
+  handleWebhookEvent(webhookId: string, headers: Record<string, string>, body: unknown): void {
+    this.lickManager?.handleWebhookEvent(webhookId, headers, body);
   }
 
   /** Register a new scoop and wait until its tab/context has been registered
@@ -1142,6 +1215,44 @@ export class Orchestrator {
     log.info('Filesystem reset and defaults re-seeded');
   }
 
+  /**
+   * Clear messages for a single scoop (live agent + persisted agent session
+   * + queued messages + timestamp tracking + per-scoop ChannelMessage
+   * history). Used by the "New session" flow to reset the cone while
+   * leaving every other scoop's runtime state untouched. The
+   * orchestrator-level `clearAllMessages` keeps its existing all-scoops
+   * semantics.
+   *
+   * The per-scoop channel-history wipe is load-bearing: without it,
+   * `processScoopQueue` calls `db.getMessagesSince(chatJid, '')` on the
+   * next prompt (because `lastAgentTimestamp` was just deleted) and
+   * replays every pre-reset turn back into the live agent.
+   */
+  async clearScoopMessages(jid: string): Promise<void> {
+    const ctx = this.contexts.get(jid);
+    if (ctx) {
+      ctx.clearMessages();
+      if (this.sessionStore) {
+        const sessionId = ctx.getSessionId();
+        await this.sessionStore.delete(sessionId).catch((err) => {
+          log.warn('Failed to clear agent session for scoop', {
+            jid,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        });
+      }
+    }
+    await db.clearMessagesForScoop(jid).catch((err) => {
+      log.warn('Failed to clear persisted channel history for scoop', {
+        jid,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    });
+    this.lastAgentTimestamp.delete(jid);
+    this.messageQueues.set(jid, []);
+    log.info('Scoop messages cleared', { jid });
+  }
+
   /** Clear all messages from the orchestrator DB, agent sessions, and live agent contexts. */
   async clearAllMessages(): Promise<void> {
     await db.clearAllMessages();
@@ -1452,6 +1563,9 @@ export class Orchestrator {
           void this.maybeNotifyConeOnScoopComplete(jid);
         }
       },
+      onCompactionStateChange: (state) => {
+        this.callbacks.onCompactionStateChange?.(jid, state);
+      },
       onToolStart: (toolName, toolInput) => {
         this.callbacks.onToolStart?.(jid, toolName, toolInput);
       },
@@ -1500,6 +1614,9 @@ export class Orchestrator {
         : undefined,
       getGlobalMemory: () => this.getGlobalMemory(),
       setGlobalMemory: scoop.isCone ? (content) => this.setGlobalMemory(content) : undefined,
+      appendGlobalMemory: scoop.isCone
+        ? (bullets, meta) => this.appendGlobalMemory(bullets, meta)
+        : undefined,
       getBrowserAPI: () => this.callbacks.getBrowserAPI(),
     };
 
@@ -1510,7 +1627,8 @@ export class Orchestrator {
       fs,
       this.sessionStore ?? undefined,
       this.sharedFs ?? undefined,
-      coneJid
+      coneJid,
+      this.processManager ?? undefined
     );
 
     this.contexts.set(jid, context);
@@ -1737,7 +1855,10 @@ export class Orchestrator {
   private startMessageLoop(): void {
     if (this.pollInterval) return;
 
-    this.pollInterval = window.setInterval(() => {
+    // `setInterval` (no `window.` prefix) so this works in both page and
+    // DedicatedWorker contexts. The standalone runtime runs the orchestrator
+    // in a worker; `window` is undefined there.
+    this.pollInterval = setInterval(() => {
       for (const jid of this.scoops.keys()) {
         const tab = this.tabs.get(jid);
         if (tab?.status === 'ready') {

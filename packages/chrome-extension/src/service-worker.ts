@@ -27,6 +27,11 @@ import type {
 } from './messages.js';
 import { extractHandoffFromWebRequest } from '../../webapp/src/net/handoff-link.js';
 import {
+  isExtensionMessage,
+  DETACHED_RUNTIME_QUERY_NAME,
+  DETACHED_RUNTIME_QUERY_VALUE,
+} from './messages.js';
+import {
   executeDaSignAndForward,
   executeS3SignAndForward,
   type DaSignAndForwardEnvelope,
@@ -34,11 +39,258 @@ import {
   type SecretGetter,
   type SignAndForwardReply,
 } from '../../webapp/src/fs/mount/sign-and-forward-shared.js';
+import { handleFetchProxyConnectionAsync } from './fetch-proxy-shared.js';
+import { deleteSecret, listSecrets, listSecretsWithValues, setSecret } from './secrets-storage.js';
+import { readOrCreateSwSessionId } from './sw-session-id.js';
+import { SecretsPipeline, type FetchProxySecretSource } from '@slicc/shared-ts';
 // ---------------------------------------------------------------------------
-// Side panel behavior
+// Detached popout state
 // ---------------------------------------------------------------------------
 
-chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true });
+const DETACHED_TAB_ID_KEY = 'slicc.detached.tabId';
+
+async function readStoredDetachedTabId(): Promise<number | undefined> {
+  try {
+    const result = await chrome.storage.session.get(DETACHED_TAB_ID_KEY);
+    const raw = result[DETACHED_TAB_ID_KEY];
+    return typeof raw === 'number' ? raw : undefined;
+  } catch (err) {
+    console.error('[slicc-sw] storage.session.get failed', err);
+    return undefined;
+  }
+}
+
+async function writeStoredDetachedTabId(tabId: number): Promise<void> {
+  await chrome.storage.session.set({ [DETACHED_TAB_ID_KEY]: tabId });
+}
+
+async function clearStoredDetachedTabId(): Promise<void> {
+  await chrome.storage.session.remove(DETACHED_TAB_ID_KEY);
+}
+
+async function reconcileDetachedLockOnBoot(): Promise<void> {
+  const storedTabId = await readStoredDetachedTabId();
+
+  if (storedTabId !== undefined) {
+    let tabAlive = false;
+    try {
+      await chrome.tabs.get(storedTabId);
+      tabAlive = true;
+    } catch {
+      // Tab gone (closed/discarded while SW was evicted)
+    }
+
+    if (tabAlive) {
+      await chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: false });
+      await chrome.sidePanel.setOptions({ enabled: false });
+      return;
+    }
+
+    await clearStoredDetachedTabId();
+  }
+
+  await chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true });
+  await chrome.sidePanel.setOptions({ enabled: true });
+}
+
+reconcileDetachedLockOnBoot().catch((err) => {
+  console.error('[slicc-sw] reconcile detached lock failed', err);
+});
+
+chrome.runtime.onStartup.addListener(() => {
+  reconcileDetachedLockOnBoot().catch(() => {});
+});
+
+chrome.runtime.onInstalled.addListener(() => {
+  reconcileDetachedLockOnBoot().catch(() => {});
+});
+
+function isValidClaimUrl(rawUrl: string | undefined): boolean {
+  if (!rawUrl) return false;
+  let u: URL;
+  try {
+    u = new URL(rawUrl);
+  } catch {
+    return false;
+  }
+  let expectedOrigin: string;
+  try {
+    expectedOrigin = new URL(chrome.runtime.getURL('index.html')).origin;
+  } catch {
+    return false;
+  }
+  // Accept both '/index.html' (explicit) and '/' (root → index.html
+  // served by the manifest's default). Both produce the same boot
+  // path; reject anything else so e.g. /secrets.html?detached=1
+  // cannot claim the lock.
+  const isExtensionIndex = u.pathname === '/index.html' || u.pathname === '/';
+  return (
+    u.origin === expectedOrigin &&
+    isExtensionIndex &&
+    u.searchParams.get(DETACHED_RUNTIME_QUERY_NAME) === DETACHED_RUNTIME_QUERY_VALUE
+  );
+}
+
+async function handleDetachedClaim(sender: ChromeMessageSender): Promise<void> {
+  const claimingTabId = sender.tab?.id;
+  if (claimingTabId === undefined) return;
+  if (!isValidClaimUrl(sender.url)) return;
+
+  let step = 'read-stored-tab-id';
+  try {
+    const storedTabId = await readStoredDetachedTabId();
+
+    if (storedTabId === claimingTabId) {
+      // Idempotent reclaim (detached tab reload). No state change.
+      return;
+    }
+
+    if (storedTabId !== undefined) {
+      step = 'check-existing-tab';
+      let existing: ChromeTab | undefined;
+      try {
+        existing = await chrome.tabs.get(storedTabId);
+      } catch {
+        existing = undefined;
+      }
+      if (existing !== undefined && existing.id !== undefined) {
+        // A different detached tab already holds the lock. Close the new one.
+        step = 'remove-claiming-tab';
+        await chrome.tabs.remove(claimingTabId);
+        step = 'focus-existing-tab';
+        await chrome.tabs.update(existing.id, { active: true });
+        if (existing.windowId !== undefined) {
+          step = 'focus-existing-window';
+          await chrome.windows.update(existing.windowId, { focused: true });
+        }
+        return;
+      }
+      // Stored tab is gone; fall through to lock with the new claimer.
+    }
+
+    step = 'write-detached-tab-id';
+    await writeStoredDetachedTabId(claimingTabId);
+    step = 'set-panel-behavior-locked';
+    await chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: false });
+    step = 'set-options-disabled';
+    await chrome.sidePanel.setOptions({ enabled: false });
+    step = 'broadcast-detached-active';
+    // Fire-and-forget; .catch() suppresses the unhandled-rejection warning
+    // that Chrome emits when there are no listeners (e.g., no panel open).
+    // Matches the codebase's existing fire-and-forget pattern for
+    // chrome.runtime.sendMessage.
+    chrome.runtime
+      .sendMessage({
+        source: 'service-worker',
+        payload: { type: 'detached-active' },
+      })
+      .catch(() => {});
+
+    // Best-effort hard close of any open side panel (Chrome 141+).
+    step = 'get-windows';
+    const windows = await chrome.windows.getAll();
+    step = 'close-side-panels';
+    await Promise.all(
+      windows.map(async (win) => {
+        try {
+          await chrome.sidePanel.close({ windowId: win.id });
+        } catch {
+          // No side panel open in that window — normal case, swallow.
+        }
+      })
+    );
+  } catch (err) {
+    console.error(`[slicc-sw] handleDetachedClaim failed at step=${step}`, err);
+    throw err;
+  }
+}
+
+async function handleDetachedPopoutRequest(): Promise<void> {
+  const detachedUrl = `${chrome.runtime.getURL('index.html')}?${DETACHED_RUNTIME_QUERY_NAME}=${DETACHED_RUNTIME_QUERY_VALUE}`;
+  await chrome.tabs.create({ url: detachedUrl, active: true });
+  // The lock change is driven by the new tab's detached-claim message,
+  // not by tab creation. See spec.
+}
+
+chrome.runtime.onMessage.addListener((message, sender, _sendResponse) => {
+  // Return false explicitly to tell Chrome we will not call sendResponse
+  // asynchronously. Returning true keeps sendResponse alive and conflicts
+  // with the other SW onMessage listeners that may want to respond.
+  if (!isExtensionMessage(message)) return false;
+  if (message.source !== 'panel') return false;
+  const payloadType = (message.payload as { type?: string }).type;
+
+  if (payloadType === 'detached-claim') {
+    handleDetachedClaim(sender).catch((err) => {
+      // Step-context already logged by handleDetachedClaim's internal catch.
+      // This catch is the final safety net so the rejection doesn't go unhandled.
+      console.error('[slicc-sw] handleDetachedClaim unhandled', err);
+    });
+    return false;
+  }
+
+  if (payloadType === 'detached-popout-request') {
+    handleDetachedPopoutRequest().catch((err) => {
+      console.error('[slicc-sw] handleDetachedPopoutRequest failed', err);
+    });
+    return false;
+  }
+  return false;
+});
+
+async function handleActionClick(clickedTab: ChromeTab): Promise<void> {
+  const storedId = await readStoredDetachedTabId();
+
+  if (storedId !== undefined) {
+    let alive: ChromeTab | undefined;
+    try {
+      alive = await chrome.tabs.get(storedId);
+    } catch {
+      alive = undefined;
+    }
+    if (alive !== undefined) {
+      await chrome.tabs.update(storedId, { active: true });
+      if (alive.windowId !== undefined) {
+        await chrome.windows.update(alive.windowId, { focused: true });
+      }
+      return;
+    }
+  }
+
+  // Recovery: no detached tab actually exists.
+  // Fire-and-forget the cleanup (don't await) so the user-gesture
+  // context from chrome.action.onClicked is still active when
+  // sidePanel.open() is called below. Awaiting any Promise inside
+  // a gesture-triggered listener can consume the activation and
+  // cause sidePanel.open to reject.
+  chrome.storage.session.remove(DETACHED_TAB_ID_KEY).catch(() => {});
+  chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true }).catch(() => {});
+  chrome.sidePanel.setOptions({ enabled: true }).catch(() => {});
+  if (clickedTab.id !== undefined) {
+    await chrome.sidePanel.open({ tabId: clickedTab.id });
+  }
+}
+
+chrome.action.onClicked.addListener((tab) => {
+  chrome.action.setBadgeText({ text: '' });
+  handleActionClick(tab).catch((err) => {
+    console.error('[slicc-sw] handleActionClick failed', err);
+  });
+});
+
+async function handleTabRemoved(tabId: number): Promise<void> {
+  const storedId = await readStoredDetachedTabId();
+  if (storedId !== tabId) return;
+  await clearStoredDetachedTabId();
+  await chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true });
+  await chrome.sidePanel.setOptions({ enabled: true });
+}
+
+chrome.tabs.onRemoved.addListener((tabId) => {
+  handleTabRemoved(tabId).catch((err) => {
+    console.error('[slicc-sw] handleTabRemoved failed', err);
+  });
+});
 
 // ---------------------------------------------------------------------------
 // Offscreen document lifecycle
@@ -130,6 +382,51 @@ async function addToSliccGroup(tabId: number): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
+// Handoff notifications — alert the user when a main-frame document response
+// advertises a SLICC handoff via RFC 8288 `Link` header, and open the side
+// panel on notification click (user gesture required).
+// ---------------------------------------------------------------------------
+
+/** Maps notification ID → windowId so the click handler can open the right panel. */
+const handoffNotificationWindows = new Map<string, number>();
+
+async function showHandoffNotification(windowId: number): Promise<void> {
+  const contexts = await chrome.runtime.getContexts({ contextTypes: ['SIDE_PANEL'] });
+  if (contexts.length > 0) return;
+
+  const notificationId = `slicc-handoff-${Date.now()}`;
+  handoffNotificationWindows.set(notificationId, windowId);
+  chrome.action.setBadgeText({ text: '!' });
+  chrome.action.setBadgeBackgroundColor({ color: '#ff5f72' });
+  chrome.notifications.create(notificationId, {
+    type: 'basic',
+    iconUrl: 'logos/sliccy-color-1scoops-128x128.png',
+    title: 'Slicc handoff received',
+    message: 'Click to open the Slicc side panel and process the handoff.',
+  });
+}
+
+chrome.notifications.onClicked.addListener((notificationId: string) => {
+  const windowId = handoffNotificationWindows.get(notificationId);
+  handoffNotificationWindows.delete(notificationId);
+  chrome.action.setBadgeText({ text: '' });
+  if (windowId !== undefined) {
+    chrome.sidePanel.open({ windowId }).catch(() => {});
+  }
+  readStoredDetachedTabId()
+    .then(async (detachedTabId) => {
+      if (detachedTabId !== undefined) {
+        const tab = await chrome.tabs.get(detachedTabId);
+        await chrome.tabs.update(detachedTabId, { active: true });
+        if (tab.windowId !== undefined) {
+          await chrome.windows.update(tab.windowId, { focused: true });
+        }
+      }
+    })
+    .catch(() => {});
+});
+
+// ---------------------------------------------------------------------------
 // Handoff `Link` header observer — emits a navigate lick when a main-frame
 // document response advertises a SLICC handoff rel via RFC 8288 Link.
 // ---------------------------------------------------------------------------
@@ -156,9 +453,16 @@ chrome.webRequest.onHeadersReceived.addListener(
     if (tabId >= 0) {
       chrome.tabs
         .get(tabId)
-        .then((tab) => dispatch(tab.title))
+        .then((tab) => {
+          if (tab.windowId !== undefined) showHandoffNotification(tab.windowId);
+          dispatch(tab.title);
+        })
         .catch(() => dispatch());
     } else {
+      chrome.windows
+        .getCurrent()
+        .then((w) => showHandoffNotification(w.id!))
+        .catch(() => {});
       dispatch();
     }
   },
@@ -188,6 +492,7 @@ chrome.runtime.onMessage.addListener(
     const msg = message as ExtensionMessage;
 
     if (msg.source === 'panel') {
+      chrome.action.setBadgeText({ text: '' });
       const panelPayload = msg.payload;
 
       // Handle OAuth requests — service worker has chrome.identity access
@@ -490,14 +795,19 @@ async function cdpGetTargets(): Promise<Record<string, unknown>> {
     chrome.tabs.query({ active: true, currentWindow: true }),
   ]);
   const activeTabIds = new Set(activeTabs.map((t) => t.id));
-  const targetInfos = tabs.map((tab) => ({
-    targetId: String(tab.id),
-    type: 'page',
-    title: tab.title ?? '',
-    url: tab.url ?? '',
-    attached: attachedTabs.has(tab.id!),
-    active: activeTabIds.has(tab.id!),
-  }));
+  // Skip tabs without a numeric id (devtools, anonymous pages). They
+  // can't be CDP-attached targets — without this filter, String(undefined)
+  // would surface "undefined" as a targetId and tab.id! would crash.
+  const targetInfos = tabs
+    .filter((tab): tab is typeof tab & { id: number } => typeof tab.id === 'number')
+    .map((tab) => ({
+      targetId: String(tab.id),
+      type: 'page',
+      title: tab.title ?? '',
+      url: tab.url ?? '',
+      attached: attachedTabs.has(tab.id),
+      active: activeTabIds.has(tab.id),
+    }));
   return { targetInfos };
 }
 
@@ -667,3 +977,169 @@ chrome.debugger.onDetach.addListener((source: { tabId: number }, _reason: string
     }
   }
 });
+
+// ---------------------------------------------------------------------------
+// Secrets-aware fetch-proxy connection handler
+// ---------------------------------------------------------------------------
+
+async function buildSecretsPipeline(): Promise<SecretsPipeline> {
+  const sessionId = await readOrCreateSwSessionId();
+  const source: FetchProxySecretSource = {
+    get: async (name) => {
+      const got = (await chrome.storage.local.get(name)) as Record<string, string | undefined>;
+      return got[name];
+    },
+    listAll: () => listSecretsWithValues(chrome.storage.local as any),
+  };
+  return new SecretsPipeline({ sessionId, source });
+}
+
+chrome.runtime.onConnect.addListener((port) => {
+  if (port.name !== 'fetch-proxy.fetch') return;
+  // Chrome drops port messages that arrive before any onMessage listener
+  // is attached. The page-side caller posts its `request` message right
+  // after `chrome.runtime.connect(...)` resolves, which is BEFORE this
+  // async buildSecretsPipeline finishes. Attaching the listener inside
+  // the .then() is too late — the message has already been dropped and
+  // the caller hangs forever.
+  //
+  // Solution: hand the pipeline-build promise to a variant that attaches
+  // the listener SYNCHRONOUSLY and awaits the pipeline INSIDE the handler.
+  // The catch path on the promise just propagates into the handler's
+  // try/catch, which posts response-error back to the page.
+  const pipelinePromise = buildSecretsPipeline().then(async (p) => {
+    await p.reload();
+    return p;
+  });
+  pipelinePromise.catch((err) => {
+    console.error('[sw] fetch-proxy init failed', err);
+    // The handler's await pipelinePromise will throw and post response-error,
+    // so we just log here. Don't disconnect — the handler needs the port.
+  });
+  handleFetchProxyConnectionAsync(port as any, pipelinePromise);
+});
+
+// ---------------------------------------------------------------------------
+// Secrets message handlers
+// ---------------------------------------------------------------------------
+
+chrome.runtime.onMessage.addListener(
+  (msg: unknown, _sender: ChromeMessageSender, sendResponse: (response?: unknown) => void) => {
+    if (
+      typeof msg === 'object' &&
+      msg != null &&
+      'type' in msg &&
+      msg.type === 'secrets.list-masked-entries'
+    ) {
+      (async () => {
+        try {
+          const pipeline = await buildSecretsPipeline();
+          await pipeline.reload();
+          sendResponse({ entries: pipeline.getMaskedEntries() });
+        } catch (err) {
+          // Without this catch, the unhandled rejection closes the
+          // message port and the caller resolves with `undefined` —
+          // indistinguishable from "no entries", which silently
+          // populates the agent shell with an empty env.
+          console.error('[sw] secrets.list-masked-entries failed', err);
+          sendResponse({
+            entries: [],
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
+      })();
+      return true;
+    }
+    // The panel-terminal `secret` command can't touch chrome.storage directly:
+    // it runs in the offscreen document, which lacks chrome.storage even when
+    // the manifest grants it (MV3 quirk). Route the management ops through
+    // the SW, which DOES have chrome.storage.
+    if (typeof msg === 'object' && msg != null && 'type' in msg && msg.type === 'secrets.list') {
+      (async () => {
+        try {
+          const entries = await listSecrets(chrome.storage.local as any);
+          sendResponse({ entries });
+        } catch (err) {
+          console.error('[sw] secrets.list failed', err);
+          sendResponse({
+            entries: [],
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
+      })();
+      return true;
+    }
+    if (
+      typeof msg === 'object' &&
+      msg != null &&
+      'type' in msg &&
+      msg.type === 'secrets.set' &&
+      'name' in msg &&
+      typeof msg.name === 'string' &&
+      'value' in msg &&
+      typeof msg.value === 'string' &&
+      'domains' in msg &&
+      Array.isArray(msg.domains)
+    ) {
+      const name = msg.name;
+      const value = msg.value;
+      const domains = (msg.domains as unknown[]).filter((d): d is string => typeof d === 'string');
+      (async () => {
+        try {
+          await setSecret(chrome.storage.local as any, name, value, domains);
+          sendResponse({ ok: true });
+        } catch (err) {
+          console.error('[sw] secrets.set failed', err);
+          sendResponse({ ok: false, error: err instanceof Error ? err.message : String(err) });
+        }
+      })();
+      return true;
+    }
+    if (
+      typeof msg === 'object' &&
+      msg != null &&
+      'type' in msg &&
+      msg.type === 'secrets.delete' &&
+      'name' in msg &&
+      typeof msg.name === 'string'
+    ) {
+      const name = msg.name;
+      (async () => {
+        try {
+          await deleteSecret(chrome.storage.local as any, name);
+          sendResponse({ ok: true });
+        } catch (err) {
+          console.error('[sw] secrets.delete failed', err);
+          sendResponse({ ok: false, error: err instanceof Error ? err.message : String(err) });
+        }
+      })();
+      return true;
+    }
+    if (
+      typeof msg === 'object' &&
+      msg != null &&
+      'type' in msg &&
+      msg.type === 'secrets.mask-oauth-token' &&
+      'providerId' in msg &&
+      typeof msg.providerId === 'string'
+    ) {
+      const providerId = msg.providerId;
+      (async () => {
+        try {
+          const pipeline = await buildSecretsPipeline();
+          await pipeline.reload();
+          const name = `oauth.${providerId}.token`;
+          const found = pipeline.getMaskedEntries().find((e) => e.name === name);
+          sendResponse({ maskedValue: found?.maskedValue });
+        } catch (err) {
+          console.error('[sw] secrets.mask-oauth-token failed', err);
+          sendResponse({
+            maskedValue: undefined,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
+      })();
+      return true;
+    }
+  }
+);

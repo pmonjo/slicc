@@ -7,6 +7,18 @@ import {
 } from '../../src/scoops/onboarding-orchestrator.js';
 import { __test__ as messageTest } from '../../src/scoops/onboarding-messages.js';
 
+type AccountSnapshot = {
+  id: string;
+  key: string;
+  baseUrl?: string;
+  deployment?: string;
+  apiVersion?: string;
+};
+
+type DipMessage = Record<string, unknown> & { type: string };
+
+type FinalLickPayload = Record<string, unknown> & { action: string };
+
 function fakeFetch(impl: (url: string) => Response | Promise<Response>) {
   return vi.fn(async (input: RequestInfo | URL) => {
     return await impl(String(input));
@@ -57,11 +69,10 @@ function makeHarness(
   const fs = new VirtualFS('test-' + Math.random());
   const systemMessages: string[] = [];
   const dipRefs: string[] = [];
-  const dipInbox: any[] = [];
-  const finalLicks: any[] = [];
-  const accounts: any[] = [];
+  const dipInbox: DipMessage[] = [];
+  const finalLicks: FinalLickPayload[] = [];
+  const accounts: AccountSnapshot[] = [];
   const selectedModels: string[] = [];
-  const skillInstallCalls: Array<{ at: number; profile: unknown }> = [];
   const orchestrator = new OnboardingOrchestrator({
     fs,
     postSystemMessage: (line) => systemMessages.push(line),
@@ -73,9 +84,6 @@ function makeHarness(
     resolveModelLabel: (_p, m) => m.toUpperCase(),
     broadcastToDip: (msg) => dipInbox.push(msg),
     fireFinalLick: (data) => finalLicks.push(data),
-    installRecommendedSkills: async (profile) => {
-      skillInstallCalls.push({ at: Date.now(), profile });
-    },
     fetchImpl: fakeFetch(() => new Response('{}', { status: 200 })),
     rand: () => 0,
   });
@@ -88,7 +96,6 @@ function makeHarness(
     finalLicks,
     accounts,
     selectedModels,
-    skillInstallCalls,
   };
 }
 
@@ -145,37 +152,6 @@ describe('OnboardingOrchestrator', () => {
         await new Promise((r) => setTimeout(r, 10));
       }
       expect(await h.fs.exists('/home/user/.welcome.json')).toBe(true);
-    });
-
-    it('kicks off the recommended-skills installer with the in-memory profile', async () => {
-      const h = makeHarness();
-      await h.orchestrator.handleOnboardingComplete({ name: 'Kim', role: 'developer' });
-      await new Promise((r) => setTimeout(r, 5));
-      expect(h.skillInstallCalls).toHaveLength(1);
-      // Profile is passed by reference so the installer doesn't have to wait
-      // for the parallel persistProfile write to land on disk.
-      expect(h.skillInstallCalls[0].profile).toMatchObject({ name: 'Kim', role: 'developer' });
-    });
-
-    it('silently no-ops when no skill installer was wired', async () => {
-      const fs = new VirtualFS('no-installer-' + Math.random());
-      const finalLicks: any[] = [];
-      const orch = new OnboardingOrchestrator({
-        fs,
-        postSystemMessage: () => {},
-        postDipReference: () => {},
-        getProviderCatalogue: () => baseCatalogue,
-        saveAccount: () => {},
-        setSelectedModel: () => {},
-        broadcastToDip: () => {},
-        fireFinalLick: (data) => finalLicks.push(data),
-        // installRecommendedSkills omitted on purpose.
-        rand: () => 0,
-      });
-      const handled = await orch.handleOnboardingComplete({ name: 'NoInstaller' });
-      expect(handled).toBe(true);
-      // No throw, orchestrator still advances to awaiting-connect.
-      expect(orch.getStage()).toBe('awaiting-connect');
     });
 
     it('is idempotent for duplicate complete events in the same session', async () => {
@@ -269,9 +245,9 @@ describe('OnboardingOrchestrator', () => {
     it('rejects when the validator says the key is bad — does NOT save or fire the cone lick', async () => {
       const fetchImpl = fakeFetch(() => new Response('{"error":"bad"}', { status: 401 }));
       const fs = new VirtualFS('reject-' + Math.random());
-      const accounts: any[] = [];
-      const finalLicks: any[] = [];
-      const dipInbox: any[] = [];
+      const accounts: AccountSnapshot[] = [];
+      const finalLicks: FinalLickPayload[] = [];
+      const dipInbox: DipMessage[] = [];
       const orch = new OnboardingOrchestrator({
         fs,
         postSystemMessage: () => {},
@@ -300,9 +276,9 @@ describe('OnboardingOrchestrator', () => {
         throw new TypeError('Failed to fetch');
       }) as unknown as typeof fetch;
       const fs = new VirtualFS('skipped-' + Math.random());
-      const accounts: any[] = [];
-      const finalLicks: any[] = [];
-      const dipInbox: any[] = [];
+      const accounts: AccountSnapshot[] = [];
+      const finalLicks: FinalLickPayload[] = [];
+      const dipInbox: DipMessage[] = [];
       const orch = new OnboardingOrchestrator({
         fs,
         postSystemMessage: () => {},
@@ -348,7 +324,7 @@ describe('OnboardingOrchestrator', () => {
     it('leaves the selected model untouched when the catalogue has no models for the provider', async () => {
       const fs = new VirtualFS('no-models-' + Math.random());
       const selectedModels: string[] = [];
-      const finalLicks: any[] = [];
+      const finalLicks: FinalLickPayload[] = [];
       const orch = new OnboardingOrchestrator({
         fs,
         postSystemMessage: () => {},
@@ -437,10 +413,166 @@ describe('OnboardingOrchestrator', () => {
       await h.orchestrator.handleConnectAttempt({
         provider: '',
         apiKey: '',
-      } as any);
+      });
       expect(h.accounts).toEqual([]);
       const reject = h.dipInbox.find((m) => m.type === 'slicc-connect-result');
       expect(reject.ok).toBe(false);
+    });
+  });
+
+  describe('handleOAuthAttempt', () => {
+    it('sets the model and fires the final lick on successful OAuth with a model', async () => {
+      const fs = new VirtualFS('oauth-ok-' + Math.random());
+      const selectedModels: string[] = [];
+      const finalLicks: FinalLickPayload[] = [];
+      const dipInbox: DipMessage[] = [];
+      const launchOAuth = vi.fn(async () => ({ ok: true, model: 'adobe:claude-sonnet-4-6' }));
+      const orch = new OnboardingOrchestrator({
+        fs,
+        postSystemMessage: () => {},
+        postDipReference: () => {},
+        getProviderCatalogue: () => baseCatalogue,
+        saveAccount: () => {},
+        setSelectedModel: (id) => selectedModels.push(id),
+        resolveModelLabel: (_p, m) => m.toUpperCase(),
+        broadcastToDip: (msg) => dipInbox.push(msg),
+        fireFinalLick: (data) => finalLicks.push(data),
+        fetchImpl: fakeFetch(() => new Response('{}', { status: 200 })),
+        rand: () => 0,
+        launchOAuth,
+      });
+      await orch.handleOnboardingComplete({});
+      await orch.handleOAuthAttempt({ provider: 'adobe' });
+      expect(launchOAuth).toHaveBeenCalledWith('adobe', null);
+      expect(selectedModels).toEqual(['adobe:claude-sonnet-4-6']);
+      expect(finalLicks).toHaveLength(1);
+      expect(finalLicks[0].action).toBe('onboarding-complete-with-provider');
+      expect(finalLicks[0].data.provider).toBe('adobe');
+      expect(finalLicks[0].data.model).toBe('adobe:claude-sonnet-4-6');
+      expect(finalLicks[0].data.validation).toBe('oauth');
+      expect(orch.getStage()).toBe('complete');
+    });
+
+    it('fires the final lick but does not call setSelectedModel when OAuth returns no model', async () => {
+      const fs = new VirtualFS('oauth-nomodel-' + Math.random());
+      const selectedModels: string[] = [];
+      const finalLicks: FinalLickPayload[] = [];
+      const dipInbox: DipMessage[] = [];
+      const orch = new OnboardingOrchestrator({
+        fs,
+        postSystemMessage: () => {},
+        postDipReference: () => {},
+        getProviderCatalogue: () => baseCatalogue,
+        saveAccount: () => {},
+        setSelectedModel: (id) => selectedModels.push(id),
+        broadcastToDip: (msg) => dipInbox.push(msg),
+        fireFinalLick: (data) => finalLicks.push(data),
+        fetchImpl: fakeFetch(() => new Response('{}', { status: 200 })),
+        rand: () => 0,
+        launchOAuth: async () => ({ ok: true, model: null }),
+      });
+      await orch.handleOnboardingComplete({});
+      await orch.handleOAuthAttempt({ provider: 'adobe' });
+      expect(selectedModels).toEqual([]);
+      expect(finalLicks).toHaveLength(1);
+      expect(finalLicks[0].data.model).toBeNull();
+      const okMsg = dipInbox.find((m) => m.type === 'slicc-connect-result' && m.ok);
+      expect(okMsg).toBeTruthy();
+    });
+
+    it('broadcasts an error and keeps stage at awaiting-connect when OAuth fails', async () => {
+      const fs = new VirtualFS('oauth-fail-' + Math.random());
+      const finalLicks: FinalLickPayload[] = [];
+      const dipInbox: DipMessage[] = [];
+      const orch = new OnboardingOrchestrator({
+        fs,
+        postSystemMessage: () => {},
+        postDipReference: () => {},
+        getProviderCatalogue: () => baseCatalogue,
+        saveAccount: () => {},
+        setSelectedModel: () => {},
+        broadcastToDip: (msg) => dipInbox.push(msg),
+        fireFinalLick: (data) => finalLicks.push(data),
+        fetchImpl: fakeFetch(() => new Response('{}', { status: 200 })),
+        rand: () => 0,
+        launchOAuth: async () => ({ ok: false, message: 'Login cancelled.' }),
+      });
+      await orch.handleOnboardingComplete({});
+      await orch.handleOAuthAttempt({ provider: 'adobe' });
+      expect(finalLicks).toEqual([]);
+      const reject = dipInbox.find((m) => m.type === 'slicc-connect-result');
+      expect(reject.ok).toBe(false);
+      expect(reject.kind).toBe('failed');
+      expect(orch.getStage()).toBe('awaiting-connect');
+    });
+
+    it('broadcasts an error and keeps stage at awaiting-connect when launchOAuth throws', async () => {
+      const fs = new VirtualFS('oauth-throw-' + Math.random());
+      const finalLicks: FinalLickPayload[] = [];
+      const dipInbox: DipMessage[] = [];
+      const orch = new OnboardingOrchestrator({
+        fs,
+        postSystemMessage: () => {},
+        postDipReference: () => {},
+        getProviderCatalogue: () => baseCatalogue,
+        saveAccount: () => {},
+        setSelectedModel: () => {},
+        broadcastToDip: (msg) => dipInbox.push(msg),
+        fireFinalLick: (data) => finalLicks.push(data),
+        fetchImpl: fakeFetch(() => new Response('{}', { status: 200 })),
+        rand: () => 0,
+        launchOAuth: async () => {
+          throw new Error('popup closed');
+        },
+      });
+      await orch.handleOnboardingComplete({});
+      await orch.handleOAuthAttempt({ provider: 'adobe' });
+      expect(finalLicks).toEqual([]);
+      const reject = dipInbox.find((m) => m.type === 'slicc-connect-result');
+      expect(reject.ok).toBe(false);
+      expect(reject.message).toContain('popup closed');
+      expect(orch.getStage()).toBe('awaiting-connect');
+    });
+
+    it('is a no-op when launchOAuth is not provided by the runtime', async () => {
+      const fs = new VirtualFS('oauth-noop-' + Math.random());
+      const finalLicks: FinalLickPayload[] = [];
+      const dipInbox: DipMessage[] = [];
+      const orch = new OnboardingOrchestrator({
+        fs,
+        postSystemMessage: () => {},
+        postDipReference: () => {},
+        getProviderCatalogue: () => baseCatalogue,
+        saveAccount: () => {},
+        setSelectedModel: () => {},
+        broadcastToDip: (msg) => dipInbox.push(msg),
+        fireFinalLick: (data) => finalLicks.push(data),
+        fetchImpl: fakeFetch(() => new Response('{}', { status: 200 })),
+        rand: () => 0,
+        // launchOAuth intentionally omitted
+      });
+      await orch.handleOnboardingComplete({});
+      await orch.handleOAuthAttempt({ provider: 'adobe' });
+      expect(finalLicks).toEqual([]);
+      const reject = dipInbox.find((m) => m.type === 'slicc-connect-result');
+      expect(reject.ok).toBe(false);
+      expect(reject.message).toContain('not available');
+    });
+
+    it('ignores OAuth attempt when stage is already complete', async () => {
+      const h = makeHarness();
+      await h.orchestrator.handleOnboardingComplete({});
+      await h.orchestrator.handleConnectAttempt({
+        provider: 'openai',
+        apiKey: 'sk-good',
+        model: 'gpt-4o',
+      });
+      expect(h.orchestrator.getStage()).toBe('complete');
+      h.finalLicks.length = 0;
+      h.dipInbox.length = 0;
+      await h.orchestrator.handleOAuthAttempt({ provider: 'adobe' });
+      expect(h.finalLicks).toEqual([]);
+      expect(h.dipInbox).toEqual([]);
     });
   });
 });

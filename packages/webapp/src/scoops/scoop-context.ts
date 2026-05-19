@@ -15,7 +15,7 @@ import type { VirtualFS } from '../fs/index.js';
 import type { RestrictedFS } from '../fs/restricted-fs.js';
 import { WasmShell } from '../shell/index.js';
 import { Agent, adaptTools, createLogger } from '../core/index.js';
-import { createCompactContext } from '../core/context-compaction.js';
+import { createCompactContext, stripOrphanedToolResults } from '../core/context-compaction.js';
 import type {
   AgentEvent as CoreAgentEvent,
   AgentMessage,
@@ -25,9 +25,9 @@ import type {
   ImageContent,
   Model,
 } from '../core/index.js';
-import { isContextOverflow, streamSimple, getSupportedThinkingLevels } from '@mariozechner/pi-ai';
-import type { Api, AssistantMessage as PiAssistantMessage } from '@mariozechner/pi-ai';
-import type { ThinkingLevel } from '@mariozechner/pi-agent-core';
+import { isContextOverflow, streamSimple, getSupportedThinkingLevels } from '@earendil-works/pi-ai';
+import type { Api, AssistantMessage as PiAssistantMessage } from '@earendil-works/pi-ai';
+import type { ThinkingLevel } from '@earendil-works/pi-agent-core';
 import type { SessionStore } from '../core/session.js';
 import { createFileTools, createBashTool } from '../tools/index.js';
 import type { BrowserAPI } from '../cdp/index.js';
@@ -44,6 +44,7 @@ import {
 } from './scoop-management-tools.js';
 import { getAdobeSessionId } from './llm-session-id.js';
 import { fetchSecretEnvVars } from '../core/secret-env.js';
+import type { Process, ProcessManager } from '../kernel/process-manager.js';
 
 const log = createLogger('scoop-context');
 
@@ -69,6 +70,22 @@ export function resolveThinkingLevel(
   if (requested === 'xhigh' && !getSupportedThinkingLevels(model).includes('xhigh')) return 'high';
   return requested;
 }
+
+/**
+ * Structural view of an `AgentMessage` used by the overflow / image recovery
+ * passes. They walk every kind of message and only need `role` plus a list of
+ * content blocks discriminated by `type` — narrower than the full union of
+ * pi-ai message shapes, but enough to do the trimming safely without `any`.
+ */
+type RecoveryContentBlock = {
+  type: string;
+  text?: string;
+  data?: string;
+};
+type RecoveryMessage = {
+  role: string;
+  content: RecoveryContentBlock[] | string;
+};
 
 /** Detect API errors caused by invalid/oversized images. */
 export function isImageProcessingError(msg: string): boolean {
@@ -191,6 +208,19 @@ export interface ScoopContextCallbacks {
   getGlobalMemory: () => Promise<string>;
   /** Update global CLAUDE.md (cone only) */
   setGlobalMemory?: (content: string) => Promise<void>;
+  /**
+   * Append auto-extracted memory bullets to /shared/CLAUDE.md (cone only).
+   * Called by the compaction memory-extraction pass. When omitted the
+   * compaction pass skips its second LLM call entirely.
+   */
+  appendGlobalMemory?: (bullets: string, meta: { source: string }) => Promise<void>;
+  /**
+   * Optional lifecycle hook for compaction. Emitted by the compaction
+   * `transformContext` before and after each LLM call so the panel can
+   * render a ghost-bubble affordance while the agent is silent.
+   * `state === 'idle'` clears the affordance.
+   */
+  onCompactionStateChange?: (state: 'summarizing' | 'extracting-memory' | 'idle') => void;
   /** BrowserAPI provider for browser automation commands */
   getBrowserAPI: () => BrowserAPI;
 }
@@ -209,6 +239,20 @@ export class ScoopContext {
   private unsubscribe: (() => void) | null = null;
   /** Aborts the in-flight prompt() retry loop and any pending backoff sleep. */
   private promptAbortController: AbortController | null = null;
+  /**
+   * Process manager. When set, `prompt()` registers a
+   * `kind:'scoop-turn'` process whose `Process.abort` is the same
+   * controller as `promptAbortController`. `stop()` / `dispose()`
+   * route through `pm.signal(pid, 'SIGINT')` so the recorded
+   * `terminatedBy` and the exit code match the expected
+   * scoop-turn aborted (130) shape.
+   *
+   * Optional — tests construct `ScoopContext` without a manager and
+   * the existing inline-orchestrator path stays untouched. The
+   * kernel-worker boot wires it through `createKernelHost`.
+   */
+  private processManager: ProcessManager | null = null;
+  private currentTurnProcess: Process | null = null;
 
   private sessionStore: SessionStore | null = null;
   private sessionId: string;
@@ -225,7 +269,8 @@ export class ScoopContext {
     fs: VirtualFS | RestrictedFS,
     sessionStore?: SessionStore,
     skillsFs?: VirtualFS,
-    coneJid?: string
+    coneJid?: string,
+    processManager?: ProcessManager
   ) {
     this.scoop = scoop;
     this.callbacks = callbacks;
@@ -233,6 +278,7 @@ export class ScoopContext {
     this.sessionStore = sessionStore ?? null;
     this.skillsFs = skillsFs ?? null;
     this.coneJid = coneJid;
+    this.processManager = processManager ?? null;
     // Internal persistence key — stable across days/restarts so saved
     // conversations can be restored by `SessionStore.load`. The outgoing
     // Adobe `X-Session-Id` is computed separately in `init()`.
@@ -314,7 +360,22 @@ export class ScoopContext {
         createBashTool(this.shell),
         ...scoopManagementTools,
       ];
-      const tools = adaptTools(legacyTools);
+      // Thread the process manager so each tool call registers a
+      // `kind:'tool'` process under the active scoop-turn.
+      // `getParentPid` is a closure over `currentTurnProcess` so the
+      // right turn's pid is always visible — tools fired between
+      // turns (e.g. proactive tool-use; rare) get `ppid: undefined`
+      // (defaults to 1).
+      const tools = this.processManager
+        ? adaptTools(legacyTools, {
+            processManager: this.processManager,
+            owner: {
+              kind: this.scoop.isCone ? 'cone' : 'scoop',
+              scoopJid: this.scoop.jid,
+            },
+            getParentPid: () => this.currentTurnProcess?.pid,
+          })
+        : adaptTools(legacyTools);
 
       // Load scoop memory
       const memoryPath = this.scoop.isCone
@@ -375,11 +436,12 @@ export class ScoopContext {
         try {
           const saved = await this.sessionStore.load(this.sessionId);
           if (saved) {
-            restoredMessages = saved.messages;
+            restoredMessages = stripOrphanedToolResults(saved.messages);
             this.sessionCreatedAt = saved.createdAt;
             log.info('Restored agent session', {
               folder: this.scoop.folder,
               messageCount: restoredMessages.length,
+              droppedOrphans: saved.messages.length - restoredMessages.length,
             });
           }
         } catch (err) {
@@ -390,11 +452,6 @@ export class ScoopContext {
           this.callbacks.onError(`Conversation history could not be restored. Starting fresh.`);
         }
       }
-
-      const compactFn = createCompactContext({
-        model,
-        getApiKey: () => getApiKey() ?? undefined,
-      });
 
       // Compute the Adobe session identifier once per init. It is a
       // daily-rotating random UUID for the cone, and `<uuid>/<hash(folder, uuid)>`
@@ -409,6 +466,28 @@ export class ScoopContext {
           headers: { ...opts?.headers, 'X-Session-Id': adobeSessionId },
         });
       };
+
+      // Compaction hits the LLM via pi-coding-agent's `completeSimple`, which
+      // bypasses our `streamWithSessionId` wrapper. Forward the same Adobe
+      // session header through `createCompactContext` so summarization calls
+      // join the same session as the agent's tool turns.
+      const compactionHeaders =
+        model.provider === 'adobe' ? { 'X-Session-Id': adobeSessionId } : undefined;
+      // Auto-extracted memory is cone-only — scoops keep their own local
+      // memory files curated by the user. Wiring the callback only for the
+      // cone also skips the second compaction LLM call entirely for scoops.
+      const onMemoryUpdates =
+        this.scoop.isCone && this.callbacks.appendGlobalMemory
+          ? (bullets: string) =>
+              this.callbacks.appendGlobalMemory!(bullets, { source: 'compaction' })
+          : undefined;
+      const compactFn = createCompactContext({
+        model,
+        getApiKey: () => getApiKey() ?? undefined,
+        headers: compactionHeaders,
+        onMemoryUpdates,
+        onCompactionStateChange: this.callbacks.onCompactionStateChange,
+      });
 
       // Guard: dispose() may have run while init() was awaiting above.
       if (this.disposed) return;
@@ -494,6 +573,28 @@ export class ScoopContext {
 
     this.isProcessing = true;
     this.setStatus('processing');
+
+    // Register the scoop turn as a process. The `Process.abort`
+    // adopts `abortController` so existing callers that hold the
+    // controller (stop/dispose) keep working; `pm.signal(pid, …)`
+    // is the path the `kill` shell command takes. Truncate the
+    // prompt text to a reasonable length for `argv` (full text
+    // would be visible in `/proc/<pid>/cmdline` — fine, but
+    // hundreds-of-KB prompts shouldn't blow up that file).
+    const turnArgv = ['prompt', text.length > 200 ? text.slice(0, 197) + '…' : text];
+    const turnProcess = this.processManager
+      ? this.processManager.spawn({
+          kind: 'scoop-turn',
+          argv: turnArgv,
+          cwd: this.scoop.isCone ? '/' : `/scoops/${this.scoop.folder}/workspace`,
+          owner: {
+            kind: this.scoop.isCone ? 'cone' : 'scoop',
+            scoopJid: this.scoop.jid,
+          },
+          adoptAbort: abortController,
+        })
+      : null;
+    this.currentTurnProcess = turnProcess;
 
     const MAX_RETRIES = 3;
     const BASE_DELAY_MS = 1000;
@@ -605,19 +706,52 @@ export class ScoopContext {
       }
     } finally {
       this.isProcessing = false;
+      // Bug fix: every early-return path above (disposed, aborted,
+      // retry-loop bail-outs) skips the `setStatus('ready')` line
+      // at the bottom of the try block, so the panel never gets a
+      // wire-level signal to clear its "processing" spinner. Flip
+      // status here as a backstop — but only if it's still
+      // 'processing'. The non-retryable / retries-exhausted paths
+      // already set 'error' before returning; we don't want to
+      // overwrite that. When the scoop is disposed entirely,
+      // setStatus is a no-op (guarded inside).
+      if (!this.disposed && this.status === 'processing') {
+        this.setStatus('ready');
+      }
       // Only clear the reference if it's still ours — a later prompt() may
       // have already installed a new controller.
       if (this.promptAbortController === abortController) {
         this.promptAbortController = null;
+      }
+      // Exit the scoop-turn process. Pass `null` so the manager
+      // derives the conventional exit code from `terminatedBy`
+      // (130 SIGINT, 143 SIGTERM, 137 SIGKILL); a clean turn or a
+      // turn that exhausted retries without an abort gets 0.
+      if (turnProcess && this.processManager) {
+        if (lastError && !abortSignal.aborted) {
+          this.processManager.exit(turnProcess.pid, 1);
+        } else {
+          this.processManager.exit(turnProcess.pid, abortSignal.aborted ? null : 0);
+        }
+      }
+      if (this.currentTurnProcess === turnProcess) {
+        this.currentTurnProcess = null;
       }
     }
   }
 
   /** Stop the current agent operation and clear any queued prompts */
   stop(): void {
-    // Abort before touching the agent so any pending backoff sleep resolves
-    // and the retry loop exits on its next disposal/abort check.
-    this.promptAbortController?.abort();
+    // Route the abort through `pm.signal` first so the turn
+    // process records `terminatedBy: 'SIGINT'` before we abort
+    // the controller (the abort would still fire because
+    // `signal()` calls `controller.abort()` internally — but
+    // doing it via the manager keeps the recorded state consistent).
+    if (this.currentTurnProcess && this.processManager) {
+      this.processManager.signal(this.currentTurnProcess.pid, 'SIGINT');
+    } else {
+      this.promptAbortController?.abort();
+    }
     this.agent?.clearAllQueues?.();
     this.agent?.abort?.();
     this.isProcessing = false;
@@ -739,7 +873,14 @@ export class ScoopContext {
   dispose(): void {
     this.disposed = true;
     // Cancel any in-flight retry loop / backoff sleep before tearing down the agent.
-    this.promptAbortController?.abort();
+    if (this.currentTurnProcess && this.processManager) {
+      // SIGTERM matches the conventional shutdown semantic — the
+      // turn loop's `finally` block will run `pm.exit(pid, null)`
+      // and the manager derives the 143 exit code from terminatedBy.
+      this.processManager.signal(this.currentTurnProcess.pid, 'SIGTERM');
+    } else {
+      this.promptAbortController?.abort();
+    }
     this.promptAbortController = null;
     this.agent?.clearAllQueues?.();
     this.agent?.abort?.();
@@ -920,7 +1061,7 @@ export class ScoopContext {
       let replaced = 0;
 
       for (let i = trimmed.length - 1; i >= 0 && replaced < 5; i--) {
-        const msg = trimmed[i] as any;
+        const msg = trimmed[i] as RecoveryMessage;
         if (!Array.isArray(msg.content)) continue;
 
         let msgSize = 0;
@@ -940,16 +1081,16 @@ export class ScoopContext {
           // must stay paired with subsequent toolResult messages. Only replace
           // text/image/thinking content blocks.
           if (msg.role === 'assistant') {
-            const toolCalls = msg.content.filter((block: any) => block.type === 'toolCall');
+            const toolCalls = msg.content.filter((block) => block.type === 'toolCall');
             trimmed[i] = {
               ...msg,
               content: [placeholder, ...toolCalls],
-            };
+            } as AgentMessage;
           } else {
             trimmed[i] = {
               ...msg,
               content: [placeholder],
-            };
+            } as AgentMessage;
           }
           replaced++;
           log.info('Replaced oversized message', {
@@ -958,7 +1099,7 @@ export class ScoopContext {
             size: msgSize,
             preservedToolCalls:
               msg.role === 'assistant'
-                ? msg.content.filter((b: any) => b.type === 'toolCall').length
+                ? msg.content.filter((b) => b.type === 'toolCall').length
                 : 0,
           });
         }
@@ -1023,23 +1164,23 @@ export class ScoopContext {
       const limit = Math.max(0, trimmed.length - 10);
 
       for (let i = trimmed.length - 1; i >= limit; i--) {
-        const msg = trimmed[i] as any;
+        const msg = trimmed[i] as RecoveryMessage;
         if (!Array.isArray(msg.content)) continue;
 
-        const hasImages = msg.content.some((block: any) => block.type === 'image');
+        const hasImages = msg.content.some((block) => block.type === 'image');
         if (!hasImages) continue;
 
         // Remove image blocks, keep text blocks
-        const filtered = msg.content.filter((block: any) => block.type !== 'image');
+        const filtered = msg.content.filter((block) => block.type !== 'image');
 
         if (filtered.length === 0) {
           // All content was images — replace with placeholder
           trimmed[i] = {
             ...msg,
             content: [{ type: 'text' as const, text: '[Image removed: rejected by API]' }],
-          };
+          } as AgentMessage;
         } else {
-          trimmed[i] = { ...msg, content: filtered };
+          trimmed[i] = { ...msg, content: filtered } as AgentMessage;
         }
         stripped++;
       }

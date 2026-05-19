@@ -87,6 +87,11 @@ struct ServerCommand: AsyncParsableCommand {
         let serveOrigin = "http://localhost:\(servePort)"
 
         var browserProcess: Process?
+        // Real Chrome PID when we routed the spawn through `/usr/bin/open`
+        // (LaunchServices) for TCC attribution. `browserProcess` then wraps
+        // `open`, so the graceful-shutdown SIGKILL fallback needs this
+        // separate handle to actually target Chrome.
+        var browserKillPid: pid_t?
         var browserLabel = config.electron ? "Electron" : "Chrome"
         var overlayInjector: ElectronOverlayInjector?
 
@@ -97,7 +102,43 @@ struct ServerCommand: AsyncParsableCommand {
         // pops on the first slicc-server run after Sliccstart wrote the
         // blob, and SecretStore.all() is what triggers it.
         let envFileSecrets: [Secret] = config.envFileURL.flatMap { Self.parseEnvFileSecrets(at: $0) } ?? []
-        let secretInjector = SecretInjector(sessionId: UUID().uuidString, envFileSecrets: envFileSecrets)
+        // Session-id persistence: when --env-file is given, co-locate the
+        // session-id file with the env-file (so per-project envs get
+        // per-project masking namespaces). Otherwise default to
+        // ~/.slicc/session-id, matching packages/node-server/src/index.ts.
+        let sessionDir: URL = {
+            if let envFileURL = config.envFileURL {
+                return envFileURL.deletingLastPathComponent()
+            }
+            let home = URL(fileURLWithPath: NSHomeDirectory())
+            return home.appendingPathComponent(".slicc")
+        }()
+        let sessionId: String
+        do {
+            sessionId = try SecretInjector.readOrCreateSessionId(in: sessionDir)
+        } catch {
+            // Fall back to an ephemeral UUID rather than crashing; the
+            // node-server path also degrades gracefully on filesystem errors.
+            logger.warning(
+                "session-id persistence failed; falling back to ephemeral session",
+                metadata: ["error": .string(String(describing: error))]
+            )
+            sessionId = UUID().uuidString
+        }
+        let oauthStore = OAuthSecretStore()
+        let secretInjector = SecretInjector(
+            sessionId: sessionId,
+            envFileSecrets: envFileSecrets,
+            oauthStore: oauthStore
+        )
+        // Do NOT call `await secretInjector.reload()` here: at startup the
+        // OAuth store is empty, so reload() is a state no-op — but the
+        // redundant Keychain re-read + async actor hop + second
+        // setSecretsAndScrubber cycle on a just-init'd injector has been
+        // observed to corrupt the libsystem_malloc nano zone, crashing the
+        // process shortly after Hummingbird binds with "freed pointer was
+        // not the last allocation". reload() is fine to call once OAuth
+        // replicas actually arrive (see /api/secrets/oauth-update).
 
         if config.electron, !config.serveOnly {
             guard let electronApp = config.electronApp else {
@@ -139,6 +180,7 @@ struct ServerCommand: AsyncParsableCommand {
                 )
             )
             browserProcess = launchedChrome.process
+            browserKillPid = launchedChrome.chromePid
             browserLabel = "Chrome"
             cdpPort = launchedChrome.cdpPort
         }
@@ -157,7 +199,14 @@ struct ServerCommand: AsyncParsableCommand {
                 logger: Logger(label: "slicc.static-files")
             )
         )
-        registerAPIRoutes(router: router, lickSystem: lickSystem, config: config, httpClient: httpClient, secretInjector: secretInjector)
+        registerAPIRoutes(
+            router: router,
+            lickSystem: lickSystem,
+            config: config,
+            httpClient: httpClient,
+            secretInjector: secretInjector,
+            oauthStore: oauthStore
+        )
 
         let wsRouter = Router(context: BasicWebSocketRequestContext.self)
         await cdpProxy.install(on: wsRouter, cdpPort: cdpPort)
@@ -237,6 +286,7 @@ struct ServerCommand: AsyncParsableCommand {
             await shutdownHandler.install(
                 context: ShutdownContext(
                     browserProcess: browserProcess,
+                    browserKillPid: browserKillPid,
                     browserLabel: browserLabel,
                     cdpPort: cdpPort,
                     fileLogger: fileLogger,

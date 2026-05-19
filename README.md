@@ -11,7 +11,7 @@ If this scares, confuses, or excites you, keep reading.
 
 # slicc — Self-Licking Ice Cream Cone
 
-[![74% Vibe_Coded](https://img.shields.io/badge/74%25-Vibe_Coded-ff69b4?style=for-the-badge&logo=claude&logoColor=white)](https://github.com/ai-ecoverse/vibe-coded-badge-action)
+[![76% Vibe_Coded](https://img.shields.io/badge/76%25-Vibe_Coded-ff69b4?style=for-the-badge&logo=claude&logoColor=white)](https://github.com/ai-ecoverse/vibe-coded-badge-action)
 
 [![npm](https://img.shields.io/npm/v/sliccy)](https://www.npmjs.com/package/sliccy)
 
@@ -105,6 +105,19 @@ npm run build:extension
 
 Load `dist/extension/` as an unpacked extension in `chrome://extensions`, then open the SLICC side panel.
 
+**Pop out to a full-page tab.** In the Chrome extension, the side panel
+header has a "Pop out" button that opens SLICC in a full-page tab with
+the standalone split-pane layout. Close the tab to return to the side
+panel. State (chat history, scoops, VFS) is shared.
+
+While a detached tab is open, the side panel is disabled globally
+(across all Chrome windows) — clicking the toolbar icon focuses the
+detached tab. This is intentional; close the tab to restore the side
+panel. The optional best-effort SW hard-close of any open side panels
+uses `chrome.sidePanel.close` (Chrome 141+). Older Chrome versions
+still get full mutual exclusion via `window.close()` from the panel,
+the send-path lock, and the non-dismissible overlay.
+
 ### 5. Run a second browser
 
 SLICC can mirror itself across multiple browsers, even on other machines:
@@ -174,7 +187,7 @@ SLICC is part of the [AI Ecoverse](https://github.com/ai-ecoverse), a growing se
 - [upskill](https://github.com/ai-ecoverse/upskill) — installs reusable agent skills from other repositories (and built-in in SLICC)
 - [ai-aligned-git](https://github.com/ai-ecoverse/ai-aligned-git) and [ai-aligned-gh](https://github.com/ai-ecoverse/ai-aligned-gh) — guardrails and attribution helpers for AI-assisted Git/GitHub work
 
-SLICC would not have been possible without the pioneering inspiration of [OpenClaw](https://github.com/openclaw/openclaw), [NanoClaw](https://github.com/qwibitai/nanoclaw), and [Pi](https://github.com/badlogic/pi-mono). Pi is actually the frozen heart of every SLICC instance.
+SLICC would not have been possible without the pioneering inspiration of [OpenClaw](https://github.com/openclaw/openclaw), [NanoClaw](https://github.com/qwibitai/nanoclaw), and [Pi](https://github.com/earendil-works/pi-mono). Pi is actually the frozen heart of every SLICC instance.
 
 ## Development and deeper docs
 

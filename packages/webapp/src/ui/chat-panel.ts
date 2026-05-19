@@ -16,7 +16,14 @@ import { formatAttachmentSize, formatAttachmentSummary } from '../core/attachmen
 import { getMimeType } from '../core/mime-types.js';
 import { processImageContent, isSupportedImageFormat } from '../core/image-processor.js';
 import { VoiceInput, getVoiceAutoSend, getVoiceLang } from './voice-input.js';
-import { hydrateDips, disposeDips, type DipInstance } from './dip.js';
+import {
+  hydrateDips,
+  disposeDips,
+  mountDraftDip,
+  splitContentSegments,
+  type DipInstance,
+  type DraftDipInstance,
+} from './dip.js';
 import { createToolUIRenderer, disposeToolUIRenderer } from './tool-ui-renderer.js';
 import {
   getToolDescriptor,
@@ -38,6 +45,7 @@ import {
   setSelectedModelId,
   getProviderConfig,
 } from './provider-settings.js';
+import { quickLabel } from './quick-llm.js';
 import { trackChatSend, trackImageView } from './telemetry.js';
 import { attachLongPressGesture } from './long-press.js';
 
@@ -66,6 +74,18 @@ const MAX_INLINE_TEXT_BYTES = 512 * 1024;
 /** Generate a simple unique ID. */
 function uid(): string {
   return Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+}
+
+/** Reject degenerate cluster labels: too short, just digits/punctuation, or
+ *  a single word. The LLM occasionally treats tool inputs as code to run
+ *  and replies with the *result* (e.g., "3" for `console.log(1+2)`); this
+ *  guards against displaying that as the cluster's label. */
+function isUsefulClusterLabel(text: string): boolean {
+  if (text.length < 6) return false;
+  if (!/[a-zA-Z]/.test(text)) return false;
+  // Reject single-word labels; cluster summaries should be a phrase.
+  if (!/\s/.test(text.trim())) return false;
+  return true;
 }
 
 /** Read a tool-call element's current status from its `tool-call--<status>`
@@ -135,8 +155,22 @@ function isTextLikeFile(file: File, mimeType: string): boolean {
 
 function renderChatMessageContent(msg: ChatMessage): string {
   return msg.role === 'assistant'
-    ? renderAssistantMessageContent(msg.content)
+    ? renderAssistantMessageContent(msg.content, msg.isStreaming === true)
     : renderMessageContent(msg.content);
+}
+
+/**
+ * Render a single prose segment of a streaming assistant message. Called
+ * once per prose segment per flush by `renderStreamingSegmented`. The
+ * `isStreaming` flag is always false here because the caller has
+ * already split shtml fences out into their own segments — there's no
+ * shtml block in the prose to swap for a placeholder, and rendering
+ * with the streaming flag would only suppress legitimate code blocks.
+ */
+function renderProseSegment(text: string, role: ChatMessage['role']): string {
+  return role === 'assistant'
+    ? renderAssistantMessageContent(text, false)
+    : renderMessageContent(text);
 }
 
 /**
@@ -184,6 +218,9 @@ export class ChatPanel {
   private keydownListener: ((e: KeyboardEvent) => void) | null = null;
   private messages: ChatMessage[] = [];
   private agent: AgentHandle | null = null;
+  private leaderBroadcast:
+    | ((text: string, messageId: string, attachments?: MessageAttachment[]) => void)
+    | null = null;
   private unsubscribe: (() => void) | null = null;
   private isStreaming = false;
   private currentStreamId: string | null = null;
@@ -199,7 +236,26 @@ export class ChatPanel {
   private pendingDeltaText = '';
   private streamingRafId: number | null = null;
   private dips = new Map<string, DipInstance[]>();
+  /**
+   * Streaming-draft iframes by message id, indexed in shtml-block order.
+   * Slot is `null` when a placeholder exists but no draft has been mounted
+   * (e.g. extension mode, or the block content is still empty). Drafts
+   * persist across `updateStreamingContent` re-renders by being re-parented
+   * onto the freshly-rendered `.msg__dip-pending` element — re-parenting
+   * within the same document does not reload the iframe, which is the
+   * whole point of this mechanism. Disposed before final `hydrateDips`.
+   */
+  private drafts = new Map<string, Array<DraftDipInstance | null>>();
   public onDipLick?: (action: string, data: unknown) => void;
+  /**
+   * Fired whenever the displayed message list changes (new message,
+   * streaming update, switch to a new context). The estimated token
+   * count is a coarse chars/4 heuristic over message content + tool
+   * call JSON — same family of estimate the compaction pass uses,
+   * accurate enough to drive UI affordances like the "context getting
+   * full" glow on the New Session button.
+   */
+  public onMessagesChanged?: (estimatedTokens: number) => void;
   private modelSelectorEl!: HTMLElement;
   public onModelChange?: (modelId: string) => void;
   private thinkingBtn!: HTMLButtonElement;
@@ -230,6 +286,47 @@ export class ChatPanel {
    *  msgId is used as the anchor: it's the chain's first call and stays
    *  stable as the cluster grows. */
   private openClusterAnchors = new Set<string>();
+  /** Cache of LLM-generated cluster labels keyed by sorted tool-call ids. */
+  private clusterLabelCache = new Map<string, string>();
+  /** Sticky label keyed by the cluster's *anchor* (first tool-call id).
+   *  The anchor stays the same as the cluster grows, so once an LLM label
+   *  has been shown we can re-display it on every subsequent rebuild —
+   *  instead of flickering back to the comma-joined fallback while the
+   *  new signature's label is being fetched. */
+  private clusterLabelByAnchor = new Map<string, string>();
+  /** Debounce timers keyed by anchor. A fresh tool call arriving inside
+   *  the debounce window resets the timer, so a fast burst fires one
+   *  LLM call for the whole cluster instead of one per call. */
+  private clusterLabelTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  /** Latest pending snapshot per anchor: the signature we'll request a
+   *  label for, plus every preview element that should receive the
+   *  result (including orphaned ones from intermediate reflows — those
+   *  are filtered with `isConnected` at settle time). `inFlight` flips
+   *  true once `fireClusterLabelRequest` has actually called the LLM
+   *  for this signature, so identical-signature reschedules (the same
+   *  cluster reflowing during streaming) can enroll their new
+   *  previewEl without starting a duplicate request. */
+  private clusterLabelPending = new Map<
+    string,
+    {
+      signature: string;
+      toolCalls: readonly ToolCall[];
+      elements: Set<HTMLElement>;
+      inFlight: boolean;
+    }
+  >();
+  /** Debounce window before a cluster-label request actually fires.
+   *  Short enough that a finished cluster gets its label promptly, long
+   *  enough to coalesce a fast burst of tool calls into one request. */
+  private static readonly CLUSTER_LABEL_DEBOUNCE_MS = 600;
+  /** Default placeholder before any LLM-suggested replacement. */
+  private static readonly DEFAULT_PLACEHOLDER = 'What shall we build?';
+  /** AbortController for the most recent placeholder-suggestion request. */
+  private placeholderAbort: AbortController | null = null;
+  /** Previous `setStreamingState` value. The placeholder refresh fires
+   *  only on the streaming→idle edge — not on every "still idle" call
+   *  (e.g. context switches that pass `false` while already idle). */
+  private wasStreaming = false;
 
   constructor(container: HTMLElement) {
     this.container = container;
@@ -244,6 +341,13 @@ export class ChatPanel {
     this.unsubscribe?.();
     this.agent = agent;
     this.unsubscribe = agent.onEvent((ev) => this.handleAgentEvent(ev));
+  }
+
+  /** Register a broadcast hook for when the leader sends their own user message. */
+  setLeaderBroadcast(
+    fn: ((text: string, messageId: string, attachments?: MessageAttachment[]) => void) | null
+  ): void {
+    this.leaderBroadcast = fn;
   }
 
   /** Set a callback for terminal output events. */
@@ -286,6 +390,7 @@ export class ChatPanel {
   /** Clear the current session and reset messages. */
   async clearSession(): Promise<void> {
     this.messages = [];
+    this.resetEphemeralLlmState();
     this.renderMessages();
     await this.sessionStore.delete(this.sessionId);
   }
@@ -296,6 +401,36 @@ export class ChatPanel {
   }
 
   /** Switch to a different scoop's chat context. */
+  /**
+   * Render a frozen-session archive as a read-only chat view. Bypasses
+   * `SessionStore` (the archive lives on the VFS, not in IndexedDB) and
+   * does NOT persist on the way out — the contextId is namespaced so a
+   * subsequent `persistSessionAsync()` would no-op rather than poison
+   * the live cone session.
+   */
+  async displayFrozenSession(opts: {
+    /** Unique id for this view; prefixed with `frozen:` so it can't collide with a real session. */
+    contextId: string;
+    /** Pre-parsed messages from the archive. */
+    messages: ChatMessage[];
+    /** Title to show in the thread header. */
+    title: string;
+  }): Promise<void> {
+    await this.persistSessionAsync();
+    this.setStreamingState(false);
+    this.currentStreamId = null;
+    this.cancelPendingDelta();
+    this.resetEphemeralLlmState();
+    if (this.textarea) this.textarea.placeholder = ChatPanel.DEFAULT_PLACEHOLDER;
+    this.sessionId = opts.contextId;
+    // The current-scoop label is a free-form string in this code path —
+    // re-use it as a "frozen indicator" so the thread header reads naturally.
+    this.currentScoopName = `❄ ${opts.title}`;
+    this.setReadOnly(true);
+    this.messages = opts.messages.map((m) => ({ ...m, isStreaming: false }));
+    this.renderMessages();
+  }
+
   async switchToContext(contextId: string, readOnly: boolean, scoopName?: string): Promise<void> {
     // Save current session first
     await this.persistSessionAsync();
@@ -305,6 +440,15 @@ export class ChatPanel {
     this.setStreamingState(false);
     this.currentStreamId = null;
     this.cancelPendingDelta();
+
+    // Drop ephemeral LLM-suggestion state from the prior scoop. The
+    // cluster cache is keyed by tool-call ids (which are scoped to the
+    // outgoing scoop) and the placeholder we generated reflects the
+    // outgoing transcript; both would be misleading in the new context.
+    this.resetEphemeralLlmState();
+    // Reset the placeholder back to the static default until the next
+    // streaming→idle transition computes a fresh one for this scoop.
+    if (this.textarea) this.textarea.placeholder = ChatPanel.DEFAULT_PLACEHOLDER;
 
     // Switch
     this.sessionId = contextId;
@@ -322,6 +466,23 @@ export class ChatPanel {
       this.messages = [];
     }
     this.renderMessages();
+  }
+
+  /** Drop all ephemeral state tied to a scoop's lifetime: cluster
+   *  labels (keyed by tool-call ids that vanish with the scoop) and
+   *  any in-flight placeholder suggestion. Called on every session
+   *  reset (`switchToContext`, `clearSession`, `dispose`) so the
+   *  ChatPanel never carries unbounded label entries across switches
+   *  or applies a label resolved from a previous scoop's signatures. */
+  private resetEphemeralLlmState(): void {
+    this.clusterLabelCache.clear();
+    this.clusterLabelByAnchor.clear();
+    for (const t of this.clusterLabelTimers.values()) clearTimeout(t);
+    this.clusterLabelTimers.clear();
+    this.clusterLabelPending.clear();
+    this.placeholderAbort?.abort();
+    this.placeholderAbort = null;
+    this.wasStreaming = false;
   }
 
   /** Set read-only mode (hide input for non-cone scoops). */
@@ -489,6 +650,65 @@ export class ChatPanel {
     this.renderMessages();
     this.persistSession();
     this.renderModelSelector();
+  }
+
+  /**
+   * Toggle the in-flight compaction ghost bubble. Called by the kernel
+   * client when the active scoop's compaction transformer enters or
+   * leaves a phase. The bubble lives outside `this.messages` (it's not
+   * a persisted ChatMessage) — it's a sibling `.msg-group--ghost` node
+   * appended to the messages container that we tear down on idle.
+   *
+   * `'idle'` removes the bubble. The other states show different
+   * labels so the user knows whether we're crunching the conversation
+   * (summarizing) or persisting learnings (extracting-memory).
+   */
+  setCompactionState(state: 'summarizing' | 'extracting-memory' | 'idle'): void {
+    const existing = this.messagesInner?.querySelector(':scope > .msg-group--compaction');
+    if (state === 'idle') {
+      existing?.remove();
+      return;
+    }
+    const label =
+      state === 'extracting-memory'
+        ? 'Saving memories from this session…'
+        : 'Compacting earlier messages to save context…';
+    if (existing) {
+      const labelEl = existing.querySelector('.msg-group--compaction__label');
+      if (labelEl) labelEl.textContent = label;
+      return;
+    }
+    const ghost = this.createCompactionGhostBubble(label);
+    this.messagesInner.appendChild(ghost);
+    this.scrollToBottom();
+  }
+
+  /**
+   * Build the ghost-bubble DOM. Lucide `archive` icon (a box with a
+   * slot, suggesting "filing away") + animated dots after the label so
+   * the bubble visibly pulses while the LLM call is in flight.
+   */
+  private createCompactionGhostBubble(label: string): HTMLElement {
+    const group = document.createElement('div');
+    group.className = 'msg-group msg-group--compaction';
+    const bubble = document.createElement('div');
+    bubble.className = 'msg-group--compaction__bubble';
+    // Lucide `archive` — keep paths inline so we don't have to load the
+    // sprite bundle for one icon.
+    bubble.innerHTML =
+      '<svg class="msg-group--compaction__icon" xmlns="http://www.w3.org/2000/svg" ' +
+      'width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" ' +
+      'stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
+      '<rect width="20" height="5" x="2" y="3" rx="1"/>' +
+      '<path d="M4 8v11a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8"/>' +
+      '<path d="M10 12h4"/>' +
+      '</svg>' +
+      '<span class="msg-group--compaction__label"></span>' +
+      '<span class="msg-group--compaction__dots" aria-hidden="true"><span></span><span></span><span></span></span>';
+    const labelEl = bubble.querySelector('.msg-group--compaction__label');
+    if (labelEl) labelEl.textContent = label;
+    group.appendChild(bubble);
+    return group;
   }
 
   /** Clear all messages from the display (doesn't affect session store). */
@@ -705,7 +925,7 @@ export class ChatPanel {
 
     this.textarea = document.createElement('textarea');
     this.textarea.className = 'chat__textarea';
-    this.textarea.placeholder = 'What shall we build?';
+    this.textarea.placeholder = ChatPanel.DEFAULT_PLACEHOLDER;
     this.textarea.rows = 1;
 
     this.sendBtn = document.createElement('button');
@@ -832,12 +1052,50 @@ export class ChatPanel {
       if (e.key === 'Enter' && !e.shiftKey) {
         e.preventDefault();
         this.sendMessage();
+        return;
+      }
+      // Tab accepts the LLM-suggested placeholder as the textarea value.
+      // Only fires when the textarea is empty AND the placeholder is a
+      // real suggestion (not the static default), so it doesn't steal Tab
+      // from the user's intended focus shift in the empty initial state.
+      if (
+        e.key === 'Tab' &&
+        !e.shiftKey &&
+        !e.metaKey &&
+        !e.ctrlKey &&
+        !e.altKey &&
+        this.textarea.value.length === 0 &&
+        this.textarea.placeholder.length > 0 &&
+        this.textarea.placeholder !== ChatPanel.DEFAULT_PLACEHOLDER
+      ) {
+        e.preventDefault();
+        this.textarea.value = this.textarea.placeholder;
+        this.adjustTextareaHeight();
+        this.updateSendButtonState();
+        const end = this.textarea.value.length;
+        this.textarea.setSelectionRange(end, end);
       }
     });
 
     this.textarea.addEventListener('input', () => {
       this.adjustTextareaHeight();
       this.updateSendButtonState();
+    });
+
+    this.textarea.addEventListener('paste', (e) => {
+      const items = e.clipboardData?.items;
+      if (!items) return;
+      const imageFiles: File[] = [];
+      for (const item of items) {
+        if (item.kind === 'file' && item.type.startsWith('image/')) {
+          const file = item.getAsFile();
+          if (file) imageFiles.push(file);
+        }
+      }
+      if (imageFiles.length > 0) {
+        e.preventDefault();
+        void this.addAttachmentsFromFiles(imageFiles);
+      }
     });
 
     this.sendBtn.addEventListener('click', () => this.sendMessage());
@@ -998,6 +1256,7 @@ export class ChatPanel {
 
     // Send to agent (orchestrator persists & queues if the cone is busy)
     this.agent?.sendMessage(text, msg.id, attachments);
+    this.leaderBroadcast?.(text, msg.id, attachments);
   }
 
   private handleAgentEvent(event: AgentEvent): void {
@@ -1254,6 +1513,9 @@ export class ChatPanel {
     this.updateSendButtonState();
     // Textarea stays enabled so the user can queue follow-up messages
     this.textarea.disabled = false;
+    const transitionedToIdle = this.wasStreaming && !streaming;
+    this.wasStreaming = streaming;
+
     // Mic button stays enabled during streaming so user can toggle voice mode off
     if (streaming) {
       if (this.voiceInput?.isListening()) {
@@ -1268,6 +1530,10 @@ export class ChatPanel {
         oldestQueued.queued = false;
         this.updateMessageEl(oldestQueued.id);
       }
+      // Cancel any in-flight placeholder suggestion: its source
+      // transcript is now stale (this turn will append new context).
+      this.placeholderAbort?.abort();
+      this.placeholderAbort = null;
     }
     if (!streaming) {
       if (this.voiceMode) {
@@ -1279,7 +1545,227 @@ export class ChatPanel {
       } else {
         this.textarea.focus();
       }
+      // Fire-and-forget: regenerate the textarea placeholder from recent
+      // turns so the next prompt suggestion reflects the current
+      // conversation. Only fires on the streaming→idle edge — calls
+      // that pass `false` while already idle (e.g. switchToContext
+      // resetting streaming state on a fresh scoop) should NOT refresh
+      // off whatever messages happen to be loaded at that moment.
+      // quickLabel returns null on any failure, in which case we keep
+      // whatever placeholder is already set.
+      if (transitionedToIdle) {
+        void this.refreshSuggestedPlaceholder();
+      }
     }
+  }
+
+  /** Look up a ToolCall by owning message id and tool-call id. */
+  private lookupToolCall(
+    msgId: string | undefined,
+    toolCallId: string | undefined
+  ): ToolCall | undefined {
+    if (!msgId || !toolCallId) return undefined;
+    const msg = this.messages.find((m) => m.id === msgId);
+    return msg?.toolCalls?.find((tc) => tc.id === toolCallId);
+  }
+
+  /** Replace a cluster's comma-joined preview with an LLM-generated label
+   *  describing what the tool calls accomplish together. Uses inputs only
+   *  (per-tool args), not return values.
+   *
+   *  Two layers of caching keep the label visually stable as a cluster
+   *  grows: an exact-signature cache (sorted tool-call ids → label) for
+   *  re-renders of an unchanged cluster, and an anchor cache (first
+   *  tool-call id → most recent label) so a cluster that has grown by
+   *  one tool call keeps displaying its previous LLM label instead of
+   *  flickering back to the comma-joined "bash, bash, bash" fallback.
+   *
+   *  Requests are debounced per anchor so a fast burst of tool calls
+   *  fires a single LLM call once the burst settles rather than one
+   *  per call. Late-arriving previewEls from intermediate reflows
+   *  enroll in the pending entry and pick up the eventual response. */
+  private scheduleClusterLabel(previewEl: HTMLElement, toolCalls: readonly ToolCall[]): void {
+    if (toolCalls.length === 0) return;
+    const anchor = toolCalls[0].id;
+    const signature = toolCalls
+      .map((tc) => tc.id)
+      .slice()
+      .sort()
+      .join('|');
+
+    // Exact-signature cache hit: this cluster has been labeled before.
+    const cached = this.clusterLabelCache.get(signature);
+    if (cached) {
+      previewEl.textContent = cached;
+      this.clusterLabelByAnchor.set(anchor, cached);
+      return;
+    }
+
+    // The cluster has changed (or this is the first render). If we have
+    // ANY prior label for this anchor, paint it immediately so the user
+    // doesn't see the comma-joined fallback flash while we refresh.
+    const stickyLabel = this.clusterLabelByAnchor.get(anchor);
+    if (stickyLabel) previewEl.textContent = stickyLabel;
+
+    // Enroll this previewEl in the pending entry for `anchor`. Three
+    // cases:
+    //
+    //   1. No pending entry — first schedule for this anchor; create one.
+    //   2. Same signature — cluster re-rendered with no new tool calls
+    //      (typical during streaming reflows). Just enroll the new
+    //      element. If a request is already in flight, that's the only
+    //      thing to do; do NOT reset the debounce timer or fire again
+    //      (would duplicate the LLM call for an identical signature).
+    //   3. Signature changed — newer snapshot supersedes the old one.
+    //      Carry over the element set (orphaned ones drop out at
+    //      settle via `isConnected`) and clear `inFlight` so the new
+    //      signature gets its own request once the debounce expires.
+    //      Any still-in-flight call for the old signature will drop
+    //      its result at settle time on the signature mismatch.
+    const existing = this.clusterLabelPending.get(anchor);
+    if (existing && existing.signature === signature) {
+      existing.elements.add(previewEl);
+      if (existing.inFlight) return;
+    } else {
+      const elements = existing?.elements ?? new Set<HTMLElement>();
+      elements.add(previewEl);
+      this.clusterLabelPending.set(anchor, {
+        signature,
+        toolCalls: [...toolCalls],
+        elements,
+        inFlight: false,
+      });
+    }
+
+    // Debounce: reset the timer on every fresh call. A burst of tool
+    // calls keeps pushing the firing time out so we only pay for one
+    // label once the burst settles.
+    const existingTimer = this.clusterLabelTimers.get(anchor);
+    if (existingTimer) clearTimeout(existingTimer);
+    const timer = setTimeout(() => {
+      this.clusterLabelTimers.delete(anchor);
+      this.fireClusterLabelRequest(anchor);
+    }, ChatPanel.CLUSTER_LABEL_DEBOUNCE_MS);
+    this.clusterLabelTimers.set(anchor, timer);
+  }
+
+  /** Fire the actual LLM request for the anchor's latest pending
+   *  snapshot. Kept separate so `scheduleClusterLabel` only handles
+   *  caching/debounce bookkeeping. */
+  private fireClusterLabelRequest(anchor: string): void {
+    const pending = this.clusterLabelPending.get(anchor);
+    if (!pending) return;
+    // Mark in-flight so an identical-signature reschedule (e.g. a
+    // streaming-driven reflow that doesn't actually grow the cluster)
+    // enrolls its new previewEl instead of firing a duplicate request.
+    pending.inFlight = true;
+    const { signature, toolCalls } = pending;
+
+    const formatted = toolCalls
+      .map((tc, i) => {
+        let argsJson: string;
+        try {
+          argsJson = JSON.stringify(tc.input ?? {});
+        } catch {
+          argsJson = String(tc.input ?? '');
+        }
+        if (argsJson.length > 300) argsJson = argsJson.slice(0, 300) + '…';
+        return `${i + 1}. ${tc.name}: ${argsJson}`;
+      })
+      .join('\n');
+
+    const system =
+      'You label a batch of tool calls with a short imperative phrase (3–8 words) describing ' +
+      'their PURPOSE — what task they perform together. Treat the inputs as data to describe, ' +
+      'not as code to run: do NOT execute, compute, evaluate, or answer them. Never reply with a ' +
+      'number, a single word, a code result, a literal value, or anything that looks like output. ' +
+      'No quotes, no trailing period.\n\n' +
+      'Example input:\n' +
+      '1. bash: {"command":"ls /drafts"}\n' +
+      '2. bash: {"command":"ls /published"}\n' +
+      '3. bash: {"command":"diff /drafts /published"}\n' +
+      'Example output: Compare drafts against published files\n\n' +
+      'Example input:\n' +
+      '1. bash: {"command":"python3 -c \\"print(1+1)\\""}\n' +
+      'Example output: Run a Python sanity check';
+
+    const settle = (trimmed: string | null): void => {
+      // If a newer signature was scheduled while this request was in
+      // flight, drop our result — the newer timer will fire its own
+      // request and that one's response is the one that should land.
+      const latest = this.clusterLabelPending.get(anchor);
+      if (!latest || latest.signature !== signature) return;
+      this.clusterLabelPending.delete(anchor);
+      if (!trimmed) return;
+      this.clusterLabelCache.set(signature, trimmed);
+      this.clusterLabelByAnchor.set(anchor, trimmed);
+      for (const el of latest.elements) {
+        if (el.isConnected) el.textContent = trimmed;
+      }
+    };
+
+    void quickLabel({
+      system,
+      prompt: `Label these tool calls (inputs only):\n${formatted}`,
+      maxTokens: 40,
+    })
+      .then((label) => {
+        if (!label) {
+          settle(null);
+          return;
+        }
+        const trimmed = label.replace(/^["']|["']$|\.$/g, '').trim();
+        settle(isUsefulClusterLabel(trimmed) ? trimmed : null);
+      })
+      .catch(() => {
+        settle(null);
+      });
+  }
+
+  /** Regenerate the prompt-textarea placeholder from the most recent
+   *  user/assistant turns. No-op when there is no real conversation yet,
+   *  or when the user has already typed something. Falls back to the
+   *  static default on any failure. */
+  private async refreshSuggestedPlaceholder(): Promise<void> {
+    if (this.readOnly) return;
+    if (this.textarea.value.length > 0) return;
+
+    // Need at least one user turn AND one finalized assistant turn.
+    const finalized = this.messages.filter((m) => !m.isStreaming && !m.queued);
+    const lastAssistant = [...finalized].reverse().find((m) => m.role === 'assistant');
+    const recentUsers = finalized.filter((m) => m.role === 'user').slice(-3);
+    if (!lastAssistant || recentUsers.length === 0) {
+      this.textarea.placeholder = ChatPanel.DEFAULT_PLACEHOLDER;
+      return;
+    }
+
+    const truncate = (s: string, n: number) => (s.length > n ? s.slice(0, n) + '…' : s);
+
+    const transcript = [
+      ...recentUsers.map((m) => `[user]: ${truncate(m.content, 400)}`),
+      `[assistant]: ${truncate(lastAssistant.content, 800)}`,
+    ].join('\n\n');
+
+    const system =
+      "You suggest the user's next prompt in a coding-agent chat. Based on the recent " +
+      'conversation, output ONE concrete follow-up the user might type next. Reply with just ' +
+      'the prompt text — no quotes, no preamble, no list. Max 80 characters. If nothing useful ' +
+      'comes to mind, reply exactly: What shall we build?';
+
+    this.placeholderAbort?.abort();
+    const controller = new AbortController();
+    this.placeholderAbort = controller;
+
+    const suggestion = await quickLabel({
+      system,
+      prompt: `Recent conversation:\n${transcript}`,
+      maxTokens: 40,
+      signal: controller.signal,
+    });
+    if (controller.signal.aborted) return;
+    if (this.textarea.value.length > 0) return; // user started typing while we waited
+    this.textarea.placeholder =
+      suggestion && suggestion.length > 0 ? suggestion : ChatPanel.DEFAULT_PLACEHOLDER;
   }
 
   /** Render the model selector — full list when empty, compact active-only when chat started. */
@@ -1530,19 +2016,119 @@ export class ChatPanel {
     if (!msg) return;
     const wrapper = this.messagesEl.querySelector(`.msg-group[data-msg-id="${messageId}"]`);
     if (!wrapper) return;
-    const contentEl = wrapper.querySelector('.msg__content');
-    if (contentEl) {
-      contentEl.innerHTML = renderChatMessageContent(msg);
-      if (msg.isStreaming) {
-        const cursor = document.createElement('span');
-        cursor.className = 'streaming-cursor';
-        contentEl.appendChild(cursor);
-      }
-    } else if (msg.content.trim().length > 0) {
-      this.updateMessageEl(messageId);
+    const contentEl = wrapper.querySelector('.msg__content') as HTMLElement | null;
+    if (!contentEl) {
+      if (msg.content.trim().length > 0) this.updateMessageEl(messageId);
       return;
     }
+
+    this.renderStreamingSegmented(contentEl, msg);
+    if (msg.isStreaming) {
+      const cursor = document.createElement('span');
+      cursor.className = 'streaming-cursor';
+      contentEl.appendChild(cursor);
+    }
     this.scrollToBottom();
+  }
+
+  /**
+   * Reconcile `contentEl`'s children against the segments derived from
+   * `msg.content`. Each segment owns a stable container element:
+   *
+   * - **prose** containers use `innerHTML` (no iframes inside, so
+   *   wiping/replacing is safe).
+   * - **shtml** containers hold a draft iframe that is mounted ONCE and
+   *   never re-parented. WHATWG-compliant browsers destroy an iframe's
+   *   contentWindow on disconnect, so any `appendChild` move or
+   *   `innerHTML` wipe of the parent triggers a reload — verified
+   *   empirically against this Canary build. Keeping the iframe pinned
+   *   to its container is the only reliable way to stream into it.
+   *
+   * On the very first call after `createMessageEl` built `contentEl`
+   * with the legacy placeholder-based path, we wipe and re-install
+   * segment containers so subsequent flushes have a stable structure
+   * to reconcile against.
+   */
+  private renderStreamingSegmented(contentEl: HTMLElement, msg: ChatMessage): void {
+    contentEl.querySelector(':scope > .streaming-cursor')?.remove();
+
+    const existing = Array.from(
+      contentEl.querySelectorAll<HTMLElement>(':scope > [data-seg-kind]')
+    );
+    if (existing.length === 0 && contentEl.childNodes.length > 0) {
+      contentEl.replaceChildren();
+    }
+
+    const segments = splitContentSegments(msg.content);
+    let drafts = this.drafts.get(msg.id);
+    if (!drafts) {
+      drafts = [];
+      this.drafts.set(msg.id, drafts);
+    }
+    let shtmlIdx = 0;
+
+    for (let i = 0; i < segments.length; i++) {
+      const seg = segments[i];
+      if (!seg) continue;
+      let container: HTMLElement | null = existing[i] ?? null;
+
+      if (container && container.dataset.segKind !== seg.kind) {
+        container.remove();
+        container = null;
+      }
+
+      if (!container) {
+        container = document.createElement('div');
+        container.dataset.segKind = seg.kind;
+        container.className = `msg__seg msg__seg--${seg.kind}`;
+        contentEl.appendChild(container);
+      }
+
+      if (seg.kind === 'prose') {
+        if (container.dataset.text !== seg.text) {
+          container.innerHTML = renderProseSegment(seg.text, msg.role);
+          container.dataset.text = seg.text;
+        }
+      } else {
+        let draft = drafts[shtmlIdx] ?? null;
+        if (!draft) {
+          draft = mountDraftDip((action, data) => this.onDipLick?.(action, data));
+          drafts[shtmlIdx] = draft;
+          container.appendChild(draft.element);
+        }
+        if (container.dataset.body !== seg.body) {
+          draft.update(seg.body);
+          container.dataset.body = seg.body;
+        }
+        shtmlIdx++;
+      }
+    }
+
+    // Trim leftover segment containers whose segment vanished.
+    for (let i = segments.length; i < existing.length; i++) {
+      existing[i]?.remove();
+    }
+    // Trim drafts that no longer correspond to an shtml segment.
+    let totalShtml = 0;
+    for (const seg of segments) if (seg.kind === 'shtml') totalShtml++;
+    for (let i = totalShtml; i < drafts.length; i++) {
+      drafts[i]?.dispose();
+    }
+    drafts.length = totalShtml;
+  }
+
+  private disposeDraftsForMessage(messageId: string): void {
+    const drafts = this.drafts.get(messageId);
+    if (!drafts) return;
+    for (const draft of drafts) draft?.dispose();
+    this.drafts.delete(messageId);
+  }
+
+  private disposeAllDrafts(): void {
+    for (const [, drafts] of this.drafts) {
+      for (const draft of drafts) draft?.dispose();
+    }
+    this.drafts.clear();
   }
 
   private updateSendButtonState(): void {
@@ -1678,6 +2264,42 @@ export class ChatPanel {
     this.autoScrollAttached = true;
     this.hideJumpPill();
     this.scrollToBottom(true);
+    this.notifyMessagesChanged();
+  }
+
+  /**
+   * Rough chars/4 estimator over the current message list. Same family
+   * of heuristic the compaction pass uses (pi-coding-agent's
+   * `estimateTokens`), just over the UI's `ChatMessage` shape rather
+   * than the structured `AgentMessage`. Folds tool-call I/O into the
+   * count so long tool-result transcripts move the gauge appropriately.
+   */
+  private estimateChatTokens(): number {
+    let chars = 0;
+    for (const m of this.messages) {
+      chars += m.content?.length ?? 0;
+      if (m.toolCalls) {
+        for (const tc of m.toolCalls) {
+          chars += tc.name.length;
+          try {
+            chars += JSON.stringify(tc.input ?? {}).length;
+          } catch {
+            /* circular / non-serializable — ignore */
+          }
+          if (tc.result) chars += tc.result.length;
+        }
+      }
+    }
+    return Math.ceil(chars / 4);
+  }
+
+  private notifyMessagesChanged(): void {
+    if (!this.onMessagesChanged) return;
+    try {
+      this.onMessagesChanged(this.estimateChatTokens());
+    } catch {
+      /* listener bug must not break rendering */
+    }
   }
 
   private appendMessageEl(msg: ChatMessage): void {
@@ -1697,9 +2319,15 @@ export class ChatPanel {
         .forEach((el) => el.classList.add('tool-call--stale'));
     }
     const el = this.createMessageEl(msg, showLabel, isLastAssistant);
-    this.messagesInner.appendChild(el);
-    this.reflowToolClusters();
+    // Don't inject an empty wrapper into the flex container — the gap: 16px
+    // between msg-groups would create a visible blank line. updateMessageEl
+    // will append it once the message has actual content or tool calls.
+    if (el.childElementCount > 0) {
+      this.messagesInner.appendChild(el);
+      this.reflowToolClusters();
+    }
     this.scrollToBottom();
+    this.notifyMessagesChanged();
   }
 
   /** Determine whether to show the sender label for a message */
@@ -1721,6 +2349,22 @@ export class ChatPanel {
     const msg = this.findMessage(messageId);
     if (!msg) return;
     const existing = this.messagesEl.querySelector(`.msg-group[data-msg-id="${messageId}"]`);
+    const idx = this.messages.indexOf(msg);
+    const prev = idx > 0 ? this.messages[idx - 1] : null;
+    const showLabel = this.shouldShowLabel(msg, prev?.role ?? null, prev?.timestamp ?? 0);
+    let isLastAssistant = false;
+    if (msg.role === 'assistant') {
+      let lastIdx = -1;
+      for (let i = this.messages.length - 1; i >= 0; i--) {
+        if (this.messages[i].role === 'assistant') {
+          lastIdx = i;
+          break;
+        }
+      }
+      isLastAssistant = idx === lastIdx;
+    }
+    const stale = this.findLastRealUserIdx() > idx;
+    const newEl = this.createMessageEl(msg, showLabel, isLastAssistant, stale);
     if (existing) {
       this.disposeDipsForMessage(messageId);
       // Tool calls for sibling messages in this chain may be inside a
@@ -1730,25 +2374,20 @@ export class ChatPanel {
       // the stale clustered ones would coexist briefly until the next
       // reflow re-collected them.
       this.unwrapToolClusters();
-      // Determine showLabel based on previous message in the list
-      const idx = this.messages.indexOf(msg);
-      const prev = idx > 0 ? this.messages[idx - 1] : null;
-      const showLabel = this.shouldShowLabel(msg, prev?.role ?? null, prev?.timestamp ?? 0);
-      // Only show feedback on the last assistant message
-      let isLastAssistant = false;
-      if (msg.role === 'assistant') {
-        let lastIdx = -1;
-        for (let i = this.messages.length - 1; i >= 0; i--) {
-          if (this.messages[i].role === 'assistant') {
-            lastIdx = i;
-            break;
-          }
-        }
-        isLastAssistant = idx === lastIdx;
-      }
-      const stale = this.findLastRealUserIdx() > idx;
-      const newEl = this.createMessageEl(msg, showLabel, isLastAssistant, stale);
       existing.replaceWith(newEl);
+      this.reflowToolClusters();
+    } else if (newEl.childElementCount > 0) {
+      // Element was skipped in appendMessageEl because it was empty at the
+      // time — now that it has content, insert it at the correct position.
+      const nextMsg = this.messages[idx + 1];
+      const nextEl = nextMsg
+        ? this.messagesEl.querySelector(`.msg-group[data-msg-id="${nextMsg.id}"]`)
+        : null;
+      if (nextEl) {
+        this.messagesInner.insertBefore(newEl, nextEl);
+      } else {
+        this.messagesInner.appendChild(newEl);
+      }
       this.reflowToolClusters();
     }
     this.scrollToBottom();
@@ -2063,6 +2702,7 @@ export class ChatPanel {
     // Tag with the owning message id so reflow can return the element to
     // its home msg-group when unwrapping a cross-message cluster.
     el.dataset.msgId = msgId;
+    el.dataset.toolCallId = tc.id;
 
     const summary = document.createElement('summary');
     summary.className = 'tool-call__header';
@@ -2149,12 +2789,14 @@ export class ChatPanel {
     summary.appendChild(nameEl);
 
     const previewText = clusterPreview(toolCalls);
+    let previewEl: HTMLElement | null = null;
     if (previewText) {
-      const preview = document.createElement('span');
-      preview.className = 'tool-call__preview';
-      preview.textContent = previewText;
-      summary.appendChild(preview);
+      previewEl = document.createElement('span');
+      previewEl.className = 'tool-call__preview';
+      previewEl.textContent = previewText;
+      summary.appendChild(previewEl);
     }
+    if (previewEl) this.scheduleClusterLabel(previewEl, toolCalls);
 
     // One bubble per inner tool call, colored to the call's status.
     // Each bubble carries only the `tool-call--<status>` modifier (no
@@ -2351,11 +2993,18 @@ export class ChatPanel {
       (tcEl) => tcEl.querySelector('.tool-call__name')?.textContent ?? ''
     );
     const previewText = clusterPreviewFromTitles(titles);
+    let previewEl: HTMLElement | null = null;
     if (previewText) {
-      const preview = document.createElement('span');
-      preview.className = 'tool-call__preview';
-      preview.textContent = previewText;
-      summary.appendChild(preview);
+      previewEl = document.createElement('span');
+      previewEl.className = 'tool-call__preview';
+      previewEl.textContent = previewText;
+      summary.appendChild(previewEl);
+    }
+    const resolvedToolCalls = toolCallEls
+      .map((tcEl) => this.lookupToolCall(tcEl.dataset.msgId, tcEl.dataset.toolCallId))
+      .filter((tc): tc is ToolCall => !!tc);
+    if (previewEl && resolvedToolCalls.length === toolCallEls.length) {
+      this.scheduleClusterLabel(previewEl, resolvedToolCalls);
     }
 
     const dotsEl = document.createElement('span');
@@ -2410,6 +3059,12 @@ export class ChatPanel {
   }
 
   private disposeDipsForMessage(messageId: string): void {
+    // Drafts (streaming preview iframes) and dips (final hydrated iframes)
+    // share a message lifecycle: when one is being torn down or rebuilt,
+    // the other should go too. The streaming flow disposes drafts itself
+    // before the final hydration call, so most of the time this branch is
+    // a no-op — but it's the right safety net for re-render paths.
+    this.disposeDraftsForMessage(messageId);
     const instances = this.dips.get(messageId);
     if (instances) {
       disposeDips(instances);
@@ -2418,6 +3073,7 @@ export class ChatPanel {
   }
 
   private disposeAllDips(): void {
+    this.disposeAllDrafts();
     for (const [, instances] of this.dips) {
       disposeDips(instances);
     }
@@ -2438,6 +3094,7 @@ export class ChatPanel {
   dispose(): void {
     this.cancelPendingDelta();
     this.disposeAllDips();
+    this.resetEphemeralLlmState();
     this.unsubscribe?.();
     this.voiceInput?.destroy();
     if (this.keydownListener) {

@@ -22,8 +22,8 @@
       "groupSlug": "non-major"
     },
     {
-      "matchPackagePrefixes": ["@mariozechner/"],
-      "groupName": "mariozechner packages"
+      "matchPackagePrefixes": ["@earendil-works/"],
+      "groupName": "earendil-works packages"
     },
     {
       "matchPackagePrefixes": ["@semantic-release/"],
@@ -41,6 +41,16 @@
       "description": "Apply a longer 14-day cooldown for major version bumps, which carry higher risk of breaking changes and are more attractive targets for malicious actors.",
       "matchUpdateTypes": ["major"],
       "minimumReleaseAge": "14 days"
+    }
+  ],
+  "customManagers": [
+    {
+      "description": "Track @ffmpeg/core version pinned in ffmpeg-wasm.ts (the wrapper does not declare it as a dependency, so renovate can't see it from package.json).",
+      "customType": "regex",
+      "managerFilePatterns": ["packages/webapp/src/shell/supplemental-commands/ffmpeg-wasm.ts"],
+      "matchStrings": [
+        "renovate: datasource=(?<datasource>.+?) depName=(?<depName>.+?)\\s+const\\s+FFMPEG_CORE_VERSION\\s*=\\s*'(?<currentValue>.+?)'"
+      ]
     }
   ]
 }

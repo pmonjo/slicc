@@ -39,6 +39,30 @@
 | `offscreen-cdp-proxy.ts`          | CDPTransport over chrome.runtime messages (offscreen → service worker → chrome.debugger)                                                                                                                                    |
 | `panel-cdp-proxy.ts`              | CDPTransport for side panel terminal (panel → offscreen → service worker → chrome.debugger)                                                                                                                                 |
 
+### packages/webapp/src/kernel/ — Kernel Host (worker-resident agent engine)
+
+The kernel host is the off-main-thread home for the agent engine. In standalone, it runs in a `DedicatedWorker`; in the extension, the same factory wires the offscreen document. The "kernel" name is by analogy: the panel ↔ host boundary is the user/kernel split.
+
+| File                           | Purpose                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `host.ts`                      | `createKernelHost(config)` factory. Single boot sequence shared by the offscreen document, the standalone DedicatedWorker, and tests: orchestrator + lick-manager + agent-bridge + tray subs + cone bootstrap + BshWatchdog + `mountInternal('/proc', …)`. Returns `{ orchestrator, browser, bridge, lickManager, sharedFs, processManager, dispose }`.                                                                                                                   |
+| `kernel-worker.ts`             | DedicatedWorker entry. Receives `{ kernelPort, cdpPort, localStorageSeed }` over `MessagePort` transfer; constructs `OffscreenBridge` + `WorkerCdpProxy` + `BrowserAPI`; calls `createKernelHost`; stands up `TerminalSessionHost`. Posts `kernel-worker-ready` once boot completes. Worker-safety guard via `tsconfig.webapp-worker.json`.                                                                                                                               |
+| `spawn.ts`                     | `spawnKernelWorker(opts)` — production wrapper around `new Worker(new URL('./kernel-worker.ts', import.meta.url), { type: 'module' })`. `bootstrapKernelWorker(opts)` is the testable inner loop that takes a `WorkerLike`. Returns `{ client, ready, dispose }`.                                                                                                                                                                                                         |
+| `transport.ts`                 | `KernelTransport<S, R>` — typed message interface. `OffscreenBridge` and `OffscreenClient` both implement against this; the chrome.runtime adapter and `MessageChannel` adapter are interchangeable.                                                                                                                                                                                                                                                                      |
+| `transport-message-channel.ts` | `MessagePort`-backed transport with implicit `port.start()` on first subscribe. `createPanelMessageChannelTransport` / `createBridgeMessageChannelTransport` add the source-tagged envelope wrapper.                                                                                                                                                                                                                                                                      |
+| `transport-chrome-runtime.ts`  | chrome.runtime.sendMessage / onMessage adapter. Used by the extension panel ↔ offscreen path.                                                                                                                                                                                                                                                                                                                                                                             |
+| `cdp-bridge.ts`                | `CdpTransportBridge` shared base. State (in-flight commands, listener counts, retain refcounts) is identical across the two existing proxies; wire shape and inbound filter pluggable via `CdpBridgeOptions`. `cdp-worker-proxy.ts` extends it.                                                                                                                                                                                                                           |
+| `cdp-worker-proxy.ts`          | `WorkerCdpProxy` — kernel-side CDP transport over a MessagePort. Pre-subscribe protocol (`cdp-subscribe` / `cdp-unsubscribe`) so the page-side `startPageCdpForwarder` only allocates `chrome.debugger` listeners while the worker is interested.                                                                                                                                                                                                                         |
+| `process-manager.ts`           | `ProcessManager` — single source of truth for every running async unit. `Process` record carries pid (uint32, monotonic from 1024+), ppid, kind (`scoop-turn` / `tool` / `shell` / `jsh` / `py` / `net`), argv, cwd, env, owner, AbortController, `Gate` (pause/resume), status, exitCode, terminatedBy, finishedAt. `signal(pid, sig)` for SIGINT/TERM/KILL/STOP/CONT; `onSignal` for kill-handler subscriptions.                                                        |
+| `proc-mount.ts`                | `ProcMountBackend` — read-only `procfs`-shaped view of the manager. Mounted at `/proc` via `vfs.mountInternal` (scoop-invisible). `/proc/<pid>/{status,cmdline,cwd,stat}` plus a synthesized `pid 1` kernel-host anchor.                                                                                                                                                                                                                                                  |
+| `realm/`                       | Generalized hard-killable runner for `node` / `.jsh` / `python`. `runInRealm({ kind: 'js' \| 'py', … })` spawns a per-task `DedicatedWorker` (standalone JS + both-mode Python) or sandbox iframe (extension JS); SIGKILL → `worker.terminate()` / `iframe.remove()` (uncatchable, exit 137). Kernel-side `realm-host` proxies `vfs` / `exec` / `fetch` RPC over the realm's port so realm code stays sandboxed and `ctx.fetch`'s SecureFetch substitution still applies. |
+| `terminal-session-host.ts`     | Worker-side endpoint for the terminal RPC. Per-session `WasmShellHeadless`. `terminal-exec` registers `kind:'shell'` process and runs the command; `terminal-signal` routes through `pm.signal`. Output gated by `proc.gate.wait()`.                                                                                                                                                                                                                                      |
+| `terminal-session-client.ts`   | Page-side counterpart. Per-call `execId` matching against `terminal-exit` events; subscription stays alive across `close()` so the closed-status event surfaces.                                                                                                                                                                                                                                                                                                          |
+| `remote-terminal-view.ts`      | `RemoteTerminalView` — page-side xterm view. Minimal line editor (typing, ←/→ ↑/↓ Home/End, Backspace/Delete, Enter, Ctrl+C → SIGINT). Pre-intercepts `mount /<path>` typed lines: runs `showDirectoryPicker` on the keystroke gesture, stashes the handle in IDB, lets the worker's `mountLocal` adopt it.                                                                                                                                                               |
+| `page-storage-sync.ts`         | `installPageStorageSync` — page side hook. Monkey-patches `window.localStorage.setItem/removeItem/clear` per-instance (not Storage.prototype, to avoid clobbering sessionStorage); forwards writes over the kernel transport so the worker's localStorage shim stays in sync.                                                                                                                                                                                             |
+| `local-vfs-client.ts`          | `LocalVfsClient` — read-only structural facade for the file-browser, memory-panel, and preview-VFS responder on the page side. `VirtualFS` satisfies the interface naturally; the narrowing prevents accidental writes from the page realm (writes flow through the kernel transport).                                                                                                                                                                                    |
+| `types.ts`                     | `KernelFacade` / `KernelClientFacade` typed interfaces. `OffscreenBridge` implements `KernelFacade`; `OffscreenClient` implements `KernelClientFacade`. Decouples the wire shape from the implementation.                                                                                                                                                                                                                                                                 |
+
 ### packages/node-server/src/ — CLI + Electron Runtimes
 
 | File                     | Purpose                                                                                                                                                                                                |
@@ -95,12 +119,12 @@
 
 ### packages/webapp/src/git/ — Git Integration
 
-| File              | Purpose                                                                                                                                             |
-| ----------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `git-commands.ts` | CLI-like interface for isomorphic-git (init, clone, add, commit, status, log, branch, checkout, diff, remote, fetch, pull, push, config, rev-parse) |
-| `git-http.ts`     | CORS proxy integration for git HTTP operations (CLI mode: `/api/fetch-proxy`, extension mode: direct fetch)                                         |
-| `diff.ts`         | Unified diff + stat formatting utilities                                                                                                            |
-| `index.ts`        | GitCommands factory                                                                                                                                 |
+| File              | Purpose                                                                                                                                                 |
+| ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `git-commands.ts` | CLI-like interface for isomorphic-git (init, clone, add, commit, status, log, branch, checkout, diff, remote, fetch, pull, push, config, rev-parse)     |
+| `git-http.ts`     | CORS proxy integration for git HTTP operations; routes through `createProxiedFetch()` (CLI: `/api/fetch-proxy`, extension: `fetch-proxy.fetch` SW Port) |
+| `diff.ts`         | Unified diff + stat formatting utilities                                                                                                                |
+| `index.ts`        | GitCommands factory                                                                                                                                     |
 
 ### packages/webapp/src/providers/ — API Providers
 
@@ -152,7 +176,6 @@
 | `oauth-token-command.ts` | `oauth-token` — retrieve OAuth access tokens for configured providers with auto-login                                                                                       |
 | `playwright-command.ts`  | `playwright-cli` / `playwright` / `puppeteer` — browser automation shell commands (navigate, snapshot, click, screenshot, cookies, HAR recording)                           |
 | `sprinkle-command.ts`    | `sprinkle` — list, open, close, and refresh `.shtml` sprinkle panels from the agent                                                                                         |
-| `debug-command.ts`       | `debug` — toggle Terminal/Memory tabs in extension mode (extension-only, uses dual-context hook+relay pattern)                                                              |
 | `magick-wasm.ts`         | Shared ImageMagick WASM initialization module for dual-mode (CLI/browser CDN vs extension bundled) image processing                                                         |
 
 ### packages/webapp/src/skills/ — Skill Discovery
@@ -198,7 +221,7 @@ All skills (native and compatibility) are read-only — the slicc-specific `mani
 | --------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `main.ts`                   | Entry point: `main()` for CLI/Electron embedded app, `mainExtension()` for extension (uses OffscreenClient). Handles layout, API key, orchestrator, skill drag/drop                                  |
 | `offscreen-client.ts`       | Extension-only: side panel's interface to offscreen engine. Provides AgentHandle + Orchestrator-compatible facade via chrome.runtime messages                                                        |
-| `layout.ts`                 | Split-pane (CLI) or tabbed (extension) layout; auto-selects based on extension detection                                                                                                             |
+| `layout.ts`                 | Unified split-pane layout. `Layout(root, isExtension)` toggles density (scoops rail, switcher, avatar). Detached popout mode passes `isExtension=false` for full standalone UX.                      |
 | `tabbed-ui.ts`              | Shared Chat/Terminal/Files/Memory tab definitions + normalization helpers reused by the extension layout and injected overlay shell                                                                  |
 | `overlay-shell-state.ts`    | Pure state transitions for the injected Electron overlay shell (open/close + active tab)                                                                                                             |
 | `electron-overlay.ts`       | Browser-side custom elements for the injected Electron overlay shell: launcher button, sidebar, persistent iframe host, and parent→iframe tab sync                                                   |
@@ -301,6 +324,8 @@ The Chrome extension uses a three-layer design to keep the agent engine alive ac
 └──────────────────────────────────────────────────────────────┘
 ```
 
+**Detached popout:** the side panel can also be popped out into a full-page tab (`chrome-extension://<id>/index.html?detached=1`). The detached tab is a second valid UI client surface — it talks to the same offscreen agent via the same `chrome.runtime` messages as the side panel. The service worker enforces global mutual exclusion (at most one detached tab; side panel disabled while one exists). See `packages/chrome-extension/CLAUDE.md` "Detached Popout" and `docs/superpowers/specs/2026-05-13-extension-detached-popout-design.md`.
+
 **Message Flow:**
 
 - **PanelToOffscreenMessage**: User input flows from panel → service worker → offscreen
@@ -315,35 +340,56 @@ The Chrome extension uses a three-layer design to keep the agent engine alive ac
 
 **CDP Proxy:** Offscreen documents can't call `chrome.debugger` directly. Instead, offscreen sends `CdpProxyMessage` through the service worker, which translates to `chrome.debugger` commands and routes results back.
 
-**Dual Shell Context:** Both the side panel and offscreen document run their own WasmShell instance. The panel shell powers the Terminal tab; the offscreen shell executes agent bash tool calls. They share VFS via IndexedDB but NOT window globals or DOM. Shell commands that affect the panel UI (e.g., `debug on`) must use the dual-context pattern: try `window.__slicc_*` hook first (panel), fall back to `chrome.runtime.sendMessage` relay (offscreen → panel). See `docs/pitfalls.md` "Extension Dual-Shell Context".
+**Dual Shell Context:** Both the side panel and offscreen document run their own WasmShell instance. The panel shell powers the Terminal tab; the offscreen shell executes agent bash tool calls. They share VFS via IndexedDB but NOT window globals or DOM. Shell commands that need to affect the panel UI from the offscreen agent must use the dual-context pattern: try a `window.__slicc_*` hook first (panel), fall back to `chrome.runtime.sendMessage` relay (offscreen → panel). See `docs/pitfalls.md` "Extension Dual-Shell Context".
 
 ## Data Flow Diagrams
 
-### User Message Flow
+### User Message Flow (standalone — kernel-worker mode, default)
 
 ```
-User input in chat → ChatPanel.sendMessage()
-  → Orchestrator.handleMessage()
-    → routeToScoop() [determines cone or specific scoop]
-    → processScoopQueue()
-      → ScoopContext.prompt()
-        → pi-agent-core loop
-          → LLM API call (streaming)
-            → AgentEvent stream
-              → Orchestrator callbacks
-                → per-scoop message buffer
-                  → emitToUI() [if scoop is selected]
-                    → ChatPanel DOM update (streaming)
-      → Tool calls [bash, file, grep/find, NanoClaw, etc.]
-        → RestrictedFS / WasmShell / BrowserAPI
-          → results
-          → back to agent loop
-    → Scoop completes
-      → Orchestrator writes full output to /shared/scoop-notifications/
-      → Orchestrator notification (path + preview + line count)
-        → Cone's message queue
-        → Cone processes completion
+[Page]                                        [DedicatedWorker]
+ChatPanel.sendMessage()
+  → OffscreenClient.sendUserMessage()
+    → KernelTransport (MessagePort) ─────────→ OffscreenBridge.handleMessage()
+                                                 → Orchestrator.handleMessage()
+                                                   → routeToScoop()
+                                                   → processScoopQueue()
+                                                     → ScoopContext.prompt()
+                                                       → pm.spawn({ kind:'scoop-turn', … })
+                                                       → pi-agent-core loop
+                                                         → LLM API call (worker fetch
+                                                           with x-bypass-llm-proxy)
+                                                         → AgentEvent stream
+                                                       → Tool calls (kind:'tool', kind:'shell',
+                                                         kind:'jsh', kind:'py')
+                                                         → RestrictedFS / WasmShellHeadless /
+                                                           BrowserAPI (CDP via WorkerCdpProxy
+                                                           ↔ startPageCdpForwarder)
+                                                       → pm.exit on completion
+                                                     → callbacks fire wire-side events
+                                            ←────── KernelTransport stream of
+agent-events (text_delta, tool_use_start,
+                                                   tool_result, scoop-status, …)
+ChatPanel DOM update (streaming)
 ```
+
+The kernel-worker runs on its own thread; a runaway bash loop or LLM stream can't freeze the page. Page main thread keeps `setInterval(…, 100)` ticking with sub-millisecond jitter while the worker is busy.
+
+### User Message Flow (extension)
+
+```
+[Side panel]                          [Service worker]               [Offscreen document]
+ChatPanel.sendMessage()
+  → OffscreenClient.sendUserMessage()
+    → chrome.runtime.sendMessage ────→ relay ────────────────────→ OffscreenBridge.handleMessage()
+                                                                     → (same Orchestrator path
+                                                                        as worker mode above, but
+                                                                        on the offscreen realm)
+                                                              ←──── chrome.runtime emit
+ChatPanel DOM update
+```
+
+Both deployment modes share `createKernelHost(...)` from `kernel/host.ts` — the SAME boot sequence wires the orchestrator, lick manager, agent bridge, process manager, and `/proc` mount. The only differences are the transport (`MessagePort` vs `chrome.runtime`) and the CDP proxy.
 
 ### Scoop Delegation
 
@@ -441,13 +487,18 @@ File path resolution: `--env-file <path>` CLI flag → `SLICC_SECRETS_FILE` env 
 
 ### Key Source Files
 
-| File                                                                | Purpose                                                                                                                                                                                                                                                                                                   |
-| ------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `packages/node-server/src/secrets/`                                 | Node `.env` SecretStore, masking engine, domain matching, mount sign-and-forward (`signing-s3.ts` + `sign-and-forward.ts` for `/api/s3-sign-and-forward` and `/api/da-sign-and-forward` endpoints — server-side signing keeps S3 credentials and the IMS bearer token out of the browser bundle entirely) |
-| `packages/swift-server/Sources/`                                    | Swift Keychain SecretStore, masking engine                                                                                                                                                                                                                                                                |
-| `packages/node-server/src/index.ts`                                 | Fetch proxy secret injection (node-server)                                                                                                                                                                                                                                                                |
-| `packages/webapp/src/shell/supplemental-commands/secret-command.ts` | `secret` shell command                                                                                                                                                                                                                                                                                    |
-| `packages/webapp/src/scoops/scoop-context.ts`                       | Shell env population with masked values, tool output scrubbing                                                                                                                                                                                                                                            |
+| File                                                                      | Purpose                                                                                                                                                                                                                                                                                     |
+| ------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `packages/shared-ts/src/secret-masking.ts`                                | Platform-agnostic masking primitives (HMAC-SHA256, domain matching, scrubbing) — moved from `packages/webapp/src/core/` and consumed by webapp, node-server, and chrome-extension SW                                                                                                        |
+| `packages/shared-ts/src/secrets-pipeline.ts`                              | Stateful unmask/scrub class; Basic-auth-aware, URL-credential-aware, byte-safe body unmask                                                                                                                                                                                                  |
+| `packages/node-server/src/secrets/`                                       | Node `.env` SecretStore, `OauthSecretStore`, sessionId persistence, mount sign-and-forward (`signing-s3.ts` + `sign-and-forward.ts` for `/api/s3-sign-and-forward` and `/api/da-sign-and-forward` endpoints), `POST /api/secrets/oauth-update`, `DELETE /api/secrets/oauth/:providerId`     |
+| `packages/swift-server/Sources/`                                          | Swift Keychain SecretStore, `OAuthSecretStore.swift`, `SecretsPipeline.swift` (mirrors TS implementation)                                                                                                                                                                                   |
+| `packages/chrome-extension/src/service-worker.ts`                         | SW handlers: `fetch-proxy.fetch` Port (sync onMessage attach + async pipeline via `handleFetchProxyConnectionAsync`, 32MB cap), `secrets.list-masked-entries`, `secrets.mask-oauth-token`, `secrets.list`/`secrets.set`/`secrets.delete` (proxy for offscreen which lacks `chrome.storage`) |
+| `packages/node-server/src/index.ts`                                       | Fetch proxy secret injection (node-server). `SecretProxyManager` wires BOTH `EnvSecretStore` (`.env` file) AND `OauthSecretStore` so env-file secrets reach the masking pipeline alongside OAuth tokens                                                                                     |
+| `packages/webapp/src/shell/supplemental-commands/secret-command.ts`       | `secret` shell command — CLI mode hits `/api/secrets`, extension mode routes through SW (`secrets.list/set/delete`)                                                                                                                                                                         |
+| `packages/webapp/src/shell/supplemental-commands/oauth-domain-command.ts` | `oauth-domain` shell command — per-provider extra allowed domains for OAuth tokens, stored in `localStorage` (`slicc_oauth_extra_domains`), merged with provider defaults on every `saveOAuthAccount` push                                                                                  |
+| `packages/webapp/src/ui/oauth-bootstrap.ts`                               | Awaited at page load: silently renews any expiring/expired OAuth token via `provider.onSilentRenew`, then re-pushes the merged-domains replica. Soft 10s timeout so a hung IMS popup doesn't deadlock the UI                                                                                |
+| `packages/webapp/src/scoops/scoop-context.ts`                             | Shell env population with masked values (filtered to POSIX-valid identifiers — dotted names like `s3.*` / `oauth.*` are NOT exposed in `$ENV`), tool output scrubbing                                                                                                                       |
 
 See [docs/secrets.md](secrets.md) for user-facing setup instructions.
 
@@ -526,16 +577,16 @@ See [docs/secrets.md](secrets.md) for user-facing setup instructions.
 
 ### UI & Layout
 
-| I need to...                           | Modify                                                                           |
-| -------------------------------------- | -------------------------------------------------------------------------------- |
-| Add a new UI panel                     | `packages/webapp/src/ui/<panel>-panel.ts` + integrate in `layout.ts` + `main.ts` |
-| Change layout (split vs tabbed)        | `packages/webapp/src/ui/layout.ts`                                               |
-| Change message rendering (HTML format) | `packages/webapp/src/ui/message-renderer.ts`                                     |
-| Add voice input features               | `packages/webapp/src/ui/voice-input.ts`                                          |
-| Change preview service worker          | `packages/webapp/src/ui/preview-sw.ts`                                           |
-| Change provider/model selection        | `packages/webapp/src/ui/provider-settings.ts`                                    |
-| Change theme handling                  | `packages/webapp/src/ui/theme.ts`                                                |
-| Change session storage                 | `packages/webapp/src/ui/session-store.ts`                                        |
+| I need to...                                             | Modify                                                                           |
+| -------------------------------------------------------- | -------------------------------------------------------------------------------- |
+| Add a new UI panel                                       | `packages/webapp/src/ui/<panel>-panel.ts` + integrate in `layout.ts` + `main.ts` |
+| Change layout density (`Layout(root, isExtension)` flag) | `packages/webapp/src/ui/layout.ts`                                               |
+| Change message rendering (HTML format)                   | `packages/webapp/src/ui/message-renderer.ts`                                     |
+| Add voice input features                                 | `packages/webapp/src/ui/voice-input.ts`                                          |
+| Change preview service worker                            | `packages/webapp/src/ui/preview-sw.ts`                                           |
+| Change provider/model selection                          | `packages/webapp/src/ui/provider-settings.ts`                                    |
+| Change theme handling                                    | `packages/webapp/src/ui/theme.ts`                                                |
+| Change session storage                                   | `packages/webapp/src/ui/session-store.ts`                                        |
 
 ### CLI Server
 

@@ -1,3 +1,12 @@
+/**
+ * upskill — skill package manager for SLICC
+ *
+ * All direct fetch() calls in this file are intentionally shadowed by the
+ * `fetch: SecureFetch` parameter passed from createProxiedFetch() in the
+ * outer caller. This ensures network requests route through the fetch proxy
+ * in CLI mode (forbidden-header bridging) and direct fetch in extension mode
+ * (CORS bypass via host_permissions).
+ */
 import { defineCommand } from 'just-bash';
 import type { Command, CommandContext, SecureFetch } from 'just-bash';
 import type { VirtualFS } from '../../fs/index.js';
@@ -1313,8 +1322,10 @@ function parseGitHubRef(ref: string): { owner: string; repo: string; branch?: st
 /** After a successful install, refresh sprinkle manager and auto-open new sprinkles. */
 async function refreshSprinklesAfterInstall(): Promise<void> {
   try {
-    if (typeof window === 'undefined') return;
-    const mgr = (window as unknown as Record<string, unknown>).__slicc_sprinkleManager;
+    // Read from `globalThis` so the lookup works in both the page
+    // realm (real `SprinkleManager`) and the kernel-worker realm
+    // (BroadcastChannel-backed proxy).
+    const mgr = (globalThis as Record<string, unknown>).__slicc_sprinkleManager;
     if (mgr && typeof (mgr as Record<string, unknown>).openNewAutoOpenSprinkles === 'function') {
       await (mgr as { openNewAutoOpenSprinkles: () => Promise<void> }).openNewAutoOpenSprinkles();
     }

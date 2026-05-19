@@ -1,0 +1,153 @@
+name: Planning Artifact Cleanup
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: planning-artifact-cleanup-main
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          ssh-key: ${{ secrets.DEPLOY_KEY }}
+
+      - name: Remove tracked planning artifacts
+        id: cleanup
+        run: |
+          set -euo pipefail
+          git rm -r --ignore-unmatch docs/superpowers .superpowers
+          if git diff --cached --quiet; then
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "has_changes=true" >> "$GITHUB_OUTPUT"
+
+      - name: Commit cleanup branch
+        if: steps.cleanup.outputs.has_changes == 'true'
+        env:
+          CLEANUP_BRANCH: automation/planning-artifact-cleanup
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -C "$CLEANUP_BRANCH"
+          git commit -m "chore: remove planning artifacts from main"
+          git push --force-with-lease origin "$CLEANUP_BRANCH"
+
+      - name: Create or update cleanup PR
+        if: steps.cleanup.outputs.has_changes == 'true'
+        id: pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CLEANUP_BRANCH: automation/planning-artifact-cleanup
+        run: |
+          set -euo pipefail
+          PR_URL=$(gh pr list \
+            --base main \
+            --head "$CLEANUP_BRANCH" \
+            --state open \
+            --json url \
+            --jq '.[0].url // ""')
+          if [ -z "$PR_URL" ]; then
+            PR_URL=$(gh pr create \
+              --base main \
+              --head "$CLEANUP_BRANCH" \
+              --title "chore: remove planning artifacts from main" \
+              --body "Automated follow-up after a merge-queue landing to remove planning artifacts that should stay visible in the original PR but not remain on \`main\`. The cleanup branch is pushed with the repo deploy key so the normal CI workflow still runs before this PR is re-queued.")
+          fi
+          echo "url=$PR_URL" >> "$GITHUB_OUTPUT"
+
+      - name: Add cleanup PR to merge queue
+        if: steps.cleanup.outputs.has_changes == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_URL: ${{ steps.pr.outputs.url }}
+        # `gh pr merge --auto` only enables auto-merge, which does NOT add
+        # the PR to a required merge queue. We poll until the PR is
+        # mergeable (CI green) and then explicitly enqueue via the
+        # `enqueuePullRequest` GraphQL mutation, which is what the
+        # "Merge when ready" button calls.
+        #
+        # NOTE: `gh pr view --json isInMergeQueue` is not supported by the
+        # gh CLI shipped on ubuntu-latest runners — the field is missing
+        # from its known set and the command exits non-zero. Query the
+        # GraphQL API directly instead so this step does not regress with
+        # CLI version drift.
+        run: |
+          set -euo pipefail
+          PR_ID=$(gh pr view "$PR_URL" --json id --jq '.id')
+
+          pr_state() {
+            gh api graphql \
+              -f query='query($id:ID!){ node(id:$id){ ... on PullRequest { mergeable mergeStateStatus isInMergeQueue } } }' \
+              -F id="$PR_ID" \
+              --jq '"\(.data.node.mergeable)|\(.data.node.mergeStateStatus)|\(.data.node.isInMergeQueue)"'
+          }
+
+          initial=$(pr_state)
+          already_queued=${initial##*|}
+          if [ "$already_queued" = "true" ]; then
+            echo "PR already in merge queue; nothing to do."
+            exit 0
+          fi
+
+          attempts=60
+          sleep_seconds=30
+          for i in $(seq 1 "$attempts"); do
+            state=$(pr_state)
+            mergeable=${state%%|*}
+            rest=${state#*|}
+            merge_state=${rest%%|*}
+            queued=${rest#*|}
+            echo "attempt $i/$attempts mergeable=$mergeable mergeStateStatus=$merge_state isInMergeQueue=$queued"
+
+            if [ "$queued" = "true" ]; then
+              echo "PR entered queue out-of-band; done."
+              exit 0
+            fi
+
+            # mergeStateStatus reference:
+            #   CLEAN / HAS_HOOKS  -> green, ready to enqueue
+            #   UNSTABLE           -> required checks pending or failing; keep waiting
+            #   BLOCKED            -> usually transient while CI is still running on a
+            #                         fresh push (queue + required checks not yet green);
+            #                         keep waiting until the polling timeout
+            #   UNKNOWN            -> GitHub still computing; keep waiting
+            #   DIRTY / BEHIND     -> needs human attention (conflict or rebase)
+            #   DRAFT              -> shouldn't happen for this workflow, but treat as terminal
+            case "$merge_state" in
+              CLEAN | HAS_HOOKS)
+                if [ "$mergeable" = "MERGEABLE" ]; then
+                  break
+                fi
+                ;;
+              DIRTY | BEHIND | DRAFT)
+                echo "PR is $merge_state; cannot enqueue. Exiting."
+                exit 0
+                ;;
+              *)
+                # UNSTABLE, BLOCKED, UNKNOWN, anything else -> keep polling.
+                ;;
+            esac
+
+            if [ "$i" -eq "$attempts" ]; then
+              echo "Timed out waiting for PR to become mergeable."
+              exit 1
+            fi
+            sleep "$sleep_seconds"
+          done
+
+          gh api graphql \
+            -f query='mutation($id:ID!){ enqueuePullRequest(input:{pullRequestId:$id}){ mergeQueueEntry{ position } } }' \
+            -F id="$PR_ID"

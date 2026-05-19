@@ -13,6 +13,8 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 const mockPopup = { close: vi.fn() };
 const messageListeners = new Set<Function>();
 
+const MOCK_ORIGIN = 'http://localhost';
+
 const mockWindow = {
   open: vi.fn(() => mockPopup),
   addEventListener: vi.fn((type: string, fn: Function) => {
@@ -21,6 +23,7 @@ const mockWindow = {
   removeEventListener: vi.fn((type: string, fn: Function) => {
     if (type === 'message') messageListeners.delete(fn);
   }),
+  location: { origin: MOCK_ORIGIN, pathname: '/', search: '' },
 };
 
 vi.stubGlobal('window', mockWindow);
@@ -34,14 +37,16 @@ vi.stubGlobal(
 // Default location: standalone CLI (no polling)
 vi.stubGlobal('location', { pathname: '/', search: '' });
 
-function fireMessage(data: unknown) {
+function fireMessage(data: unknown, opts: { origin?: string; source?: object | null } = {}) {
+  const origin = opts.origin ?? MOCK_ORIGIN;
+  const source = 'source' in opts ? opts.source : mockPopup;
   for (const handler of messageListeners) {
-    handler({ data } as MessageEvent);
+    handler({ data, origin, source } as unknown as MessageEvent);
   }
 }
 
 // Import AFTER stubs are in place (module reads `window` at call time)
-import { createOAuthLauncher } from '../../src/providers/oauth-service.js';
+import { createOAuthLauncher, getOAuthPageOrigin } from '../../src/providers/oauth-service.js';
 
 describe('createOAuthLauncher', () => {
   beforeEach(() => {
@@ -261,5 +266,47 @@ describe('createOAuthLauncher', () => {
 
     const result = await promise;
     expect(result).toBe('http://localhost:5710/auth/callback#token=first');
+  });
+});
+
+describe('getOAuthPageOrigin', () => {
+  const originalWindow = (globalThis as any).window;
+
+  afterEach(() => {
+    if (originalWindow === undefined) {
+      delete (globalThis as any).window;
+    } else {
+      (globalThis as any).window = originalWindow;
+    }
+    delete (globalThis as any).__slicc_panelRpc;
+  });
+
+  it('reads origin and href from window when available', async () => {
+    (globalThis as any).window = {
+      location: { origin: 'http://localhost:5711', href: 'http://localhost:5711/?x=1' },
+    };
+    const info = await getOAuthPageOrigin();
+    expect(info.origin).toBe('http://localhost:5711');
+    expect(info.href).toBe('http://localhost:5711/?x=1');
+  });
+
+  it('routes through panel-RPC when window is undefined (worker context)', async () => {
+    delete (globalThis as any).window;
+    const callSpy = vi.fn(async (op: string) => {
+      expect(op).toBe('page-info');
+      return { origin: 'http://localhost:5731', href: 'http://localhost:5731/foo', title: 't' };
+    });
+    (globalThis as any).__slicc_panelRpc = { call: callSpy, dispose: () => {} };
+
+    const info = await getOAuthPageOrigin();
+    expect(callSpy).toHaveBeenCalled();
+    expect(info.origin).toBe('http://localhost:5731');
+    expect(info.href).toBe('http://localhost:5731/foo');
+  });
+
+  it('throws with a clear message when no window and no panel-RPC bridge', async () => {
+    delete (globalThis as any).window;
+    delete (globalThis as any).__slicc_panelRpc;
+    await expect(getOAuthPageOrigin()).rejects.toThrow(/panel-RPC bridge/);
   });
 });

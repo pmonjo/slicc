@@ -1,9 +1,13 @@
 /**
- * Layout — split-pane (standalone) or tabbed (extension) layout.
+ * Layout — unified split-pane shell for both CLI and extension.
  *
- * Standalone mode (CLI):
+ * The `isExtension` constructor flag toggles density (scoops rail,
+ * scoop switcher, avatar). The extension
+ * (side panel) mode uses isExtension=true; the detached popout mode
+ * uses isExtension=false to get the full standalone rail UX.
+ *
  *   ┌───────┬─────────────┬───┬───────────────┐
- *   │  Header (full width)                    │
+ *   │  Header (popout btn, scoop switcher, etc.)│
  *   ├───────┬─────────────┬───┬───────────────┤
  *   │Scoops │             │ ║ │  Terminal      │
  *   │       │  Chat       │ ║ ├───────────────┤
@@ -11,13 +15,14 @@
  *   │       │             │ ║ │               │
  *   └───────┴─────────────┴───┴───────────────┘
  *
- * Extension mode (side panel):
- *   ┌─ Header [switcher] ─────────┐
- *   ├─ Tabs: [Chat] [Term] [Files] [Memory] ─┤
- *   │                                │
- *   │  Active panel (full size)      │
- *   │                                │
- *   └────────────────────────────────┘
+ * Extension-mode placement note: when isExtension=true, buildHeader
+ * returns early and no `.header` element is rendered. The popout
+ * button is attached to `.thread-header` instead (see
+ * setShowPopoutButton). The diagram above depicts the
+ * isExtension=false (standalone / detached) layout.
+ *
+ * Detached popout spec:
+ *   docs/superpowers/specs/2026-05-13-extension-detached-popout-design.md
  */
 
 import { ChatPanel } from './chat-panel.js';
@@ -25,7 +30,9 @@ import { TerminalPanel } from './terminal-panel.js';
 import { FileBrowserPanel } from './file-browser-panel.js';
 import { MemoryPanel } from './memory-panel.js';
 import { ScoopsPanel } from './scoops-panel.js';
+import type { FrozenSessionIndexEntry } from './session-freezer.js';
 import { ScoopSwitcher } from './scoop-switcher.js';
+import { attachLongPressGesture } from './long-press.js';
 import {
   getApiKey,
   clearAllSettings,
@@ -43,7 +50,7 @@ import { copyTextToClipboard } from './clipboard.js';
 import { computeTrayMenuModel } from './tray-join-url.js';
 import { showSyncEnabledDialog } from './sync-dialog.js';
 import { getTrayResetter } from '../shell/supplemental-commands/host-command.js';
-import { getHiddenTabs, setHiddenTabs, type ExtensionTabId } from './tabbed-ui.js';
+import { type ExtensionTabId } from './tabbed-ui.js';
 import { RailZone } from './rail-zone.js';
 import { PanelRegistry } from './panel-registry.js';
 import { showSprinklePicker } from './sprinkle-picker.js';
@@ -85,6 +92,8 @@ export class Layout {
   // Thread header (sub-header with scoop name)
   private threadHeaderEl!: HTMLElement;
   private threadHeaderName!: HTMLElement;
+  /** Thread-header "New session" button — populated by `setupChatHeader`. */
+  private newSessionBtn: HTMLButtonElement | null = null;
 
   // Right side — always-visible vertical icon rail + collapsible
   // content panel beside it. Replaces the old horizontal mini-tabs.
@@ -99,21 +108,20 @@ export class Layout {
   // continue to work even though the actual tab bar is gone.
   private tabContainers = new Map<TabId, HTMLElement>();
   private activeTab: TabId = 'chat';
-  /** Pre-created containers for debug tabs (terminal, memory) — always created, rail items added on demand. */
-  private debugTabContainers: { terminal: HTMLElement; memory: HTMLElement } | null = null;
-  /**
-   * Cached element handle for the Memory rail container — needed so
-   * `setDebugTabs(true)` can re-mount the rail item without losing
-   * the existing MemoryPanel mount.
-   */
+  /** Cached element handle for the Memory rail container. */
   private memoryContainer!: HTMLElement;
-  /** Cached SVGs reused when re-mounting pinned rail items. */
+  /** Cached SVGs for pinned rail items. */
   private terminalIconSvg = '';
   private memoryIconSvg = '';
 
   // Scoop switcher (extension mode)
   private scoopSwitcher: ScoopSwitcher | null = null;
   private scoopSwitcherEl: HTMLElement | null = null;
+
+  // Popout button + detached-active overlay (extension mode)
+  private popoutButtonEl?: HTMLButtonElement;
+  private popoutClickHandler?: () => void;
+  private detachedActiveOverlayEl?: HTMLDivElement;
 
   // User avatar element
   private avatarEl!: HTMLElement;
@@ -140,8 +148,21 @@ export class Layout {
    */
   public onModelsRefreshed?: () => void;
   public onScoopSelect?: (scoop: RegisteredScoop) => void;
-  public onClearChat?: () => Promise<void>;
+  /**
+   * Fired by the "New session" button. When `freeze` is true (default), the
+   * handler archives the cone session before clearing. The long-press
+   * gesture passes `freeze: false` to discard the conversation without
+   * adding it to /sessions/.
+   */
+  public onClearChat?: (opts?: { freeze?: boolean }) => Promise<void>;
   public onClearFilesystem?: () => Promise<void>;
+  /**
+   * Fired when the user clicks an entry in the frozen-sessions sidebar
+   * section. Receives the full index entry; the standalone wiring reads
+   * the archive markdown and displays it in the chat panel read-only.
+   * Standalone-only — the extension build hides the rail entirely.
+   */
+  public onFrozenSessionOpen?: (entry: FrozenSessionIndexEntry) => void;
   public onSprinkleClose?: (name: string) => void;
   /**
    * Fired when the user clicks a sprinkle's rail icon. Lets the
@@ -196,6 +217,90 @@ export class Layout {
   }
 
   /**
+   * Show or hide the "Pop out" header button. The click handler is
+   * provided by setPopoutClickHandler — Layout itself does not know
+   * about the SW envelope shape.
+   */
+  setShowPopoutButton(show: boolean): void {
+    if (!show) {
+      this.popoutButtonEl?.remove();
+      this.popoutButtonEl = undefined;
+      return;
+    }
+    if (this.popoutButtonEl) return;
+
+    // In standalone mode, Layout has a top-of-window `.header` div.
+    // In extension mode, that header is omitted (the side panel is
+    // narrower and uses `.thread-header` as its primary chrome).
+    // Put the button wherever the user's eye is already looking.
+    const containerEl = (
+      this.isExtension
+        ? this.root.querySelector('.thread-header')
+        : this.root.querySelector('.header')
+    ) as HTMLElement | null;
+    if (!containerEl) return;
+
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'header__popout-btn';
+    btn.title = 'Open in a new tab';
+    btn.textContent = '⤴'; // simple glyph; CSS may replace with icon
+    btn.setAttribute('aria-label', 'Pop out to a new tab');
+    btn.addEventListener('click', () => {
+      btn.disabled = true; // prevent double-fire
+      this.popoutClickHandler?.();
+    });
+    containerEl.appendChild(btn);
+    this.popoutButtonEl = btn;
+  }
+
+  /** Wire the popout button click handler. Replaces any previous handler. */
+  setPopoutClickHandler(handler: () => void): void {
+    this.popoutClickHandler = handler;
+  }
+
+  /**
+   * Re-enable the popout button after a failed click. Used by the
+   * SW-roundtrip caller when chrome.runtime.sendMessage rejects (e.g.,
+   * cold-start with no receivers). Safe to call when the button is
+   * absent or already enabled.
+   */
+  resetPopoutButton(): void {
+    if (this.popoutButtonEl) {
+      this.popoutButtonEl.disabled = false;
+    }
+  }
+
+  /**
+   * Render a non-dismissible full-Layout overlay indicating that a
+   * detached tab has taken over. The only escape is closing this
+   * window via the overlay's close button.
+   */
+  showDetachedActiveOverlay(): void {
+    if (this.detachedActiveOverlayEl) return;
+    const overlay = document.createElement('div');
+    overlay.className = 'layout-detached-overlay';
+    overlay.setAttribute('role', 'alertdialog');
+    overlay.setAttribute('aria-modal', 'true');
+
+    const msg = document.createElement('p');
+    msg.textContent = 'Detached in another tab. Close this window to continue.';
+
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'layout-detached-overlay-close';
+    btn.textContent = 'Close this window';
+    btn.addEventListener('click', () => {
+      window.close();
+    });
+
+    overlay.appendChild(msg);
+    overlay.appendChild(btn);
+    this.root.appendChild(overlay);
+    this.detachedActiveOverlayEl = overlay;
+  }
+
+  /**
    * Activate a built-in panel by tab id. Held over from the legacy
    * tabbed layout — callers (Electron overlay routing, deep-linking)
    * still pass `'chat' | 'terminal' | 'files' | 'memory' | 'sprinkle-*'`
@@ -203,6 +308,37 @@ export class Layout {
    * content and the rest are rail items, so we collapse the rail for
    * `chat` and activate the matching rail item otherwise.
    */
+  /**
+   * Toggle the "context getting full" glow on the New Session button.
+   * Receives the current context-fill ratio (estimated tokens divided
+   * by the active model's context window). Two-tier visual:
+   *
+   *   - ≥ 0.5  → soft glow (`glow`)        — "consider freezing"
+   *   - ≥ 0.85 → strong glow (`glow--hot`) — "compaction is imminent"
+   *
+   * Below 0.5 the button is plain. No-op when the button hasn't been
+   * mounted (extension mode hides the thread-header entry).
+   */
+  /**
+   * Set the thread-header title text. Used by frozen-session display
+   * (so the header reads "❄ <archive title>") without going through
+   * the scoop-select code path. No-op in extension mode where the
+   * header is a detached node.
+   */
+  setThreadHeaderName(text: string): void {
+    if (this.threadHeaderName && this.threadHeaderName.isConnected) {
+      this.threadHeaderName.textContent = text;
+    }
+  }
+
+  setNewSessionGlow(ratio: number): void {
+    if (!this.newSessionBtn) return;
+    const hot = ratio >= 0.85;
+    const warm = ratio >= 0.5;
+    this.newSessionBtn.classList.toggle('glow', warm);
+    this.newSessionBtn.classList.toggle('glow--hot', hot);
+  }
+
   setActiveTab(id: TabId): void {
     this.activeTab = id;
     if (id === 'chat') {
@@ -232,57 +368,6 @@ export class Layout {
     const active = this.primaryRail.getActiveItemId();
     if (active && active.startsWith('sprinkle-')) return;
     this.primaryRail.activateItem('terminal');
-  }
-
-  /**
-   * Show or hide the Terminal + Memory rail items.
-   *
-   * The `debug` shell command used to flip the visibility of these
-   * tabs in the legacy tabbed extension layout. With the unified rail
-   * the items are addable/removable like sprinkles, so we mirror the
-   * same on/off semantics by adding or removing them from the rail.
-   * Files stays pinned in the rail in either mode.
-   */
-  setDebugTabs(show: boolean): void {
-    setHiddenTabs(show ? [] : ['terminal', 'memory']);
-    if (!this.primaryRail) return;
-    if (show) {
-      // Re-add only if missing — addItem is a no-op when the id
-      // already exists, so this is safe to call repeatedly.
-      this.ensurePinnedRailItem('terminal');
-      this.ensurePinnedRailItem('memory');
-    } else {
-      this.primaryRail.removeItem('terminal');
-      this.primaryRail.removeItem('memory');
-    }
-  }
-
-  /**
-   * Re-mount a previously-removed pinned rail item without losing
-   * the cached panel container. Called from `setDebugTabs(true)` to
-   * restore terminal/memory after the user enabled debug mode.
-   */
-  private ensurePinnedRailItem(id: 'terminal' | 'memory'): void {
-    if (!this.primaryRail || this.primaryRail.hasItem(id)) return;
-    if (id === 'terminal') {
-      this.primaryRail.addItem({
-        id: 'terminal',
-        label: 'Terminal',
-        icon: this.terminalIconSvg,
-        element: this.terminalContainer,
-        position: 'bottom',
-        onActivate: () => this.panels?.terminal?.refit(),
-      });
-    } else {
-      this.primaryRail.addItem({
-        id: 'memory',
-        label: 'Memory',
-        icon: this.memoryIconSvg,
-        element: this.memoryContainer,
-        position: 'bottom',
-        onActivate: () => this.panels?.memory?.refresh(),
-      });
-    }
   }
 
   // ── Shared: Header ──────────────────────────────────────────────────
@@ -711,8 +796,8 @@ export class Layout {
       const clearAllBtn = document.createElement('button');
       clearAllBtn.className = 'avatar-popover__item avatar-popover__item--danger';
       clearAllBtn.textContent = 'Clear all accounts';
-      clearAllBtn.addEventListener('click', () => {
-        clearAllSettings();
+      clearAllBtn.addEventListener('click', async () => {
+        await clearAllSettings();
         popover.remove();
         this.refreshAvatar();
         this.refreshModels?.();
@@ -726,12 +811,20 @@ export class Layout {
     popover.appendChild(sepChat);
 
     const clearChatBtn = document.createElement('button');
-    clearChatBtn.className = 'avatar-popover__item avatar-popover__item--danger';
-    clearChatBtn.textContent = 'Clear chat';
+    clearChatBtn.className = 'avatar-popover__item';
+    clearChatBtn.textContent = 'New session';
     clearChatBtn.addEventListener('click', async () => {
       popover.remove();
-      await this.panels?.chat?.clearSession();
-      await this.onClearChat?.();
+      // The freezer runs inside onClearChat and reads the cone's session
+      // from IndexedDB. We must NOT delete the panel's session before that
+      // happens (the freezer would see nothing). When onClearChat is wired
+      // (the normal case) it handles the cone clear itself; only fall back
+      // to clearing the panel-local view if no handler is registered.
+      if (this.onClearChat) {
+        await this.onClearChat({ freeze: true });
+      } else {
+        await this.panels?.chat?.clearSession();
+      }
       location.reload();
     });
     popover.appendChild(clearChatBtn);
@@ -746,7 +839,7 @@ export class Layout {
     settingsBtn.textContent = 'Account settings\u2026';
     settingsBtn.addEventListener('click', async () => {
       popover.remove();
-      if (!getApiKey()) clearAllSettings();
+      if (!getApiKey()) await clearAllSettings();
       const changed = await showProviderSettings();
       if (changed) {
         this.refreshAvatar();
@@ -849,15 +942,36 @@ export class Layout {
     // Clear chat button — the rail now owns panel toggling, so the
     // chat header drops the panel-toggle button entirely.
     const clearChatBtn = document.createElement('button');
-    clearChatBtn.className = 'thread-header__panel-toggle';
-    clearChatBtn.dataset.tooltip = 'Clear Chat';
-    clearChatBtn.setAttribute('aria-label', 'Clear Chat');
+    clearChatBtn.className = 'thread-header__panel-toggle thread-header__new-session';
+    // Long, explanatory tooltip — the action is non-obvious enough that
+    // a 1-word label would mislead users into thinking it's a destructive
+    // "clear" button. Long-press is the only secondary affordance.
+    clearChatBtn.dataset.tooltip =
+      'New session for faster responses — history and memories will be kept. Long press to discard this session without saving memory.';
+    clearChatBtn.setAttribute(
+      'aria-label',
+      'New session — keeps memory and history. Hold to discard without saving memory.'
+    );
+    this.newSessionBtn = clearChatBtn;
+    // "Compose new" — square with a pencil, matches the universal
+    // "start a new thread" pattern (Slack, Discord, modern chat apps).
     clearChatBtn.innerHTML =
-      '<svg width="16" height="16" viewBox="0 0 20 20" fill="none"><path d="m8.249,15.021c-.4,0-.733-.317-.748-.72l-.25-6.5c-.017-.414.307-.763.72-.778.01-.001.021-.001.03-.001.4,0,.733.317.748.72l.25,6.5c.017.414-.307.763-.72.778-.01.001-.021.001-.03.001Z" fill="currentColor"/><path d="m11.751,15.021c-.01,0-.02,0-.03-.001-.413-.016-.736-.364-.72-.778l.25-6.5c.015-.403.348-.72.748-.72.01,0,.02,0,.03.001.413.016.736.364.72.778l-.25,6.5c-.015.403-.348.72-.748.72Z" fill="currentColor"/><path d="m17,4h-3.5v-.75c0-1.24-1.01-2.25-2.25-2.25h-2.5c-1.24,0-2.25,1.01-2.25,2.25v.75h-3.5c-.414,0-.75.336-.75.75s.336.75.75.75h.52l.422,10.342c.048,1.21,1.036,2.158,2.248,2.158h7.619c1.212,0,2.2-.948,2.248-2.158l.422-10.342h.52c.414,0,.75-.336.75-.75s-.336-.75-.75-.75Zm-9-.75c0-.413.337-.75.75-.75h2.5c.413,0,.75.337.75.75v.75h-4v-.75Zm6.56,12.531c-.017.403-.346.719-.75.719h-7.619c-.404,0-.733-.316-.75-.719l-.42-10.281h9.959l-.42,10.281Z" fill="currentColor"/></svg>';
-    clearChatBtn.addEventListener('click', async () => {
-      await this.panels.chat.clearSession();
-      await this.onClearChat?.();
+      '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">' +
+      '<path d="M12 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/>' +
+      '<path d="M18.375 2.625a1 1 0 0 1 3 3l-9.013 9.014a2 2 0 0 1-.853.505l-2.873.84a.5.5 0 0 1-.62-.62l.84-2.873a2 2 0 0 1 .506-.852z"/>' +
+      '</svg>';
+    const runNewSession = async (opts?: { freeze?: boolean }) => {
+      if (this.onClearChat) {
+        await this.onClearChat(opts);
+      } else {
+        await this.panels.chat.clearSession();
+      }
       location.reload();
+    };
+    // Short click → freeze + clear. Long press / modifier-click → discard.
+    attachLongPressGesture(clearChatBtn, {
+      onShortClick: () => void runNewSession({ freeze: true }),
+      onLongPress: () => void runNewSession({ freeze: false }),
     });
 
     const threadActions = document.createElement('div');
@@ -956,22 +1070,16 @@ export class Layout {
     this.memoryIconSvg =
       '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5a3 3 0 1 0-5.997.125 4 4 0 0 0-2.526 5.77 4 4 0 0 0 .556 6.588A4 4 0 1 0 12 18Z"></path><path d="M9 13a4.5 4.5 0 0 0 3-4"></path><path d="M6.003 5.125A3 3 0 0 0 6.401 6.5"></path><path d="M3.477 10.896a4 4 0 0 1 .585-.396"></path><path d="M6 18a4 4 0 0 1-1.967-.516"></path><path d="M12 13h4"></path><path d="M12 18h6a2 2 0 0 1 2 2v1"></path><path d="M12 8h8"></path><path d="M16 8V5a2 2 0 0 1 2-2"></path><circle cx="16" cy="13" r=".5"></circle><circle cx="18" cy="3" r=".5"></circle><circle cx="20" cy="21" r=".5"></circle><circle cx="20" cy="8" r=".5"></circle></svg>';
 
-    // In extension mode the panel is too narrow to host the legacy
-    // debug surfaces by default — terminal + memory live behind the
-    // shell's `debug` toggle. Files remains pinned in either mode.
-    const showDebugByDefault = !this.isExtension || !getHiddenTabs().has('terminal');
-
-    // Pinned bottom-section tools — always present, mounted from boot.
-    if (showDebugByDefault) {
-      this.primaryRail.addItem({
-        id: 'terminal',
-        label: 'Terminal',
-        icon: this.terminalIconSvg,
-        element: this.terminalContainer,
-        position: 'bottom',
-        onActivate: () => this.panels?.terminal?.refit(),
-      });
-    }
+    // Pinned bottom-section tools — always present, mounted from boot
+    // in both standalone and extension modes.
+    this.primaryRail.addItem({
+      id: 'terminal',
+      label: 'Terminal',
+      icon: this.terminalIconSvg,
+      element: this.terminalContainer,
+      position: 'bottom',
+      onActivate: () => this.panels?.terminal?.refit(),
+    });
     this.primaryRail.addItem({
       id: 'files',
       label: 'Files',
@@ -979,16 +1087,14 @@ export class Layout {
       element: fileBrowserContainer,
       position: 'bottom',
     });
-    if (showDebugByDefault) {
-      this.primaryRail.addItem({
-        id: 'memory',
-        label: 'Memory',
-        icon: this.memoryIconSvg,
-        element: this.memoryContainer,
-        position: 'bottom',
-        onActivate: () => this.panels?.memory?.refresh(),
-      });
-    }
+    this.primaryRail.addItem({
+      id: 'memory',
+      label: 'Memory',
+      icon: this.memoryIconSvg,
+      element: this.memoryContainer,
+      position: 'bottom',
+      onActivate: () => this.panels?.memory?.refresh(),
+    });
 
     // [+] only appears when sprinkles overflow the available rail height.
     this.primaryRail.enableAddButton();
@@ -1025,6 +1131,7 @@ export class Layout {
         },
         onSendMessage: () => {},
         onScoopsChanged: (scoops) => this.updateLogoScoops(scoops),
+        onFrozenSessionOpen: (vfsPath) => this.onFrozenSessionOpen?.(vfsPath),
       }),
     };
 

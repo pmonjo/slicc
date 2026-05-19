@@ -26,7 +26,7 @@ const COMMAND_CATEGORIES = new Map<string, string[]>([
   ['Search', ['find', 'rg']],
   ['Navigation & paths', ['pwd', 'basename', 'dirname', 'tree', 'du', 'cd']],
   ['Archives', ['zip', 'unzip', 'pdftk', 'pdf']],
-  ['Media', ['convert', 'magick']],
+  ['Media', ['convert', 'magick', 'ffmpeg']],
   ['Audio', ['say', 'afplay', 'chime']],
   [
     'Environment & shell',
@@ -53,17 +53,19 @@ const COMMAND_CATEGORIES = new Map<string, string[]>([
       'secret',
       'nuke',
       'models',
+      'local-llm',
       'cost',
     ],
   ],
   ['Data processing', ['xargs', 'jq', 'base64', 'date']],
-  ['Network', ['curl', 'wget', 'html-to-markdown']],
+  ['Network', ['curl', 'wget', 'websocat', 'html-to-markdown']],
   ['Version control', ['git']],
   ['Languages', ['node', 'python', 'python3', 'sqlite3']],
   ['Skills', ['skill', 'upskill']],
   ['Browser & UI', ['serve', 'open', 'imgcat', ...PLAYWRIGHT_COMMAND_NAMES, 'webhook']],
   ['Filesystem', ['mount', 'fswatch']],
   ['Scoops & agents', ['agent']],
+  ['Process', ['ps', 'kill']],
 ]);
 
 function formatHelp(commands: string[], jshCommands: string[] = []): string {

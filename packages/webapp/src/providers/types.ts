@@ -6,7 +6,7 @@ import type {
   AnthropicMessagesCompat,
   OpenAICompletionsCompat,
   OpenAIResponsesCompat,
-} from '@mariozechner/pi-ai';
+} from '@earendil-works/pi-ai';
 
 /**
  * Opens a browser window/flow for the given authorize URL and returns the
@@ -86,6 +86,17 @@ export interface ProviderConfig {
   name: string;
   description: string;
   requiresApiKey: boolean;
+  /**
+   * When true, the dialog still shows the API key field but does not require
+   * a value. `getApiKeyForProvider` returns the literal `'local'` instead of
+   * `null` when the user leaves it blank, so callers that gate on a non-null
+   * key (scoop init, pi-ai's stream) stay happy.
+   *
+   * Set this for providers that talk to local servers where the key is
+   * usually ignored but might be needed for hosted OpenAI-compatible
+   * endpoints (Together, Anyscale, Fireworks).
+   */
+  optionalApiKey?: boolean;
   apiKeyPlaceholder?: string;
   apiKeyEnvVar?: string;
   requiresBaseUrl: boolean;
@@ -105,6 +116,19 @@ export interface ProviderConfig {
   ) => Promise<void>;
   /** Called when the user clicks logout for this OAuth provider. */
   onOAuthLogout?: () => Promise<void>;
+  /**
+   * Optional: refresh an expired/expiring token silently from page context.
+   * Called by oauth-bootstrap at page load so the kernel-worker can stream
+   * with a fresh token without needing window access. Returns the new token
+   * (also persists it via saveOAuthAccount) or null if renewal is impossible
+   * (e.g. user must re-authenticate).
+   */
+  onSilentRenew?: () => Promise<string | null>;
+  /**
+   * Domains this OAuth token should be unmasked for in fetch-proxy traffic.
+   * Supports wildcards (e.g. '*.github.com').
+   */
+  oauthTokenDomains?: string[];
   /**
    * Optional: override model capabilities for specific model IDs.
    * Applied after pi-ai registry defaults, before getModelIds metadata.

@@ -10,17 +10,21 @@ import { createOpenCommand } from './open-command.js';
 import { createPdftkCommand } from './pdftk-command.js';
 import { createPlaywrightCommand, PLAYWRIGHT_COMMAND_NAMES } from './playwright-command.js';
 import { createPython3LikeCommand } from './python-command.js';
+import { createFfmpegCommand } from './ffmpeg-command.js';
 import { createServeCommand } from './serve-command.js';
 import { createSqliteCommand } from './sqlite-command.js';
 import { createUnameCommand } from './uname-command.js';
 import { createManCommand } from './man-command.js';
 import { createUnzipCommand } from './unzip-command.js';
 import { createWebhookCommand } from './webhook-command.js';
+import { createWebsocatCommand } from './websocat-command.js';
 import { createCrontaskCommand } from './crontask-command.js';
 import { createFsWatchCommand } from './fswatch-command.js';
 import { createSprinkleCommand } from './sprinkle-command.js';
 import { createOAuthTokenCommand } from './oauth-token-command.js';
+import { createLocalLlmCommand } from './local-llm-command.js';
 import { createSecretCommand } from './secret-command.js';
+import { createOAuthDomainCommand } from './oauth-domain-command.js';
 import { createRsyncCommand } from './rsync-command.js';
 import { createWhichCommand } from './which-command.js';
 import { createZipCommand } from './zip-command.js';
@@ -32,14 +36,16 @@ import {
 } from './clipboard-commands.js';
 import { createSayCommand } from './say-command.js';
 import { createAfplayCommand, createChimeCommand } from './afplay-command.js';
-import { createDebugCommand } from './debug-command.js';
 import { createModelsCommand } from './models-command.js';
 import { createCostCommand } from './cost-command.js';
 import { createNukeCommand } from './nuke-command.js';
 import { createAgentCommand } from './agent-command.js';
 import { createDiscoverCommand } from './discover-command.js';
+import { createPsCommand } from './ps-command.js';
+import { createKillCommand } from './kill-command.js';
 import type { BrowserAPI } from '../../cdp/index.js';
 import type { ScriptCatalog } from '../script-catalog.js';
+import type { ProcessManager } from '../../kernel/process-manager.js';
 export type {
   ImgcatCommandOptions as SupplementalCommandOptions,
   MediaPreviewItem,
@@ -62,6 +68,13 @@ export interface SupplementalCommandsConfig extends ImgcatCommandOptions {
    * (the terminal panel's standalone WasmShell).
    */
   getParentJid?: () => string | undefined;
+  /**
+   * Process manager threaded into `ps` / `kill`. When omitted,
+   * those commands fall back to `globalThis.__slicc_pm`
+   * (published by `createKernelHost`). Tests prefer DI; production
+   * works with either.
+   */
+  processManager?: ProcessManager;
 }
 
 export function createSupplementalCommands(options: SupplementalCommandsConfig = {}): Command[] {
@@ -78,7 +91,9 @@ export function createSupplementalCommands(options: SupplementalCommandsConfig =
     createNodeCommand(),
     createPython3LikeCommand('python3'),
     createPython3LikeCommand('python'),
+    createFfmpegCommand(),
     createWebhookCommand(),
+    createWebsocatCommand(),
     createCrontaskCommand(),
     createFsWatchCommand(),
     createSprinkleCommand(),
@@ -90,6 +105,8 @@ export function createSupplementalCommands(options: SupplementalCommandsConfig =
     createUnameCommand(),
     createManCommand(),
     createOAuthTokenCommand(),
+    createOAuthDomainCommand(),
+    createLocalLlmCommand(),
     createSecretCommand(),
     createRsyncCommand({ fs: options.fs }),
     createScreencaptureCommand(),
@@ -105,13 +122,9 @@ export function createSupplementalCommands(options: SupplementalCommandsConfig =
     createNukeCommand(),
     createAgentCommand({ getParentJid: options.getParentJid }),
     createDiscoverCommand(),
+    createPsCommand({ processManager: options.processManager }),
+    createKillCommand({ processManager: options.processManager }),
   ];
-
-  // Extension-only commands
-  const isExtension = typeof chrome !== 'undefined' && !!(chrome as any)?.runtime?.id;
-  if (isExtension) {
-    commands.push(createDebugCommand());
-  }
 
   if (options.fs) {
     commands.push(
