@@ -2436,6 +2436,17 @@ async function mainStandaloneWorker(app: HTMLElement, isElectronOverlay: boolean
         browserTransport: realCdpTransport,
         vfs: localFs,
       });
+      // Forward agent → sprinkle pushes over the WebRTC wire. Without
+      // this hook, `SprinkleManager.sendToSprinkle` (called by the welcome
+      // sprinkle flow, the `sprinkle` shell command, and any agent
+      // pushing data via the bridge) updates only the leader's local
+      // renderer — followers see the static initial content but never
+      // the live updates. iOS has the same expectation: its
+      // `AppState.sprinkleUpdates[name]` map is populated by
+      // `sprinkle.update` envelopes that this broadcaster emits.
+      sprinkleManager.setSendToSprinkleHook((name, data) =>
+        pageLeaderTray?.sync.broadcastSprinkleUpdate(name, data)
+      );
     }
   }
 

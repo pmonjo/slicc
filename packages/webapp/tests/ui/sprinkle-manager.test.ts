@@ -122,6 +122,86 @@ describe('SprinkleManager', () => {
     expect(() => mgr.sendToSprinkle('unknown', {})).not.toThrow();
   });
 
+  it('sendToSprinkle fires the onSendToSprinkle hook when sprinkle is open (leader broadcast wiring)', async () => {
+    // The hook is what `page-leader-tray.ts` wires to
+    // `LeaderSyncManager.broadcastSprinkleUpdate` so followers receive the
+    // agent's push. Without it, `sendToSprinkle` updates only the local
+    // renderer and followers see nothing until the next snapshot refresh.
+    await vfs.writeFile('/shared/sprinkles/dash/dash.shtml', '<title>D</title><div>hi</div>');
+    const onSendToSprinkle = vi.fn();
+    const mgrWithHook = new SprinkleManager(
+      vfs,
+      lickHandler,
+      {
+        addSprinkle: addSprinkle as unknown as (
+          name: string,
+          title: string,
+          element: HTMLElement
+        ) => void,
+        removeSprinkle: removeSprinkle as unknown as (name: string) => void,
+      },
+      vi.fn(),
+      { onSendToSprinkle }
+    );
+    await mgrWithHook.refresh();
+    await mgrWithHook.open('dash');
+
+    mgrWithHook.sendToSprinkle('dash', { progress: 0.42 });
+
+    expect(onSendToSprinkle).toHaveBeenCalledTimes(1);
+    expect(onSendToSprinkle).toHaveBeenCalledWith('dash', { progress: 0.42 });
+  });
+
+  it('sendToSprinkle does NOT fire the hook for a closed sprinkle (matches local-render behaviour)', () => {
+    const onSendToSprinkle = vi.fn();
+    const mgrWithHook = new SprinkleManager(
+      vfs,
+      lickHandler,
+      {
+        addSprinkle: addSprinkle as unknown as (
+          name: string,
+          title: string,
+          element: HTMLElement
+        ) => void,
+        removeSprinkle: removeSprinkle as unknown as (name: string) => void,
+      },
+      vi.fn(),
+      { onSendToSprinkle }
+    );
+
+    mgrWithHook.sendToSprinkle('not-open', { foo: 1 });
+
+    expect(onSendToSprinkle).not.toHaveBeenCalled();
+  });
+
+  it('hook errors do not propagate or skip the local renderer push', async () => {
+    await vfs.writeFile('/shared/sprinkles/dash/dash.shtml', '<title>D</title>hi');
+    const onSendToSprinkle = vi.fn(() => {
+      throw new Error('broadcaster blew up');
+    });
+    const mgrWithHook = new SprinkleManager(
+      vfs,
+      lickHandler,
+      {
+        addSprinkle: addSprinkle as unknown as (
+          name: string,
+          title: string,
+          element: HTMLElement
+        ) => void,
+        removeSprinkle: removeSprinkle as unknown as (name: string) => void,
+      },
+      vi.fn(),
+      { onSendToSprinkle }
+    );
+    await mgrWithHook.refresh();
+    await mgrWithHook.open('dash');
+
+    // Local push must succeed first; hook failure must be swallowed so
+    // a broken broadcaster doesn't break local sprinkles.
+    expect(() => mgrWithHook.sendToSprinkle('dash', { x: 1 })).not.toThrow();
+    expect(onSendToSprinkle).toHaveBeenCalledTimes(1);
+  });
+
   it('setupWatcher refreshes available list when new .shtml files appear', async () => {
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
     const watcher = new FsWatcher();

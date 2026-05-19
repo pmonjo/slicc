@@ -67,6 +67,23 @@ export interface SprinkleManagerOptions {
    * disruptive.
    */
   autoOpenBehavior?: 'activate' | 'attention';
+  /**
+   * Fired after `sendToSprinkle` pushes data to the local renderer.
+   * `page-leader-tray.ts` wires this to `LeaderSyncManager.broadcastSprinkleUpdate`
+   * so followers receive the agent's push (`sprinkle.update` over the
+   * WebRTC channel). Without this hook, `sendToSprinkle` updates only
+   * the leader's local renderer — followers see the static initial
+   * content but never the live state changes the agent pushes, and
+   * the only way to recover is a manual snapshot refresh.
+   *
+   * Fires only when the named sprinkle is currently open locally;
+   * skipped for closed sprinkles (matches the local-render behavior
+   * — there's nothing to update on the leader side either).
+   *
+   * Hook exceptions are caught and logged — a broken broadcaster
+   * must not skip the local renderer push or break the sprinkle.
+   */
+  onSendToSprinkle?: (name: string, data: unknown) => void;
 }
 
 /**
@@ -109,6 +126,7 @@ export class SprinkleManager {
   private inflightRefresh: Promise<void> | null = null;
   private lastRefreshAt = 0;
   private autoOpenBehavior: 'activate' | 'attention';
+  private onSendToSprinkle?: (name: string, data: unknown) => void;
 
   constructor(
     fs: VirtualFS,
@@ -121,6 +139,18 @@ export class SprinkleManager {
     this.bridge = new SprinkleBridge(fs, lickHandler, (name) => this.close(name), stopConeHandler);
     this.callbacks = callbacks;
     this.autoOpenBehavior = options.autoOpenBehavior ?? 'activate';
+    this.onSendToSprinkle = options.onSendToSprinkle;
+  }
+
+  /**
+   * Replace the leader-broadcast hook after construction. Used by the
+   * page-leader-tray boot path where the `LeaderSyncManager` is created
+   * AFTER the `SprinkleManager` (chicken-and-egg: the tray needs callbacks
+   * the manager provides, so the manager exists first). Calling this with
+   * `undefined` detaches the hook (e.g., on `host reset`).
+   */
+  setSendToSprinkleHook(hook: ((name: string, data: unknown) => void) | undefined): void {
+    this.onSendToSprinkle = hook;
   }
 
   /** Restore sprinkles that were open in the previous session.
@@ -448,5 +478,20 @@ export class SprinkleManager {
     // In extension mode, listeners are inside the sandbox iframe.
     // Forward via the renderer's postMessage channel.
     entry.renderer.pushUpdate(data);
+    // Notify the broadcast hook (wired by `page-leader-tray.ts` to
+    // `LeaderSyncManager.broadcastSprinkleUpdate`) so followers receive
+    // the same payload as a `sprinkle.update` over the WebRTC channel.
+    // Hook exceptions are swallowed — a broken broadcaster must not
+    // skip or undo the local pushes above.
+    if (this.onSendToSprinkle) {
+      try {
+        this.onSendToSprinkle(name, data);
+      } catch (err) {
+        log.warn('onSendToSprinkle hook threw', {
+          name,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
   }
 }
