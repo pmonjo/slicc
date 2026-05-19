@@ -1520,6 +1520,99 @@ describe('FollowerSyncManager', () => {
       await expect(pending).rejects.toThrow(/closed|disconnect/i);
     });
 
+    // F-2: the standalone-follower path calls `fetchSprinkleContent`
+    // without an external timeout wrapper (extension uses the panel
+    // proxy's 15s timer instead). Without an internal timeout a stuck
+    // leader would hold the controller's `opening` lock forever.
+    it('fetchSprinkleContent times out after sprinkleFetchTimeoutMs when the leader never replies', async () => {
+      vi.useFakeTimers();
+      try {
+        const channel = new FakeChannel();
+        const follower = new FollowerSyncManager(channel, { sprinkleFetchTimeoutMs: 1000 });
+        const pending = follower
+          .fetchSprinkleContent('stuck')
+          .then((c) => ({ ok: true as const, c }))
+          .catch((err: Error) => ({ ok: false as const, err }));
+
+        await vi.advanceTimersByTimeAsync(1001);
+        const result = await pending;
+        expect(result.ok).toBe(false);
+        if (result.ok) throw new Error('unreachable');
+        expect(result.err.message).toMatch(/timed out after 1000ms/);
+
+        // After timeout the lockstep maps must be empty so a re-fetch
+        // for the same name issues a brand-new sprinkle.fetch.
+        const before = channel.sent.length;
+        const second = follower.fetchSprinkleContent('stuck');
+        // Re-fetch sent (lockstep maps were cleaned up).
+        expect(channel.sent.length).toBeGreaterThan(before);
+        const sent = channel.parseSent();
+        const lastSent = sent[sent.length - 1];
+        if (lastSent.type !== 'sprinkle.fetch') throw new Error('expected sprinkle.fetch');
+        // Resolve the second fetch so the test can shut down cleanly.
+        channel.simulateLeaderMessage({
+          type: 'sprinkle.content',
+          requestId: lastSent.requestId,
+          sprinkleName: 'stuck',
+          content: '<p>finally</p>',
+        });
+        await expect(second).resolves.toBe('<p>finally</p>');
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('fetchSprinkleContent timeout does not reject sibling waiters that joined the same fetch', async () => {
+      // Two concurrent callers latch onto a single in-flight request.
+      // When the FIRST caller's wrapper times out, only that promise
+      // should reject — the second caller's timer is still running and
+      // its waiter is preserved (the cancel only fires when the LAST
+      // waiter gives up).
+      vi.useFakeTimers();
+      try {
+        const channel = new FakeChannel();
+        const follower = new FollowerSyncManager(channel, { sprinkleFetchTimeoutMs: 2000 });
+
+        // First caller: timer set at t=0, fires at t=2000.
+        const first = follower
+          .fetchSprinkleContent('big')
+          .then((c) => ({ ok: true as const, c }))
+          .catch((err: Error) => ({ ok: false as const, err }));
+
+        // Second caller joins 500ms later: timer set at t=500, fires at t=2500.
+        await vi.advanceTimersByTimeAsync(500);
+        const second = follower
+          .fetchSprinkleContent('big')
+          .then((c) => ({ ok: true as const, c }))
+          .catch((err: Error) => ({ ok: false as const, err }));
+
+        // Advance past first deadline, before second.
+        await vi.advanceTimersByTimeAsync(1501); // now t=2001
+        const firstResult = await first;
+        expect(firstResult.ok).toBe(false);
+
+        // Sibling still in-flight — deliver content.
+        const sent = channel.parseSent();
+        const fetchMsg = sent.find((m) => m.type === 'sprinkle.fetch');
+        if (!fetchMsg || fetchMsg.type !== 'sprinkle.fetch') {
+          throw new Error('expected sprinkle.fetch');
+        }
+        channel.simulateLeaderMessage({
+          type: 'sprinkle.content',
+          requestId: fetchMsg.requestId,
+          sprinkleName: 'big',
+          content: '<p>arrived just in time</p>',
+        });
+
+        const secondResult = await second;
+        expect(secondResult.ok).toBe(true);
+        if (!secondResult.ok) throw new Error('unreachable');
+        expect(secondResult.c).toBe('<p>arrived just in time</p>');
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
     it('handleDisconnect (via channel close) rejects pending sprinkle fetches', async () => {
       const channel = new FakeChannel();
       const follower = new FollowerSyncManager(channel);
@@ -1528,6 +1621,45 @@ describe('FollowerSyncManager', () => {
       channel.simulateClose();
 
       await expect(pending).rejects.toThrow(/closed|disconnect/i);
+    });
+
+    // F-1: prior to this PR's cleanup pass, `close()` and
+    // `handleDisconnect()` only rejected sprinkle waiters. Pending
+    // `openRemoteTab` and `sendFsRequest` callers would hang forever
+    // when the leader disconnected, because a fresh
+    // `FollowerSyncManager` is constructed on reconnect and the
+    // original resolvers never resolve. These guard the symmetry.
+    it('close rejects pending openRemoteTab callers so they do not hang on reconnect', async () => {
+      const channel = new FakeChannel();
+      const follower = new FollowerSyncManager(channel);
+
+      const pending = follower
+        .openRemoteTab('follower-1', 'https://example.test')
+        .then((id) => ({ ok: true as const, id }))
+        .catch((err: Error) => ({ ok: false as const, err }));
+      follower.close();
+      const result = await pending;
+      expect(result.ok).toBe(false);
+      if (result.ok) throw new Error('unreachable');
+      expect(result.err.message).toMatch(/closed|disconnect/i);
+    });
+
+    it('handleDisconnect rejects pending sendFsRequest callers symmetrically', async () => {
+      const channel = new FakeChannel();
+      const follower = new FollowerSyncManager(channel);
+
+      const pending = follower
+        .sendFsRequest('follower-1', {
+          op: 'readFile',
+          path: '/workspace/x',
+        })
+        .then((r) => ({ ok: true as const, r }))
+        .catch((err: Error) => ({ ok: false as const, err }));
+      channel.simulateClose();
+      const result = await pending;
+      expect(result.ok).toBe(false);
+      if (result.ok) throw new Error('unreachable');
+      expect(result.err.message).toMatch(/closed|disconnect/i);
     });
 
     it('does not crash on sprinkles.list when no callback is registered', () => {

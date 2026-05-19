@@ -66,7 +66,20 @@ export interface FollowerSyncManagerOptions {
   onSprinklesList?: (sprinkles: SprinkleSummary[]) => void;
   /** Called when the leader sends a `sprinkle.update` payload (mirrors `SprinkleManager.sendToSprinkle`). */
   onSprinkleUpdate?: (sprinkleName: string, data: unknown) => void;
+  /**
+   * Bound on every `fetchSprinkleContent` call. If the leader never
+   * answers a `sprinkle.fetch` (deadlocked agent, partial chunked
+   * transfer abandoned, leader still connected but stuck), the
+   * standalone follower would otherwise hang the controller's `opening`
+   * lock forever. The extension panel proxy bounds the same call
+   * separately at its own layer; this option covers the standalone
+   * flow that has no intermediary. Defaults to 15 s — matches
+   * `DEFAULT_FETCH_TIMEOUT_MS` in `follower-sprinkle-bridge.ts`.
+   */
+  sprinkleFetchTimeoutMs?: number;
 }
+
+const DEFAULT_SPRINKLE_FETCH_TIMEOUT_MS = 15000;
 
 /** Internal buffer for chunked sprinkle.content reassembly. Mirrors the
  *  `SprinkleFetchBuffer` Swift struct nested inside the `AppState` class in
@@ -224,8 +237,37 @@ export class FollowerSyncManager implements AgentHandle {
     this.sync.close();
     this.eventListeners.clear();
     this.cleanupCDPEventForwarding();
-    this.rejectPendingSprinkleFetches('Follower sync closed');
+    this.rejectPendingRequests('Follower sync closed');
     log.info('Follower sync closed');
+  }
+
+  /**
+   * Reject every pending request waiting on the leader and clear the
+   * associated buffers. Called from both `close()` (caller-initiated
+   * shutdown) and `handleDisconnect()` (channel drop / keepalive death).
+   *
+   * Before this method existed, only `sprinkleContentWaiters` got drained
+   * on disconnect — `tabOpenResolvers`, `fsResolvers`, in-flight
+   * `cdpChunkBuffers`, and active `remoteTransports` all leaked. Any
+   * caller awaiting `openRemoteTab()`, `sendFsRequest()`, or a
+   * `RemoteCDPTransport.send()` past a disconnect would hang forever,
+   * because a fresh `FollowerSyncManager` is constructed on reconnect
+   * and the original resolvers never resolve.
+   *
+   * `RemoteCDPTransport.disconnect()` rejects its own pending CDP
+   * promises and clears them, so we don't need to walk into each
+   * transport's internals.
+   */
+  private rejectPendingRequests(reason: string): void {
+    this.rejectPendingSprinkleFetches(reason);
+    const err = new Error(reason);
+    for (const { reject } of this.tabOpenResolvers.values()) reject(err);
+    this.tabOpenResolvers.clear();
+    for (const { reject } of this.fsResolvers.values()) reject(err);
+    this.fsResolvers.clear();
+    this.cdpChunkBuffers.clear();
+    for (const transport of this.remoteTransports.values()) transport.disconnect();
+    this.remoteTransports.clear();
   }
 
   /** Advertise local browser targets to the leader. */
@@ -264,10 +306,47 @@ export class FollowerSyncManager implements AgentHandle {
     const cached = this.sprinkleContentCache.get(sprinkleName);
     if (cached !== undefined) return Promise.resolve(cached);
 
+    const timeoutMs = this.options.sprinkleFetchTimeoutMs ?? DEFAULT_SPRINKLE_FETCH_TIMEOUT_MS;
+
     return new Promise<string>((resolve, reject) => {
+      // Per-waiter timer — when this fetch's caller times out, only this
+      // waiter rejects; siblings that joined the same in-flight request
+      // keep waiting (or get cancelled together when the LAST waiter
+      // gives up, since `cancelSprinkleFetch` drains them all).
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const wrapResolve = (content: string) => {
+        if (timer !== undefined) clearTimeout(timer);
+        resolve(content);
+      };
+      const wrapReject = (err: Error) => {
+        if (timer !== undefined) clearTimeout(timer);
+        reject(err);
+      };
+
       const waiters = this.sprinkleContentWaiters.get(sprinkleName) ?? [];
-      waiters.push({ resolve, reject });
+      waiters.push({ resolve: wrapResolve, reject: wrapReject });
       this.sprinkleContentWaiters.set(sprinkleName, waiters);
+
+      if (timeoutMs > 0) {
+        timer = setTimeout(() => {
+          // Drop just this caller's waiter; the in-flight fetch lives
+          // on for the others. If we were the last waiter, cancel the
+          // whole fetch so the three lockstep maps don't leak.
+          const list = this.sprinkleContentWaiters.get(sprinkleName);
+          if (list) {
+            const idx = list.findIndex((w) => w.resolve === wrapResolve);
+            if (idx >= 0) list.splice(idx, 1);
+            if (list.length === 0) {
+              this.sprinkleContentWaiters.delete(sprinkleName);
+              this.cancelSprinkleFetch(
+                sprinkleName,
+                `Sprinkle fetch for "${sprinkleName}" timed out after ${timeoutMs}ms`
+              );
+            }
+          }
+          reject(new Error(`Sprinkle fetch for "${sprinkleName}" timed out after ${timeoutMs}ms`));
+        }, timeoutMs);
+      }
 
       // Only one in-flight request per name. Subsequent calls latch onto the
       // same waiter list.
@@ -360,7 +439,7 @@ export class FollowerSyncManager implements AgentHandle {
     this.cleanupCDPEventForwarding();
     this.unsubscribe();
     this.sync.close();
-    this.rejectPendingSprinkleFetches(`Follower sync disconnected: ${reason}`);
+    this.rejectPendingRequests(`Follower sync disconnected: ${reason}`);
 
     // Notify higher-level code for potential reconnection
     this.options.onDisconnect?.(reason);
