@@ -1826,6 +1826,48 @@ describe('FollowerSyncManager', () => {
       await expect(second).resolves.toBe('v2');
     });
 
+    it('R3-IMP: cache write that races a sprinkles.list broadcast is discarded', async () => {
+      // Scenario: a fetch is in-flight when `sprinkles.list` arrives. The
+      // late `sprinkle.content` reply must NOT overwrite the cache —
+      // otherwise the next fetcher gets pre-list stale content forever.
+      const channel = new FakeChannel();
+      const follower = new FollowerSyncManager(channel);
+
+      const first = follower.fetchSprinkleContent('x');
+      const sent1 = channel.parseSent()[0];
+      if (sent1.type !== 'sprinkle.fetch') throw new Error('unreachable');
+
+      // Leader broadcasts a fresh list BEFORE the first reply comes back.
+      channel.simulateLeaderMessage({
+        type: 'sprinkles.list',
+        sprinkles: [{ name: 'x', title: 'X', path: '/x.shtml', open: true, autoOpen: false }],
+      });
+
+      // The original reply arrives — must resolve waiters but must NOT
+      // write the cache (content is from before the list barrier).
+      channel.simulateLeaderMessage({
+        type: 'sprinkle.content',
+        requestId: sent1.requestId,
+        sprinkleName: 'x',
+        content: 'stale-v1',
+      });
+      await expect(first).resolves.toBe('stale-v1');
+
+      // A subsequent fetch must go on the wire — cache must NOT have
+      // been populated by the racing reply.
+      const second = follower.fetchSprinkleContent('x');
+      const fetches = channel.parseSent().filter((m) => m.type === 'sprinkle.fetch');
+      expect(fetches).toHaveLength(2);
+      if (fetches[1].type !== 'sprinkle.fetch') throw new Error('unreachable');
+      channel.simulateLeaderMessage({
+        type: 'sprinkle.content',
+        requestId: fetches[1].requestId,
+        sprinkleName: 'x',
+        content: 'fresh-v2',
+      });
+      await expect(second).resolves.toBe('fresh-v2');
+    });
+
     it('also drops cache entries for sprinkles that disappeared from the list', async () => {
       const channel = new FakeChannel();
       const follower = new FollowerSyncManager(channel);

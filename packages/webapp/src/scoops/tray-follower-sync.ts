@@ -132,6 +132,17 @@ export class FollowerSyncManager implements AgentHandle {
     string,
     Array<{ resolve: (content: string) => void; reject: (err: Error) => void }>
   >();
+  /**
+   * Monotonic counter incremented on every `sprinkles.list` arrival.
+   * In-flight fetches are stamped with the current value at issue time;
+   * `handleSprinkleContent` only writes to `sprinkleContentCache` when the
+   * stamp still matches. Closes the cache-write-races-list race
+   * (R3-IMP): if a fetch's content reply lands AFTER a list barrier,
+   * it's content from the pre-barrier world and must not be cached.
+   */
+  private cacheEpoch = 0;
+  /** Per-requestId epoch stamp captured at `fetchSprinkleContent` time. */
+  private readonly fetchEpoch = new Map<string, number>();
   constructor(
     channel: TrayDataChannelLike,
     private readonly options: FollowerSyncManagerOptions = {}
@@ -269,6 +280,10 @@ export class FollowerSyncManager implements AgentHandle {
         chunks: new Map(),
         totalChunks: 1,
       });
+      // Stamp this fetch with the current cache epoch. If the epoch
+      // advances (via a `sprinkles.list` broadcast) before the reply
+      // lands, the cache write at reassembly time will be skipped.
+      this.fetchEpoch.set(requestId, this.cacheEpoch);
       this.sync.send({ type: 'sprinkle.fetch', requestId, sprinkleName });
     });
   }
@@ -289,10 +304,13 @@ export class FollowerSyncManager implements AgentHandle {
    * all current waiters so callers don't accumulate across retries when
    * the panel-side proxy gave up on the original fetch (R2-IMP-2).
    *
-   * The offscreen still tracks the requestId in `pendingSprinkleFetches`
-   * because a late `sprinkle.content` reply might still arrive and we want
-   * the chunked-content guard to drop it cleanly (matches the
-   * unknown-requestId path in `handleSprinkleContent`).
+   * Also clears the requestId from `pendingSprinkleFetches` and the
+   * `inflightSprinkleByName` lookup. A late `sprinkle.content` reply for
+   * the cancelled requestId then falls into the unknown-requestId branch
+   * in `handleSprinkleContent` and is silently dropped — that's what
+   * prevents the cache from being poisoned by a stale post-cancel reply.
+   * The next `fetchSprinkleContent(sprinkleName)` call goes back on the
+   * wire cleanly instead of latching onto an orphan requestId.
    */
   cancelSprinkleFetch(sprinkleName: string, reason = 'fetch cancelled'): void {
     const waiters = this.sprinkleContentWaiters.get(sprinkleName) ?? [];
@@ -301,6 +319,7 @@ export class FollowerSyncManager implements AgentHandle {
     if (requestId !== undefined) {
       this.inflightSprinkleByName.delete(sprinkleName);
       this.pendingSprinkleFetches.delete(requestId);
+      this.fetchEpoch.delete(requestId);
     }
     if (waiters.length === 0) return;
     const err = new Error(reason);
@@ -455,23 +474,19 @@ export class FollowerSyncManager implements AgentHandle {
         log.info('Sprinkles list received from leader', {
           sprinkleCount: message.sprinkles.length,
         });
-        // Invalidate cached `.shtml` content for every named sprinkle in
-        // the new list (R2-IMP-3). A `sprinkles.list` broadcast is the
-        // leader's natural cache-barrier signal — the .shtml file may
-        // have changed on the leader between broadcasts. Without this,
-        // a fetch that timed out panel-side but resolved late on the
-        // offscreen could poison the cache permanently. Sprinkles
-        // dropped from the list have their entries removed too so a
-        // re-add later doesn't surface stale content.
-        for (const summary of message.sprinkles) {
-          this.sprinkleContentCache.delete(summary.name);
-        }
-        // Also drop cache entries for sprinkles that disappeared from the
-        // leader's list entirely.
-        const presentNames = new Set(message.sprinkles.map((s) => s.name));
-        for (const cachedName of [...this.sprinkleContentCache.keys()]) {
-          if (!presentNames.has(cachedName)) this.sprinkleContentCache.delete(cachedName);
-        }
+        // Treat every list broadcast as a content invalidation barrier.
+        // The leader has no per-file change signal today; broadcasts are
+        // periodic (~5 s default), so a stable `.shtml` re-invalidates
+        // its cache on every tick. This is conservative — the trade-off
+        // is cache effectiveness during steady state in exchange for
+        // never serving stale content to the user when the leader's
+        // file actually changed. Bumping `cacheEpoch` ALSO discards any
+        // in-flight fetch's content reply that arrives AFTER this
+        // barrier — see `handleSprinkleContent`. Without that, a late
+        // pre-barrier reply could poison the cache for the post-barrier
+        // world.
+        this.sprinkleContentCache.clear();
+        this.cacheEpoch++;
         this.latestSprinkles = message.sprinkles;
         this.options.onSprinklesList?.(message.sprinkles);
         break;
@@ -597,14 +612,30 @@ export class FollowerSyncManager implements AgentHandle {
 
     if (assembled === null) return;
 
-    this.sprinkleContentCache.set(sprinkleName, assembled);
+    // Only cache if the fetch was issued in the current cache epoch — a
+    // `sprinkles.list` arriving mid-fetch advances the epoch and signals
+    // the content is from before the cache barrier. Waiters still get
+    // resolved with the content so the original caller isn't penalised
+    // (they asked for this content; the leader's later list broadcast
+    // can't retroactively unsay it). The NEXT fetch goes back on the
+    // wire instead of returning a stale cache hit.
+    const fetchedEpoch = this.fetchEpoch.get(requestId);
+    this.fetchEpoch.delete(requestId);
+    if (fetchedEpoch === this.cacheEpoch) {
+      this.sprinkleContentCache.set(sprinkleName, assembled);
+    }
     this.inflightSprinkleByName.delete(sprinkleName);
     const waiters = this.sprinkleContentWaiters.get(sprinkleName) ?? [];
     this.sprinkleContentWaiters.delete(sprinkleName);
     for (const waiter of waiters) waiter.resolve(assembled);
   }
 
-  /** Reject every pending sprinkle fetch with the given reason. */
+  /**
+   * Reject every pending sprinkle fetch with the given reason. Also clears
+   * the `fetchEpoch` map — without this, a future fetch with the same
+   * requestId (e.g. across a reconnect with stale clock collisions) could
+   * see a leftover epoch stamp and write stale content to the cache.
+   */
   private rejectPendingSprinkleFetches(reason: string): void {
     const err = new Error(reason);
     for (const [, waiters] of this.sprinkleContentWaiters) {
@@ -613,6 +644,7 @@ export class FollowerSyncManager implements AgentHandle {
     this.sprinkleContentWaiters.clear();
     this.pendingSprinkleFetches.clear();
     this.inflightSprinkleByName.clear();
+    this.fetchEpoch.clear();
   }
 
   private emitEvent(event: AgentEvent): void {

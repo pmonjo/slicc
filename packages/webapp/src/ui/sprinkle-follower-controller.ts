@@ -29,14 +29,18 @@ const log = createLogger('sprinkle-follower');
  * Subset of `FollowerSyncManager` that the controller relies on. Kept narrow
  * to make the controller trivially testable with a hand-rolled fake.
  *
- * `cancelSprinkleFetch` is optional: only the real `FollowerSyncManager`
- * (offscreen bridge surface) implements it. The controller itself never
- * calls cancel — the bridge does, when the panel-side proxy times out.
+ * `cancelSprinkleFetch` is **required**, not optional — the bridge calls it
+ * when the panel-side proxy times out, and a sync that silently drops the
+ * cancel would let offscreen waiters accumulate across panel retries
+ * (R2-IMP-2). Implementations whose `fetchSprinkleContent` is already
+ * self-bounding (e.g. `PanelFollowerSprinkleProxy` with its own pending
+ * timer) MAY provide a no-op body — but the method must be present so the
+ * compiler catches a future sync surface that forgets to implement it.
  */
 export interface SprinkleFollowerSync {
   fetchSprinkleContent(sprinkleName: string): Promise<string>;
   sendSprinkleLick(sprinkleName: string, body: unknown, targetScoop?: string): void;
-  cancelSprinkleFetch?(sprinkleName: string, reason?: string): void;
+  cancelSprinkleFetch(sprinkleName: string, reason?: string): void;
 }
 
 export interface SprinkleFollowerControllerOptions {
@@ -184,6 +188,14 @@ export class SprinkleFollowerController {
     for (const name of [...this.open.keys()]) this.closeLocally(name);
     this.pendingUpdates.clear();
     this.latestDesiredOpen.clear();
+    // Sprinkles still in `opening` (in-flight `openLocally` mid-await) have
+    // bridge listeners registered against `updateListeners` that
+    // `closeLocally` above didn't clear (because they aren't in `this.open`
+    // yet). The post-render cleanup branch in `openLocally` will handle
+    // them when its await resolves, but clearing here defends against a
+    // future change to that branch and against GC retention through the
+    // unsubscribed bridge closures.
+    this.updateListeners.clear();
   }
 
   // ---------------------------------------------------------------------------
@@ -248,8 +260,13 @@ export class SprinkleFollowerController {
 
     // The controller may have been disposed (or the leader may have closed
     // this sprinkle) while render was running. Tear down rather than
-    // attach.
+    // attach. Must mirror `closeLocally` exactly — in particular clearing
+    // `updateListeners` so a CLI-inline `slicc.on('update', cb)` registered
+    // during the just-completed render doesn't leak into a future re-open.
     if (this.disposed || !this.latestDesiredOpen.has(name)) {
+      this.updateListeners.delete(name);
+      this.opening.delete(name);
+      this.pendingUpdates.delete(name);
       try {
         renderer.dispose();
       } catch (err) {
@@ -267,8 +284,6 @@ export class SprinkleFollowerController {
           error: err instanceof Error ? err.message : String(err),
         });
       }
-      this.opening.delete(name);
-      this.pendingUpdates.delete(name);
       return;
     }
 

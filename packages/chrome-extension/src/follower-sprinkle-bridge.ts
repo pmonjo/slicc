@@ -187,9 +187,12 @@ export class PanelFollowerSprinkleProxy implements SprinkleFollowerSync {
         this.pending.delete(id);
         // Tell the offscreen its corresponding waiter is no longer
         // needed, so a stuck leader doesn't accumulate waiters across
-        // panel retries (R2-IMP-2). The offscreen still tracks the
-        // requestId in case a late `sprinkle.content` arrives — the
-        // unknown-requestId guard in `handleSprinkleContent` will drop it.
+        // panel retries (R2-IMP-2). The offscreen-side
+        // `cancelSprinkleFetch` deletes the requestId from
+        // `pendingSprinkleFetches`; any late `sprinkle.content` reply
+        // then hits the unknown-requestId branch in
+        // `handleSprinkleContent` and is silently dropped — preventing
+        // cache poisoning from a post-cancel reply.
         const cancel: FollowerSprinkleFetchCancelMsg = {
           type: 'follower-sprinkle-fetch-cancel',
           sprinkleName,
@@ -209,6 +212,20 @@ export class PanelFollowerSprinkleProxy implements SprinkleFollowerSync {
       };
       this.sender.send({ source: 'panel', payload });
     });
+  }
+
+  /**
+   * No-op on the panel side. Required by `SprinkleFollowerSync` for
+   * type-safety so future implementations can't silently drop cancel
+   * support, but the panel proxy doesn't need to do anything here: its
+   * `pending` Map is already cleared in `fetchSprinkleContent`'s timeout
+   * handler before the cancel envelope is even emitted. Provided so the
+   * controller can be wired against the panel proxy without TypeScript
+   * complaints; in practice the controller never invokes cancel against
+   * the proxy anyway (it doesn't know about the panel↔offscreen boundary).
+   */
+  cancelSprinkleFetch(_sprinkleName: string, _reason?: string): void {
+    /* see docstring */
   }
 
   sendSprinkleLick(sprinkleName: string, body: unknown, targetScoop?: string): void {
@@ -283,7 +300,10 @@ export function connectOffscreenFollowerSprinkleBridge(
       'follower-sprinkle-fetch-cancel'
     );
     if (cancelReq) {
-      sync.cancelSprinkleFetch?.(
+      // `cancelSprinkleFetch` is required by the `SprinkleFollowerSync`
+      // interface (round-3 type-design fix). No optional chain — a sync
+      // surface that forgets to implement it is now a compile error.
+      sync.cancelSprinkleFetch(
         cancelReq.sprinkleName,
         'panel-side fetch timed out — offscreen waiter cancelled'
       );

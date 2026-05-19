@@ -43,16 +43,19 @@ function createBus() {
 function makeOffscreenSync(): SprinkleFollowerSync & {
   fetched: string[];
   licks: Array<{ name: string; body: unknown; targetScoop?: string }>;
+  cancels: Array<{ name: string; reason?: string }>;
   contentByName: Map<string, string>;
   rejectNext?: Error;
 } {
   const fetched: string[] = [];
   const licks: Array<{ name: string; body: unknown; targetScoop?: string }> = [];
+  const cancels: Array<{ name: string; reason?: string }> = [];
   const contentByName = new Map<string, string>();
   const surface = {
     contentByName,
     fetched,
     licks,
+    cancels,
     rejectNext: undefined as Error | undefined,
     async fetchSprinkleContent(name: string): Promise<string> {
       fetched.push(name);
@@ -63,6 +66,9 @@ function makeOffscreenSync(): SprinkleFollowerSync & {
     },
     sendSprinkleLick(name: string, body: unknown, targetScoop?: string): void {
       licks.push({ name, body, targetScoop });
+    },
+    cancelSprinkleFetch(name: string, reason?: string): void {
+      cancels.push({ name, reason });
     },
   };
   return surface;
@@ -201,6 +207,7 @@ describe('PanelFollowerSprinkleProxy ↔ OffscreenFollowerSprinkleBridge', () =>
           resolveFetch = r;
         }),
       sendSprinkleLick: () => {},
+      cancelSprinkleFetch: () => {},
     };
     const bridge = connectOffscreenFollowerSprinkleBridge(bus2.offscreenHub, stuckSync);
     const proxy = new PanelFollowerSprinkleProxy(
@@ -246,6 +253,45 @@ describe('PanelFollowerSprinkleProxy ↔ OffscreenFollowerSprinkleBridge', () =>
     const proxy = new PanelFollowerSprinkleProxy(bus.panelSender, bus.panelSubscriber);
     proxy.dispose();
     await expect(proxy.fetchSprinkleContent('x')).rejects.toThrow(/disposed/);
+  });
+
+  // R3 cancel round-trip: panel-side timeout must emit a
+  // follower-sprinkle-fetch-cancel envelope; the offscreen bridge must
+  // dispatch that to sync.cancelSprinkleFetch. The R2 work tested only
+  // the panel timeout side; this verifies the full wire.
+  it('panel timeout emits follower-sprinkle-fetch-cancel that reaches sync.cancelSprinkleFetch', async () => {
+    // Use a sync that hangs the fetch so the panel times out.
+    const bus2 = createBus();
+    const hangingSync = makeOffscreenSync();
+    // No content stub → fetchSprinkleContent throws synchronously. Replace
+    // with a hanging promise to keep it pending until timeout.
+    hangingSync.fetchSprinkleContent = (_name: string) => new Promise<string>(() => {});
+    connectOffscreenFollowerSprinkleBridge(bus2.offscreenHub, hangingSync);
+    const proxy = new PanelFollowerSprinkleProxy(
+      bus2.panelSender,
+      bus2.panelSubscriber,
+      {},
+      { fetchTimeoutMs: 20 }
+    );
+
+    await expect(proxy.fetchSprinkleContent('welcome')).rejects.toThrow(/timed out/i);
+    // The cancel envelope traveled the wire and reached sync.cancelSprinkleFetch.
+    expect(hangingSync.cancels).toHaveLength(1);
+    expect(hangingSync.cancels[0].name).toBe('welcome');
+    expect(hangingSync.cancels[0].reason).toMatch(/panel-side fetch timed out/);
+  });
+
+  it('cancel envelope without a fetch still routes through to sync.cancelSprinkleFetch', () => {
+    // Direct push to verify the offscreen-bridge cancel-arm wiring
+    // independent of the timeout path.
+    bus.panelSender.send({
+      source: 'panel',
+      payload: { type: 'follower-sprinkle-fetch-cancel', sprinkleName: 'welcome' },
+    });
+
+    expect(offscreenSync.cancels).toEqual([
+      { name: 'welcome', reason: 'panel-side fetch timed out — offscreen waiter cancelled' },
+    ]);
   });
 
   // R2-IMP-1: `narrowMsg`-guarded paths must drop malformed envelopes

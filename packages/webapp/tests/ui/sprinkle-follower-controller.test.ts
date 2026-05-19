@@ -529,4 +529,94 @@ describe('SprinkleFollowerController', () => {
       expect(received).toEqual([]);
     });
   });
+
+  // ---------------------------------------------------------------------------
+  // R3-CRIT-1: post-render cleanup branch in openLocally — the leader closes
+  // (or the controller is disposed) WHILE renderer.render() is pending.
+  // Listeners registered during render must be cleared along with the
+  // renderer; otherwise a re-open in the same controller fans out to leaked
+  // listeners.
+  // ---------------------------------------------------------------------------
+
+  describe('R3-CRIT-1: post-render cleanup', () => {
+    it('clears updateListeners when leader closes mid-render (and a re-open does not inherit them)', async () => {
+      sync.contentByName.set('x', '<p>ok</p>');
+      const renderGate = FakeRenderer.installManualRender('x');
+
+      // Open the sprinkle.
+      const first = controller.updateAvailable([makeSprinkle('x', { open: true })]);
+      // Let openLocally enter render.
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(FakeRenderer.instances).toHaveLength(1);
+
+      // Simulate a sprinkle script that registers a listener synchronously
+      // during render (CLI inline mode does this).
+      const firstReceived: unknown[] = [];
+      FakeRenderer.instances[0].api.on('update', (data) => firstReceived.push(data));
+
+      // Leader closes the sprinkle while render is still pending.
+      await controller.updateAvailable([]);
+      // Resolve render — controller enters the post-render cleanup branch.
+      renderGate.resolve();
+      await first;
+      expect(addSprinkle).toHaveBeenCalledTimes(1);
+      expect(removeSprinkle).toHaveBeenCalledWith('x');
+
+      // Re-open the sprinkle. The new renderer's listeners are separate;
+      // the first renderer's listener must NOT receive updates.
+      sync.contentByName.set('x', '<p>v2</p>');
+      await controller.updateAvailable([makeSprinkle('x', { open: true })]);
+      expect(FakeRenderer.instances).toHaveLength(2);
+      controller.handleSprinkleUpdate('x', { step: 'after-reopen' });
+
+      // The first renderer's listener never registered against the controller
+      // permanently — it should be unregistered along with the cleanup.
+      expect(firstReceived).toEqual([]);
+      // The second renderer's renderer.pushUpdate path delivered normally.
+      expect(FakeRenderer.instances[1].pushed).toEqual([{ step: 'after-reopen' }]);
+    });
+
+    it('clears updateListeners when controller is disposed mid-render', async () => {
+      sync.contentByName.set('x', '<p>ok</p>');
+      const renderGate = FakeRenderer.installManualRender('x');
+
+      const first = controller.updateAvailable([makeSprinkle('x', { open: true })]);
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+      const firstReceived: unknown[] = [];
+      FakeRenderer.instances[0].api.on('update', (data) => firstReceived.push(data));
+
+      controller.dispose();
+      renderGate.resolve();
+      await first;
+
+      // After dispose nothing should fire — disposed guard in
+      // handleSprinkleUpdate also catches this.
+      controller.handleSprinkleUpdate('x', { step: 'post-dispose' });
+      expect(firstReceived).toEqual([]);
+    });
+
+    it('post-render cleanup calls renderer.dispose, container.remove, removeSprinkle', async () => {
+      sync.contentByName.set('x', '<p>ok</p>');
+      const renderGate = FakeRenderer.installManualRender('x');
+
+      const first = controller.updateAvailable([makeSprinkle('x', { open: true })]);
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(addSprinkle).toHaveBeenCalledTimes(1);
+      const renderer = FakeRenderer.instances[0];
+
+      // Leader closes mid-render.
+      await controller.updateAvailable([]);
+      renderGate.resolve();
+      await first;
+
+      expect(renderer.disposed).toBe(true);
+      expect(removeSprinkle).toHaveBeenCalledWith('x');
+    });
+  });
 });
