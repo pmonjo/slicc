@@ -98,6 +98,7 @@ function makeSprinkle(name: string, opts: Partial<SprinkleSummary> = {}): Sprink
 interface FakeSync extends SprinkleFollowerSync {
   fetched: string[];
   licks: Array<{ name: string; body: unknown; targetScoop?: string }>;
+  cancels: Array<{ name: string; reason?: string }>;
   contentByName: Map<string, string>;
   /** When set for a given name, calls to `fetchSprinkleContent(name)` resolve
    *  only when the test invokes the returned resolver. Used to drive timing
@@ -112,14 +113,21 @@ function makeFakeSync(): FakeSync {
   const contentByName = new Map<string, string>();
   const fetched: string[] = [];
   const licks: Array<{ name: string; body: unknown; targetScoop?: string }> = [];
+  const cancels: Array<{ name: string; reason?: string }> = [];
   const manualGate = new Map<
     string,
     { resolve: (content: string) => void; reject: (err: Error) => void }
   >();
 
-  const sync = {
+  // Built as a structurally-complete `SprinkleFollowerSync` so the
+  // controller's compile-time guarantee (cancelSprinkleFetch is
+  // required — R3 type design) holds for the test fake too. A future
+  // controller change that adds a `this.sync.cancelSprinkleFetch(...)`
+  // call must not silently fall through to a `cancels`-less fake.
+  const sync: FakeSync = {
     fetched,
     licks,
+    cancels,
     contentByName,
     fetchSprinkleContent: vi.fn(async (name: string): Promise<string> => {
       fetched.push(name);
@@ -138,6 +146,9 @@ function makeFakeSync(): FakeSync {
     sendSprinkleLick: vi.fn((name: string, body: unknown, targetScoop?: string) => {
       licks.push({ name, body, targetScoop });
     }),
+    cancelSprinkleFetch: vi.fn((name: string, reason?: string) => {
+      cancels.push({ name, reason });
+    }),
     installManualFetch(name: string) {
       const handle = {
         resolve: (() => {}) as (content: string) => void,
@@ -147,7 +158,7 @@ function makeFakeSync(): FakeSync {
       return handle;
     },
   };
-  return sync as FakeSync;
+  return sync;
 }
 
 describe('SprinkleFollowerController', () => {

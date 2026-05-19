@@ -304,13 +304,17 @@ export class FollowerSyncManager implements AgentHandle {
    * all current waiters so callers don't accumulate across retries when
    * the panel-side proxy gave up on the original fetch (R2-IMP-2).
    *
-   * Also clears the requestId from `pendingSprinkleFetches` and the
-   * `inflightSprinkleByName` lookup. A late `sprinkle.content` reply for
-   * the cancelled requestId then falls into the unknown-requestId branch
-   * in `handleSprinkleContent` and is silently dropped — that's what
-   * prevents the cache from being poisoned by a stale post-cancel reply.
-   * The next `fetchSprinkleContent(sprinkleName)` call goes back on the
-   * wire cleanly instead of latching onto an orphan requestId.
+   * Clears the requestId from `pendingSprinkleFetches`, the
+   * `inflightSprinkleByName` lookup, and the `fetchEpoch` stamp — every
+   * site that removes a `pendingSprinkleFetches` entry must keep the
+   * three Maps in lockstep, otherwise an orphan epoch stamp could
+   * mis-classify a future re-used requestId. A late `sprinkle.content`
+   * reply for the cancelled requestId then falls into the
+   * unknown-requestId branch in `handleSprinkleContent` and is silently
+   * dropped — that's what prevents the cache from being poisoned by a
+   * stale post-cancel reply. The next `fetchSprinkleContent(sprinkleName)`
+   * call goes back on the wire cleanly instead of latching onto an
+   * orphan requestId.
    */
   cancelSprinkleFetch(sprinkleName: string, reason = 'fetch cancelled'): void {
     const waiters = this.sprinkleContentWaiters.get(sprinkleName) ?? [];
@@ -540,6 +544,11 @@ export class FollowerSyncManager implements AgentHandle {
       log.warn('sprinkle.content error from leader', { sprinkleName, error });
       this.pendingSprinkleFetches.delete(requestId);
       this.inflightSprinkleByName.delete(sprinkleName);
+      // Mirror the cancel/reject/success paths: every removal from
+      // `pendingSprinkleFetches` must drop the matching `fetchEpoch`
+      // stamp too. Without this, leader-returned errors leak one Map
+      // entry per error for the session lifetime (R4 hygiene fix).
+      this.fetchEpoch.delete(requestId);
       const waiters = this.sprinkleContentWaiters.get(sprinkleName) ?? [];
       this.sprinkleContentWaiters.delete(sprinkleName);
       for (const waiter of waiters) waiter.reject(new Error(error));
