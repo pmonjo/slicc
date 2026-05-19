@@ -123,8 +123,8 @@ describe('SprinkleManager', () => {
   });
 
   it('sendToSprinkle fires the onSendToSprinkle hook when sprinkle is open (leader broadcast wiring)', async () => {
-    // The hook is what `page-leader-tray.ts` wires to
-    // `LeaderSyncManager.broadcastSprinkleUpdate` so followers receive the
+    // The hook is what `ui/main.ts:mainStandaloneWorker` wires to
+    // `pageLeaderTray.sync.broadcastSprinkleUpdate` so followers receive the
     // agent's push. Without it, `sendToSprinkle` updates only the local
     // renderer and followers see nothing until the next snapshot refresh.
     await vfs.writeFile('/shared/sprinkles/dash/dash.shtml', '<title>D</title><div>hi</div>');
@@ -200,6 +200,74 @@ describe('SprinkleManager', () => {
     // a broken broadcaster doesn't break local sprinkles.
     expect(() => mgrWithHook.sendToSprinkle('dash', { x: 1 })).not.toThrow();
     expect(onSendToSprinkle).toHaveBeenCalledTimes(1);
+  });
+
+  // The standalone-leader boot path (`ui/main.ts:mainStandaloneWorker`)
+  // builds `SprinkleManager` unconditionally early, then calls
+  // `setSendToSprinkleHook` AFTER `startPageLeaderTray` returns with the
+  // `LeaderSyncManager`. The constructor-options path covered above is
+  // not exercised by that flow — only the runtime setter is. These tests
+  // close that coverage gap so dropping the `setSendToSprinkleHook` call
+  // would surface here, not in production with a manual-test bug report.
+  it('setSendToSprinkleHook installed after open() fires on the next sendToSprinkle', async () => {
+    await vfs.writeFile('/shared/sprinkles/dash/dash.shtml', '<title>D</title><div>hi</div>');
+    const onSendToSprinkle = vi.fn();
+    await mgr.refresh();
+    await mgr.open('dash');
+    // Hook installed AFTER open — mirrors the leader boot path where
+    // `pageLeaderTray.sync` is constructed lazily inside the
+    // `storedWorkerBaseUrl` branch, well after the manager exists.
+    mgr.setSendToSprinkleHook(onSendToSprinkle);
+
+    mgr.sendToSprinkle('dash', { progress: 0.5 });
+
+    expect(onSendToSprinkle).toHaveBeenCalledTimes(1);
+    expect(onSendToSprinkle).toHaveBeenCalledWith('dash', { progress: 0.5 });
+  });
+
+  it('setSendToSprinkleHook(undefined) detaches a previously-installed hook', async () => {
+    await vfs.writeFile('/shared/sprinkles/dash/dash.shtml', '<title>D</title><div>hi</div>');
+    const onSendToSprinkle = vi.fn();
+    await mgr.refresh();
+    await mgr.open('dash');
+    mgr.setSendToSprinkleHook(onSendToSprinkle);
+    mgr.sendToSprinkle('dash', { a: 1 });
+    expect(onSendToSprinkle).toHaveBeenCalledTimes(1);
+
+    mgr.setSendToSprinkleHook(undefined);
+    mgr.sendToSprinkle('dash', { b: 2 });
+
+    // Still called only once — detach took effect.
+    expect(onSendToSprinkle).toHaveBeenCalledTimes(1);
+  });
+
+  it('setSendToSprinkleHook overrides a constructor-supplied hook', async () => {
+    await vfs.writeFile('/shared/sprinkles/dash/dash.shtml', '<title>D</title><div>hi</div>');
+    const constructorHook = vi.fn();
+    const setterHook = vi.fn();
+    const mgrWithBoth = new SprinkleManager(
+      vfs,
+      lickHandler,
+      {
+        addSprinkle: addSprinkle as unknown as (
+          name: string,
+          title: string,
+          element: HTMLElement
+        ) => void,
+        removeSprinkle: removeSprinkle as unknown as (name: string) => void,
+      },
+      vi.fn(),
+      { onSendToSprinkle: constructorHook }
+    );
+    await mgrWithBoth.refresh();
+    await mgrWithBoth.open('dash');
+    mgrWithBoth.setSendToSprinkleHook(setterHook);
+
+    mgrWithBoth.sendToSprinkle('dash', { x: 1 });
+
+    expect(constructorHook).not.toHaveBeenCalled();
+    expect(setterHook).toHaveBeenCalledTimes(1);
+    expect(setterHook).toHaveBeenCalledWith('dash', { x: 1 });
   });
 
   it('setupWatcher refreshes available list when new .shtml files appear', async () => {
