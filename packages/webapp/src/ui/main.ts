@@ -2539,32 +2539,50 @@ async function mainStandaloneWorker(app: HTMLElement, isElectronOverlay: boolean
     const event = rawEvent as CustomEvent<{ joinUrl: string }>;
     const joinUrl = event.detail?.joinUrl;
     if (!joinUrl) {
-      log.warn('slicc:tray-join fired without joinUrl');
+      // `error`, not `warn` — the only emitters are SLICC's own UI
+      // surfaces, so a missing `joinUrl` is a dispatcher contract
+      // violation. Prod log level is ERROR, so anything less is
+      // suppressed and the bug goes invisible.
+      log.error('slicc:tray-join fired without joinUrl — UI dispatcher contract violation');
       return;
     }
 
+    // Null the leader ref BEFORE calling `.stop()` so that if `.stop()`
+    // throws, the catch block sees a consistent post-teardown state
+    // (leader logically gone). The hook detaches and follower-stop
+    // each get their own inner try so one throw doesn't leak past the
+    // failed step. This is the multi-source-throw fix R10 flagged.
+    const leaderToStop = pageLeaderTray;
+    pageLeaderTray = null;
+    setConnectedFollowersGetter(null);
+    setTrayResetter(null);
+    layout.panels.chat.setOnLocalUserMessage(undefined);
+    sprinkleManager.setSendToSprinkleHook(undefined);
+    const previousFollower = pageFollowerTray;
+    pageFollowerTray = null;
+
     try {
-      pageLeaderTray?.stop();
-      pageLeaderTray = null;
-      setConnectedFollowersGetter(null);
-      setTrayResetter(null);
-      // Detach the leader-only hooks now that the runtime is switching
-      // to follower mode — without this, a stale `pageLeaderTray` ref
-      // (already nulled above) would still be invoked by the next user
-      // chat submit / sprinkle push and silently no-op.
-      layout.panels.chat.setOnLocalUserMessage(undefined);
-      sprinkleManager.setSendToSprinkleHook(undefined);
+      leaderToStop?.stop();
+    } catch (err) {
+      log.warn('Leader stop threw during tray-join switch (continuing teardown)', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+    try {
+      previousFollower?.stop();
+    } catch (err) {
+      log.warn('Previous follower stop threw during tray-join switch (continuing teardown)', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
 
-      pageFollowerTray?.stop();
-      pageFollowerTray = null;
-
-      // Mirror the boot-path options at `:2388-2413`, especially the
-      // `addSprinkle` / `removeSprinkle` callbacks — `startPageFollowerTray`
+    try {
+      // Mirror the boot-path follower options exactly — especially
+      // `addSprinkle` / `removeSprinkle`. `startPageFollowerTray`
       // silently no-ops follower sprinkle rendering when those are
       // omitted (`page-follower-tray.ts` gates the controller on their
-      // presence). Without this, a hot-join over the settings dialog
-      // would give the user chat sync but no sprinkle sync until they
-      // reload — exactly the asymmetry R9 flagged as a blocker.
+      // presence), so a hot-join would otherwise give chat sync but
+      // no sprinkle sync until the next page reload.
       pageFollowerTray = startPageFollowerTray({
         joinUrl,
         onSnapshot: (messages) => layout.panels.chat.loadMessages(messages),
@@ -2584,18 +2602,29 @@ async function mainStandaloneWorker(app: HTMLElement, isElectronOverlay: boolean
         removeSprinkle: (name) => layout.removeSprinkle(name),
       });
     } catch (err) {
-      // The teardown above (`pageLeaderTray?.stop()`, the nullings, the
-      // hook detaches) is already complete by the time a synchronous
-      // throw could land here from `startPageFollowerTray`. The runtime
-      // is in a half-state: leader gone, follower not started. We
-      // surface an error-grade log so QA / on-call sees the failure;
-      // user-side recovery is a page reload.
+      // Half-state: leader stopped, follower never started, chat agent
+      // not swapped. The next chat send would route to the local cone
+      // instead of the (non-existent) remote leader — possibly leaking
+      // a message intended for the remote runtime. We can't recover
+      // automatically (would have to re-read TRAY_WORKER_STORAGE_KEY
+      // and rebuild the leader, duplicating boot logic), so the user
+      // path is a page reload — but we MUST surface the failure to
+      // UI listeners so the settings dialog (or any other dispatcher)
+      // can render a toast / banner.
       log.error(
         'slicc:tray-join handler failed — runtime is in a half-state, page reload required',
         {
           joinUrl,
           error: err instanceof Error ? err.message : String(err),
         }
+      );
+      window.dispatchEvent(
+        new CustomEvent('slicc:tray-join-failed', {
+          detail: {
+            joinUrl,
+            error: err instanceof Error ? err.message : String(err),
+          },
+        })
       );
     }
   });

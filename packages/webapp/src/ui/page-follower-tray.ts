@@ -43,7 +43,7 @@ import { createLogger } from '../core/logger.js';
 const log = createLogger('page-follower-tray');
 
 export interface StartPageFollowerTrayOptions {
-  /** The leader's join URL (from `tray-join-storage-key` localStorage). */
+  /** The leader's join URL (from the `TRAY_JOIN_STORAGE_KEY` constant — `slicc.trayJoinUrl` — in localStorage). */
   joinUrl: string;
 
   // --- FollowerSyncManager callbacks (forwarded directly) ---
@@ -194,10 +194,18 @@ export function startPageFollowerTray(
 
     // Throttled error logging — `refreshTargets` runs every 5 s, so a
     // sustained CDP failure (browser crashed, permission revoked) must not
-    // flood logs. We log once on transition to failing and at most once per
-    // ~minute thereafter so the user has some signal in DevTools that
-    // federated CDP is silently broken.
-    let lastTargetErrorLogAt = 0;
+    // flood logs. We log at `error` (prod log gate is ERROR by default
+    // so `warn` would be suppressed) at most once per ~minute, with a
+    // symmetric recovery log on first success after a failing streak.
+    // Uses `performance.now()` not `Date.now()` so NTP backward jumps
+    // can't cause indefinite suppression.
+    // `lastTargetErrorLogAt = -Infinity` (NOT 0): we use `performance.now()`
+    // which starts small (~ms since process boot), so an initial value
+    // of 0 would make the first `now - last > 60_000` check FALSE and
+    // suppress the very first error log. -Infinity guarantees the
+    // first failure passes through.
+    let lastTargetErrorLogAt = Number.NEGATIVE_INFINITY;
+    let targetsInFailingState = false;
     const refreshTargets = async (): Promise<void> => {
       try {
         const pages = await options.browserAPI.listPages();
@@ -205,15 +213,21 @@ export function startPageFollowerTray(
         // that case so we don't advertise this connection's runtimeId
         // against the new sync (or vice versa).
         if (activeSync !== sync) return;
+        if (targetsInFailingState) {
+          targetsInFailingState = false;
+          lastTargetErrorLogAt = Number.NEGATIVE_INFINITY;
+          log.info('Follower target advertisement recovered');
+        }
         sync.advertiseTargets(
           pages.map((p) => ({ targetId: p.targetId, title: p.title, url: p.url })),
           runtimeId
         );
       } catch (err) {
-        const now = Date.now();
+        const now = performance.now();
+        targetsInFailingState = true;
         if (now - lastTargetErrorLogAt > 60_000) {
           lastTargetErrorLogAt = now;
-          log.warn('Follower target advertisement failed (best-effort)', {
+          log.error('Follower target advertisement failed (best-effort, throttled)', {
             error: err instanceof Error ? err.message : String(err),
           });
         }
