@@ -32,7 +32,6 @@ import {
   type AgentSpawnOptions,
   type AgentSpawnResult,
 } from '../../../packages/webapp/src/scoops/agent-bridge.js';
-import { LeaderTrayManager } from '../../../packages/webapp/src/scoops/tray-leader.js';
 import {
   DEFAULT_PRODUCTION_TRAY_WORKER_BASE_URL,
   DEFAULT_STAGING_TRAY_WORKER_BASE_URL,
@@ -41,19 +40,19 @@ import {
   TRAY_JOIN_STORAGE_KEY,
   TRAY_WORKER_STORAGE_KEY,
 } from '../../../packages/webapp/src/scoops/tray-runtime-config.js';
-import {
-  FollowerTrayManager,
-  LeaderTrayPeerManager,
-  startFollowerWithAutoReconnect,
-} from '../../../packages/webapp/src/scoops/tray-webrtc.js';
+import { startFollowerWithAutoReconnect } from '../../../packages/webapp/src/scoops/tray-webrtc.js';
 import { FollowerSyncManager } from '../../../packages/webapp/src/scoops/tray-follower-sync.js';
 import { ThrottledErrorTracker } from '../../../packages/webapp/src/scoops/throttled-error-tracker.js';
 import {
   connectOffscreenFollowerSprinkleBridge,
   type OffscreenMessageHub,
 } from './follower-sprinkle-bridge.js';
+import { connectOffscreenLeaderSyncBridge } from './leader-sync-bridge.js';
+import {
+  startExtensionLeaderTray,
+  type ExtensionLeaderTrayHandle,
+} from './extension-leader-tray.js';
 import { OffscreenBridge } from './offscreen-bridge.js';
-import { ServiceWorkerLeaderTraySocket } from './tray-socket-proxy.js';
 import { createLogger } from '../../../packages/webapp/src/core/index.js';
 import type { ExtensionMessage } from './messages.js';
 import { getApiKey } from '../../../packages/webapp/src/ui/provider-settings.js';
@@ -436,47 +435,60 @@ async function init(): Promise<void> {
     }
 
     if (trayRuntimeConfig?.workerBaseUrl) {
-      let trayLeader!: LeaderTrayManager;
-      const trayPeers = new LeaderTrayPeerManager({
-        sendControlMessage: (message) => trayLeader.sendControlMessage(message),
-        onPeerConnected: (peer) => {
-          log.info('Tray follower data channel opened', {
-            controllerId: peer.controllerId,
-            bootstrapId: peer.bootstrapId,
-            attempt: peer.attempt,
+      // Build the panel↔offscreen hub. The leader and follower branches
+      // each own their own hub instance and detach on switch (spec §8).
+      const hub: OffscreenMessageHub = {
+        sendToPanel: (envelope) => {
+          chrome.runtime.sendMessage(envelope).catch((err: unknown) => {
+            const msg = err instanceof Error ? err.message : String(err);
+            if (/receiving end does not exist/i.test(msg)) return;
+            log.error('Offscreen → panel sendMessage failed (leader)', { error: msg });
           });
         },
-      });
-      trayLeader = new LeaderTrayManager({
+        onPanelMessage: (handler) => {
+          const listener = (msg: unknown): boolean => {
+            if (!msg || typeof msg !== 'object' || !('source' in msg) || !('payload' in msg)) {
+              return false;
+            }
+            handler(msg as { source: string; payload: unknown });
+            return false;
+          };
+          chrome.runtime.onMessage.addListener(listener);
+          return () => chrome.runtime.onMessage.removeListener(listener);
+        },
+      };
+
+      // Forward-declared so the bridge can resolve sync lazily (sync isn't
+      // built until startExtensionLeaderTray returns the handle).
+      let activeHandle: ExtensionLeaderTrayHandle | null = null;
+      const leaderBridge = connectOffscreenLeaderSyncBridge(
+        hub,
+        () => activeHandle?.sync ?? null,
+        bridge
+      );
+      leaderBridge.signalLeaderMode(true);
+
+      activeHandle = startExtensionLeaderTray({
         workerBaseUrl: trayRuntimeConfig.workerBaseUrl,
-        runtime: 'slicc-extension-offscreen',
-        webSocketFactory: (url) => new ServiceWorkerLeaderTraySocket(url),
-        onControlMessage: (message) => {
-          void trayPeers.handleControlMessage(message).catch((error) => {
-            log.warn('Tray leader bootstrap handling failed', {
-              error: error instanceof Error ? error.message : String(error),
-            });
-          });
-        },
-        onReconnecting: (attempt, lastError) => {
-          log.info('Extension leader tray reconnecting', { attempt, lastError });
-        },
-        onReconnected: (session) => {
-          log.info('Extension leader tray reconnected', { trayId: session.trayId });
-        },
-        onReconnectGaveUp: (lastError, attempts) => {
-          log.warn('Extension leader tray reconnect gave up', { lastError, attempts });
-        },
+        bridge,
+        orchestrator,
+        sharedFs: host.sharedFs ?? null,
+        browser,
+        log,
+        leaderBridge,
       });
-      void trayLeader.start().catch((error) => {
-        log.warn('Leader tray join failed', {
-          error: error instanceof Error ? error.message : String(error),
+
+      void activeHandle.leader.start().catch((err) => {
+        log.warn('Extension leader tray start failed', {
+          error: err instanceof Error ? err.message : String(err),
         });
       });
+
       stopTrayRuntime = () => {
-        trayPeers.stop();
-        trayLeader.stop();
+        activeHandle?.stop();
+        activeHandle = null;
       };
+      return;
     }
   };
 

@@ -934,8 +934,12 @@ export class OffscreenBridge implements KernelFacade {
   /**
    * Persist a scoop's message buffer to the shared UI session store.
    * Fire-and-forget — errors are swallowed to avoid blocking agent processing.
+   *
+   * Public so `ExtensionLeaderBridge` (consumed by `startExtensionLeaderTray`)
+   * can call it from the leader-tray adapter — same buffer-persistence
+   * semantics as the standalone leader (spec §6).
    */
-  private persistScoop(jid: string): void {
+  persistScoop(jid: string): void {
     if (!this.sessionStore || !this.orchestrator) return;
     const scoop = this.orchestrator.getScoops().find((s) => s.jid === jid);
     if (!scoop) return;
