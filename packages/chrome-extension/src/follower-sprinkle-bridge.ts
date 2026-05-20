@@ -33,6 +33,8 @@ import type {
 } from './messages.js';
 import type { SprinkleFollowerSync } from '../../../packages/webapp/src/ui/sprinkle-follower-controller.js';
 import type { SprinkleSummary } from '../../../packages/webapp/src/scoops/tray-sync-protocol.js';
+import type { LeaderTrayRuntimeStatus } from '../../../packages/webapp/src/scoops/tray-leader.js';
+import type { LeaderTrayResetResponseMsg } from './messages.js';
 
 // Compile-time invariant: the `sprinkles` array shape inside
 // `FollowerSprinklesListMsg` must remain assignable to the canonical
@@ -48,6 +50,21 @@ type _AssertSprinkleSummaryEnvelopeMatches =
     : never;
 
 const _sprinkleSummaryEnvelopeMatches: _AssertSprinkleSummaryEnvelopeMatches = true;
+
+// Same invariant for `LeaderTrayRuntimeStatusEnvelope` carried by
+// `LeaderTrayResetResponseMsg.status` — `messages.ts` mirrors the shape inline
+// to keep tray-leader.ts (which references `chrome`/`window`/`createLogger`)
+// out of the webapp-worker tsconfig surface. Asserted bidirectionally so
+// either side drifting breaks the build.
+type _LeaderTrayResetStatus = NonNullable<LeaderTrayResetResponseMsg['status']>;
+type _AssertLeaderTrayRuntimeStatusEnvelopeMatches =
+  _LeaderTrayResetStatus extends LeaderTrayRuntimeStatus
+    ? LeaderTrayRuntimeStatus extends _LeaderTrayResetStatus
+      ? true
+      : never
+    : never;
+
+const _leaderTrayRuntimeStatusEnvelopeMatches: _AssertLeaderTrayRuntimeStatusEnvelopeMatches = true;
 
 /**
  * Generic chrome.runtime sender — kept narrow so tests can substitute a
