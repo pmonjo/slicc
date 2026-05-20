@@ -3,7 +3,7 @@ import { createServer } from 'http';
 import { createServer as createNetServer } from 'net';
 import { spawn, type ChildProcess } from 'child_process';
 import { existsSync, readFileSync } from 'fs';
-import { join, resolve, dirname } from 'path';
+import { join, resolve, dirname, sep } from 'path';
 import { homedir } from 'os';
 import { Readable, Transform } from 'stream';
 import { StringDecoder } from 'string_decoder';
@@ -1534,17 +1534,45 @@ async function main() {
         setHeaders: (res, path) => {
           // Service workers must declare a maximum scope; without
           // `Service-Worker-Allowed: /`, the browser refuses to register
-          // a root-scoped SW served from `/llm-proxy-sw.js`.
+          // a root-scoped SW served from `/llm-proxy-sw.js`. Also force
+          // `no-store` on SWs so a fresh registration always picks up
+          // the new bundle hashes the SW preloads/intercepts.
           if (path.endsWith('llm-proxy-sw.js')) {
             res.setHeader('Service-Worker-Allowed', '/');
             res.setHeader('Cache-Control', 'no-store');
+            return;
           }
+          // Vite emits content-hashed filenames into `/assets/` — the
+          // hash changes when content changes, so the file at a given
+          // URL is byte-for-byte immutable. Tell the browser to cache
+          // forever to avoid revalidation round-trips. The `path`
+          // parameter is a filesystem path (uses `sep` on Windows,
+          // `/` elsewhere), hence the platform-aware match.
+          if (path.includes(`${sep}assets${sep}`)) {
+            res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+            return;
+          }
+          // Everything else (HTML, manifest, sprinkle-sandbox.html, etc.)
+          // is NOT content-hashed and references hashed asset URLs that
+          // change on rebuild. If the browser serves a stale `index.html`
+          // out of its heuristic cache, the referenced `/assets/*` chunks
+          // will 404 after an update — the user sees
+          //   "Failed to fetch dynamically imported module: …/assets/<old-hash>.js"
+          // on every cone bootstrap until they hard-refresh.
+          // `no-cache` forces a conditional revalidation on every load
+          // (cheap — `If-None-Match` returns 304 when unchanged) so the
+          // tab picks up a freshly-built `index.html` after `npm run build`.
+          res.setHeader('Cache-Control', 'no-cache');
         },
       })
     );
 
-    // SPA fallback — serve index.html for all non-file routes
+    // SPA fallback — serve index.html for all non-file routes. Same
+    // `no-cache` reasoning as above: the served `index.html` carries
+    // references to the current asset hashes, and stale-cached HTML
+    // is the canonical post-update breakage.
     app.get('/{*path}', (_req, res) => {
+      res.setHeader('Cache-Control', 'no-cache');
       res.sendFile(join(uiDir, 'index.html'));
     });
   }
