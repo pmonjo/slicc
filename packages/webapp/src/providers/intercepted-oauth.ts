@@ -140,6 +140,22 @@ function matchesPattern(url: string, pattern: string): boolean {
 }
 
 /**
+ * Normalize a `redirectUriPattern` into the form CDP `Fetch.enable` expects.
+ *
+ * `Fetch.enable.patterns[].urlPattern` only matches literal strings unless
+ * the caller includes a `*` glob. We accept exact URIs (e.g.
+ * `http://127.0.0.1:56121/callback`) at the API surface for usability, but
+ * the OAuth provider almost always tacks a `?code=…&state=…` query string
+ * onto the redirect — so an exact pattern would never pause. Append a `*`
+ * so both bare and querystring-suffix variants pause. The
+ * {@link matchesPattern} guard in the handler already accepts both shapes.
+ */
+function toFetchUrlPattern(pattern: string): string {
+  if (pattern.endsWith('*')) return pattern;
+  return `${pattern}*`;
+}
+
+/**
  * Apply a list of {@link OAuthRequestRewrite}s to an outbound URL.
  * Exported for tests.
  */
@@ -195,6 +211,16 @@ export function createInterceptingOAuthLauncher(
         } catch {
           /* best-effort */
         }
+        // Detach regardless of `onCapture`. If we leave the tab open
+        // (e.g. user wants to inspect the consent screen after capture)
+        // we still don't want a permanently-attached debugger session —
+        // Chrome's automation banner stays up and the page is partially
+        // frozen as long as the session is live.
+        try {
+          await transport.send('Target.detachFromTarget', { sessionId });
+        } catch {
+          /* best-effort */
+        }
       }
       if (targetId && onCapture === 'close') {
         try {
@@ -218,6 +244,13 @@ export function createInterceptingOAuthLauncher(
       const onPaused = (params: Record<string, unknown>) => {
         const evt = params as unknown as FetchRequestPausedEvent;
         if (!evt?.request?.url || !sessionId) return;
+        // CDP fan-outs `Fetch.requestPaused` for every attached target on
+        // the transport. Without this guard, a `Fetch.enable` on another
+        // session (e.g. the agent's own page watcher) would deliver
+        // requests we shouldn't be rewriting or capturing here.
+        const eventSessionId =
+          typeof params['sessionId'] === 'string' ? (params['sessionId'] as string) : undefined;
+        if (eventSessionId !== sessionId) return;
 
         // Capture step: did this request hit the redirect URI?
         if (matchesPattern(evt.request.url, config.redirectUriPattern)) {
@@ -280,7 +313,10 @@ export function createInterceptingOAuthLauncher(
             'Fetch.enable',
             {
               patterns: [
-                { urlPattern: config.redirectUriPattern, requestStage: 'Request' },
+                {
+                  urlPattern: toFetchUrlPattern(config.redirectUriPattern),
+                  requestStage: 'Request',
+                },
                 // Also pause every request so the rewrite rules can fire on
                 // intermediate hops (e.g. authorize URL patches). Provider
                 // rewrites are scoped via `match`, so the false-positive cost

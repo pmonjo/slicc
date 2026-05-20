@@ -1371,7 +1371,7 @@ export function showProviderSettings(options?: ShowProviderSettingsOptions): Pro
         const pid = providerSelect.value;
         if (!pid) return;
         const providerConfig = getProviderConfig(pid);
-        if (!providerConfig.onOAuthLogin) return;
+        if (!providerConfig.onOAuthLogin && !providerConfig.onOAuthLoginIntercepted) return;
 
         // Validate base URL if required
         const hadAccountBefore = getAccounts().some((a) => a.providerId === pid);
@@ -1388,9 +1388,21 @@ export function showProviderSettings(options?: ShowProviderSettingsOptions): Pro
         }
         oauthStatus.textContent = 'Opening login window...';
         try {
-          const { createOAuthLauncher } = await import('../providers/oauth-service.js');
-          const launcher = createOAuthLauncher();
-          await providerConfig.onOAuthLogin(launcher, renderAccountsList);
+          if (providerConfig.onOAuthLoginIntercepted) {
+            const { createInterceptingOAuthLauncherForCurrentRuntime } =
+              await import('../providers/oauth-service.js');
+            const launcher = await createInterceptingOAuthLauncherForCurrentRuntime();
+            if (!launcher) {
+              throw new Error(
+                'No controlled-browser CDP transport available — open SLICC in standalone mode or the Chrome extension.'
+              );
+            }
+            await providerConfig.onOAuthLoginIntercepted(launcher, renderAccountsList);
+          } else if (providerConfig.onOAuthLogin) {
+            const { createOAuthLauncher } = await import('../providers/oauth-service.js');
+            const launcher = createOAuthLauncher();
+            await providerConfig.onOAuthLogin(launcher, renderAccountsList);
+          }
         } catch (err) {
           // Clean up pre-login baseUrl placeholder if no account existed before
           if (!hadAccountBefore) {

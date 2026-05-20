@@ -173,6 +173,7 @@ describe('createInterceptingOAuthLauncher', () => {
     await Promise.resolve();
 
     emit(state, 'Fetch.requestPaused', {
+      sessionId: 'session-abc',
       requestId: 'r1',
       request: {
         url: 'http://127.0.0.1:56121/callback?code=ABC&state=xyz',
@@ -206,6 +207,7 @@ describe('createInterceptingOAuthLauncher', () => {
     for (let i = 0; i < 5; i++) await Promise.resolve();
 
     emit(state, 'Fetch.requestPaused', {
+      sessionId: 'session-abc',
       requestId: 'r1',
       request: { url: 'http://127.0.0.1:56121/callback?code=ABC', method: 'GET', headers: {} },
     });
@@ -228,6 +230,7 @@ describe('createInterceptingOAuthLauncher', () => {
 
     // An intermediate request to the authorize URL — should be rewritten.
     emit(state, 'Fetch.requestPaused', {
+      sessionId: 'session-abc',
       requestId: 'r-auth',
       request: { url: 'https://auth.x.ai/oauth2/auth?x=1', method: 'GET', headers: {} },
     });
@@ -237,6 +240,7 @@ describe('createInterceptingOAuthLauncher', () => {
 
     // Finish the flow.
     emit(state, 'Fetch.requestPaused', {
+      sessionId: 'session-abc',
       requestId: 'r-redir',
       request: { url: 'http://127.0.0.1:56121/callback?code=ABC', method: 'GET', headers: {} },
     });
@@ -265,5 +269,83 @@ describe('createInterceptingOAuthLauncher', () => {
 
     const result = await flowPromise;
     expect(result).toBeNull();
+  });
+
+  it('ignores Fetch.requestPaused events from foreign sessions', async () => {
+    const { transport, state } = createFakeTransport();
+    const launcher = createInterceptingOAuthLauncher(transport);
+
+    const flowPromise = launcher({
+      authorizeUrl: 'https://auth.x.ai/oauth2/auth',
+      redirectUriPattern: 'http://127.0.0.1:56121/*',
+      timeoutMs: 1_000,
+    });
+
+    for (let i = 0; i < 5; i++) await Promise.resolve();
+
+    // Foreign session emits a redirect-shaped URL — must not capture.
+    emit(state, 'Fetch.requestPaused', {
+      sessionId: 'someone-else',
+      requestId: 'r-foreign',
+      request: {
+        url: 'http://127.0.0.1:56121/callback?code=BAD',
+        method: 'GET',
+        headers: {},
+      },
+    });
+
+    vi.advanceTimersByTime(2_000);
+    const result = await flowPromise;
+    expect(result).toBeNull();
+    expect(state.sent.some((c) => c.method === 'Fetch.failRequest')).toBe(false);
+  });
+
+  it('normalises an exact redirectUriPattern by appending * for Fetch.enable', async () => {
+    const { transport, state } = createFakeTransport();
+    const launcher = createInterceptingOAuthLauncher(transport);
+
+    const flowPromise = launcher({
+      authorizeUrl: 'https://auth.x.ai/oauth2/auth',
+      redirectUriPattern: 'http://127.0.0.1:56121/callback',
+      timeoutMs: 1_000,
+    });
+
+    for (let i = 0; i < 5; i++) await Promise.resolve();
+
+    const enableCall = state.sent.find((c) => c.method === 'Fetch.enable');
+    expect(enableCall).toBeDefined();
+    const patterns = (enableCall!.params as { patterns: Array<{ urlPattern: string }> }).patterns;
+    expect(patterns[0].urlPattern).toBe('http://127.0.0.1:56121/callback*');
+
+    vi.advanceTimersByTime(2_000);
+    await flowPromise;
+  });
+
+  it('detaches the debugger session on cleanup, even when onCapture is "leave"', async () => {
+    const { transport, state } = createFakeTransport();
+    const launcher = createInterceptingOAuthLauncher(transport);
+
+    const flowPromise = launcher({
+      authorizeUrl: 'https://auth.x.ai/oauth2/auth',
+      redirectUriPattern: 'http://127.0.0.1:56121/*',
+      onCapture: 'leave',
+    });
+
+    for (let i = 0; i < 5; i++) await Promise.resolve();
+
+    emit(state, 'Fetch.requestPaused', {
+      sessionId: 'session-abc',
+      requestId: 'r1',
+      request: {
+        url: 'http://127.0.0.1:56121/callback?code=ABC',
+        method: 'GET',
+        headers: {},
+      },
+    });
+
+    await flowPromise;
+    const methods = state.sent.map((c) => c.method);
+    expect(methods).toContain('Target.detachFromTarget');
+    expect(methods).not.toContain('Target.closeTarget');
   });
 });

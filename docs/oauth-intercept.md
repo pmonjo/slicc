@@ -122,5 +122,14 @@ export const config: ProviderConfig = {
 ```
 
 A provider implements **either** `onOAuthLogin` (popup /
-`chrome.identity` path) **or** `onOAuthLoginIntercepted` (CDP path). The
-`oauth-token` command and `/login` UI dispatch to whichever is set.
+`chrome.identity` path) **or** `onOAuthLoginIntercepted` (CDP path). All
+three entry points dispatch to whichever hook is set:
+
+- `oauth-token <providerId>` (shell)
+- `/login` onboarding (`launchOAuth` in `src/ui/main.ts`)
+- Settings → Add Account login button (`src/ui/provider-settings.ts`)
+
+The intercepted path requires the controlled-browser CDP transport
+(standalone or extension float). In a worker context with no transport,
+all three surfaces surface a clean "no CDP transport available" error
+instead of silently failing.

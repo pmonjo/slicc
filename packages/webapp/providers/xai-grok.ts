@@ -47,7 +47,17 @@ import { sanitizePayload } from './xai-grok-sanitize.js';
 const PROVIDER_ID = 'xai-grok';
 
 const XAI_OAUTH_ISSUER = 'https://auth.x.ai';
-const XAI_AUTHORIZE_URL = `${XAI_OAUTH_ISSUER}/oauth2/auth`;
+// Endpoints sourced from https://auth.x.ai/.well-known/openid-configuration
+// (issuer-canonical). The grok CLI sees a redirect through
+// `https://accounts.x.ai/oauth2/consent` after this initial authorize hit.
+//
+// TODO(oauth-discovery): replace these constants with runtime OIDC
+// discovery (fetch `${ISSUER}/.well-known/openid-configuration`, validate
+// endpoints belong to `*.x.ai`, cache on the OAuth account). Stnly's
+// pi-grok already does this in `oauth.ts::discover()`. Even better: lift
+// the pattern into `src/providers/oauth-service.ts` so any provider can
+// declare `discoveryUrl: ...` instead of hardcoding endpoints.
+const XAI_AUTHORIZE_URL = `${XAI_OAUTH_ISSUER}/oauth2/authorize`;
 const XAI_TOKEN_URL = `${XAI_OAUTH_ISSUER}/oauth2/token`;
 // Public Grok-CLI client. Same id appears in ~/.grok/auth.json and hermes.
 const XAI_OAUTH_CLIENT_ID = 'b1a00492-073a-47ea-816f-4c329264a828';
@@ -55,7 +65,15 @@ const XAI_OAUTH_SCOPE = 'openid profile email offline_access grok-cli:access api
 const XAI_REDIRECT_URI = 'http://127.0.0.1:56121/callback';
 const XAI_REDIRECT_PATTERN = 'http://127.0.0.1:56121/*';
 const XAI_API_BASE_URL = 'https://api.x.ai/v1';
-const XAI_API: Api = 'openai-responses';
+// pi-ai's actual responses-API name — used when we delegate to
+// `streamOpenAIResponses` after auth + payload sanitization.
+const OPENAI_RESPONSES_API: Api = 'openai-responses';
+// The api slicc tags each model with after `provider-settings.ts` rewrites
+// `api: 'openai'` from `toModelMetadata()` to `${providerId}-${apiType}`.
+// We register our streams under this name so the agent loop routes Grok
+// turns to *us* (OAuth + sanitization), not to pi-ai's stock OpenAI path.
+// Same indirection trick as `built-in/local-llm.ts`.
+const XAI_API: Api = `${PROVIDER_ID}-openai` as Api;
 
 // ── Models ─────────────────────────────────────────────────────────
 
@@ -251,7 +269,7 @@ const streamXai = (model: Model<Api>, context: Context, options: ProviderStreamO
       const proxyModel = {
         ...model,
         baseUrl: XAI_API_BASE_URL,
-        api: XAI_API,
+        api: OPENAI_RESPONSES_API,
       } as Model<'openai-responses'>;
       const inner = streamOpenAIResponses(proxyModel, context, {
         ...options,
@@ -282,7 +300,7 @@ const streamSimpleXai = (model: Model<Api>, context: Context, options?: SimpleSt
       const proxyModel = {
         ...model,
         baseUrl: XAI_API_BASE_URL,
-        api: XAI_API,
+        api: OPENAI_RESPONSES_API,
       } as Model<'openai-responses'>;
       const innerOptions: SimpleStreamOptions & {
         onPayload?: StreamOptions['onPayload'];

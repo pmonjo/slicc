@@ -1053,13 +1053,31 @@ async function mainExtension(app: HTMLElement, options?: { detached?: boolean })
       launchOAuth: async (providerId, baseUrl) => {
         try {
           const cfg = getProviderConfigExt(providerId);
-          if (!cfg.isOAuth || !cfg.onOAuthLogin) {
+          if (!cfg.isOAuth || (!cfg.onOAuthLogin && !cfg.onOAuthLoginIntercepted)) {
             return { ok: false, message: 'Provider does not support OAuth.' };
           }
           if (cfg.requiresBaseUrl && baseUrl) addAccountExt(providerId, '', baseUrl);
-          const { createOAuthLauncher } = await import('../providers/oauth-service.js');
-          const launcher = createOAuthLauncher();
-          await cfg.onOAuthLogin(launcher, () => undefined);
+          // Dispatch on which OAuth hook the provider declared. Intercepted
+          // OAuth (xAI Grok, public clients restricted to loopback redirects)
+          // needs a CDP transport; loopback URI is captured via
+          // `Fetch.requestPaused` without binding a real local port.
+          if (cfg.onOAuthLoginIntercepted) {
+            const { createInterceptingOAuthLauncherForCurrentRuntime } =
+              await import('../providers/oauth-service.js');
+            const launcher = await createInterceptingOAuthLauncherForCurrentRuntime();
+            if (!launcher) {
+              return {
+                ok: false,
+                message:
+                  'Intercepted OAuth requires the controlled-browser transport — open SLICC in standalone or extension mode.',
+              };
+            }
+            await cfg.onOAuthLoginIntercepted(launcher, () => undefined);
+          } else if (cfg.onOAuthLogin) {
+            const { createOAuthLauncher } = await import('../providers/oauth-service.js');
+            const launcher = createOAuthLauncher();
+            await cfg.onOAuthLogin(launcher, () => undefined);
+          }
           return {
             ok: true,
             model: resolveDefaultModel(
@@ -1739,6 +1757,13 @@ async function mainStandaloneWorker(app: HTMLElement, isElectronOverlay: boolean
     );
   }
 
+  // Expose the page-side BrowserAPI so the OAuth intercept launcher
+  // (active-transport.ts) can resolve a CDP transport from the main
+  // thread — the kernel-worker publishes its own __slicc_browser in
+  // host.ts, but the settings dialog and OAuth click handlers run on
+  // the page realm where that global isn't visible.
+  (globalThis as Record<string, unknown>).__slicc_browser = browser;
+
   let selectedScoop: RegisteredScoop | null = null;
   let client!: InstanceType<typeof OffscreenClient>;
 
@@ -2132,13 +2157,27 @@ async function mainStandaloneWorker(app: HTMLElement, isElectronOverlay: boolean
       launchOAuth: async (providerId, baseUrl) => {
         try {
           const cfg = getProviderConfig(providerId);
-          if (!cfg.isOAuth || !cfg.onOAuthLogin) {
+          if (!cfg.isOAuth || (!cfg.onOAuthLogin && !cfg.onOAuthLoginIntercepted)) {
             return { ok: false, message: 'Provider does not support OAuth.' };
           }
           if (cfg.requiresBaseUrl && baseUrl) addAccount(providerId, '', baseUrl);
-          const { createOAuthLauncher } = await import('../providers/oauth-service.js');
-          const launcher = createOAuthLauncher();
-          await cfg.onOAuthLogin(launcher, () => undefined);
+          if (cfg.onOAuthLoginIntercepted) {
+            const { createInterceptingOAuthLauncherForCurrentRuntime } =
+              await import('../providers/oauth-service.js');
+            const launcher = await createInterceptingOAuthLauncherForCurrentRuntime();
+            if (!launcher) {
+              return {
+                ok: false,
+                message:
+                  'Intercepted OAuth requires the controlled-browser transport — open SLICC in standalone or extension mode.',
+              };
+            }
+            await cfg.onOAuthLoginIntercepted(launcher, () => undefined);
+          } else if (cfg.onOAuthLogin) {
+            const { createOAuthLauncher } = await import('../providers/oauth-service.js');
+            const launcher = createOAuthLauncher();
+            await cfg.onOAuthLogin(launcher, () => undefined);
+          }
           return {
             ok: true,
             model: resolveDefaultModel(providerId, cfg, getProviderModels, isModelHiddenFromPicker),

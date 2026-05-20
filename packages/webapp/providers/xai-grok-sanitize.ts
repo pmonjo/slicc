@@ -91,7 +91,13 @@ function isInputImagePart(value: unknown): value is Record<string, unknown> {
 }
 
 function normalizeImageParts(value: unknown): unknown {
-  if (Array.isArray(value)) return value.map(normalizeImageParts);
+  if (Array.isArray(value)) {
+    // Filter out nulls that come back from dropped input_image entries —
+    // leaving `null` items in a content array violates the Responses API
+    // schema. Recursion happens via `.map()` so nested arrays drop their
+    // own nulls too.
+    return value.map(normalizeImageParts).filter((part) => part !== null);
+  }
   if (!value || typeof value !== 'object') return value;
 
   const obj = { ...(value as Record<string, unknown>) };
@@ -241,7 +247,9 @@ export function sanitizePayload(
       next.instructions = merged;
     }
 
-    input = normalizeImageParts(input) as Record<string, unknown>[];
+    input = (normalizeImageParts(input) as (Record<string, unknown> | null)[]).filter(
+      (part): part is Record<string, unknown> => part !== null
+    );
     input = rewriteFunctionCallOutput(input);
 
     next.input = input;
