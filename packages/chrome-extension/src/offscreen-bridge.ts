@@ -326,22 +326,39 @@ export class OffscreenBridge implements KernelFacade {
         };
         bridge.getBuffer(scoopJid).push(chatMsg);
         bridge.persistScoop(scoopJid);
-
-        bridge.emit({
-          type: 'incoming-message',
-          scoopJid,
-          message: {
-            id: message.id,
-            content: message.content,
-            attachments: message.attachments,
-            channel: message.channel,
-            senderName: message.senderName,
-            fromAssistant: message.fromAssistant,
-            timestamp: message.timestamp,
-          },
-        } satisfies IncomingMessageMsg);
+        bridge.notifyPanelIncomingMessage(scoopJid, message);
       },
     };
+  }
+
+  /**
+   * Emit a canonical `incoming-message` wire envelope to the panel.
+   *
+   * Extracted from the `onIncomingMessage` orchestrator callback so the
+   * future leader factory's `onFollowerMessage` (Task 12) can emit this
+   * envelope explicitly — `'web'`-channel messages don't trigger
+   * `orchestrator.onIncomingMessage` (gated by `isExternalLickChannel`
+   * at `orchestrator.ts:1297` — `'web'` is excluded from
+   * `EXTERNAL_LICK_CHANNELS`), so the panel echo path needs a direct
+   * helper.
+   *
+   * Purely envelope construction — does not buffer, persist, or
+   * format. Callers are responsible for any side effects they need.
+   */
+  notifyPanelIncomingMessage(scoopJid: string, message: ChannelMessage): void {
+    this.emit({
+      type: 'incoming-message',
+      scoopJid,
+      message: {
+        id: message.id,
+        content: message.content,
+        attachments: message.attachments,
+        channel: message.channel,
+        senderName: message.senderName,
+        fromAssistant: message.fromAssistant,
+        timestamp: message.timestamp,
+      },
+    } satisfies IncomingMessageMsg);
   }
 
   /**

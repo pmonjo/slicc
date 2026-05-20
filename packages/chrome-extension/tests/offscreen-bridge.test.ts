@@ -9,6 +9,7 @@
  */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import type { ChannelMessage } from '../../webapp/src/scoops/types.js';
 
 // Mock chrome.runtime
 const messageListeners: Array<
@@ -1199,5 +1200,53 @@ describe('OffscreenBridge.routeSprinkleLick', () => {
     await unboundBridge.routeSprinkleLick('welcome', { action: 'go' });
     // Nothing throws; mock orchestrator on the bound bridge is unaffected.
     expect(mockOrchestrator.handleMessage).not.toHaveBeenCalled();
+  });
+});
+
+describe('OffscreenBridge.notifyPanelIncomingMessage', () => {
+  it('emits an incoming-message envelope with the canonical wire shape', () => {
+    const bridge = new OffscreenBridge();
+    const msg: ChannelMessage = {
+      id: 'm-99',
+      chatJid: 'scoop-1',
+      senderId: 'user',
+      senderName: 'User',
+      content: 'hello from follower',
+      timestamp: '2026-05-20T00:00:00.000Z',
+      fromAssistant: false,
+      channel: 'web',
+    };
+    sentMessages.length = 0;
+    bridge.notifyPanelIncomingMessage('scoop-1', msg);
+    const sent = sentMessages.find((m: any) => m?.payload?.type === 'incoming-message') as any;
+    expect(sent).toBeDefined();
+    expect(sent.payload.scoopJid).toBe('scoop-1');
+    expect(sent.payload.message).toMatchObject({
+      id: 'm-99',
+      content: 'hello from follower',
+      channel: 'web',
+      fromAssistant: false,
+    });
+  });
+
+  it('existing onIncomingMessage callback still emits via the same helper', () => {
+    // Characterization test: the refactored onIncomingMessage callback
+    // (which only fires for external lick channels) must produce the
+    // same wire envelope as before the refactor.
+    const bridge = new OffscreenBridge();
+    const callbacks = OffscreenBridge.createCallbacks(bridge);
+    sentMessages.length = 0;
+    callbacks.onIncomingMessage?.('cone-1', {
+      id: 'wh-1',
+      chatJid: 'cone-1',
+      senderId: 'webhook',
+      senderName: 'webhook:test',
+      content: '[Webhook test]',
+      timestamp: '2026-05-20T00:00:00.000Z',
+      fromAssistant: false,
+      channel: 'webhook',
+    });
+    const sent = sentMessages.find((m: any) => m?.payload?.type === 'incoming-message') as any;
+    expect(sent.payload.message.channel).toBe('webhook');
   });
 });
