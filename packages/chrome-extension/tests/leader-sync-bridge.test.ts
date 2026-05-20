@@ -115,3 +115,86 @@ describe('PanelLeaderSyncProxy → offscreen adapter', () => {
     expect(() => proxy.pushSprinkleUpdate('welcome', null)).not.toThrow();
   });
 });
+
+describe('PanelLeaderSyncProxy.resetTray', () => {
+  it('sends leader-tray-reset and resolves on matching response', async () => {
+    const bus = createBus();
+    const proxy = new PanelLeaderSyncProxy(bus.panelSender, bus.panelSubscriber, {});
+    bus.offscreenHub.onPanelMessage((env) => {
+      const msg = env.payload as any;
+      if (msg?.type !== 'leader-tray-reset') return;
+      bus.offscreenHub.sendToPanel({
+        source: 'offscreen',
+        payload: {
+          type: 'leader-tray-reset-response',
+          requestId: msg.requestId,
+          ok: true,
+          status: { state: 'connected', session: null, error: null, reconnectAttempts: 0 } as any,
+        },
+      });
+    });
+    const status = await proxy.resetTray(1000);
+    expect(status.state).toBe('connected');
+  });
+
+  it('rejects on ok: false with the error', async () => {
+    const bus = createBus();
+    const proxy = new PanelLeaderSyncProxy(bus.panelSender, bus.panelSubscriber, {});
+    bus.offscreenHub.onPanelMessage((env) => {
+      const msg = env.payload as any;
+      if (msg?.type !== 'leader-tray-reset') return;
+      bus.offscreenHub.sendToPanel({
+        source: 'offscreen',
+        payload: {
+          type: 'leader-tray-reset-response',
+          requestId: msg.requestId,
+          ok: false,
+          error: 'no active session',
+        },
+      });
+    });
+    await expect(proxy.resetTray(1000)).rejects.toThrow(/no active session/);
+  });
+
+  it('rejects on timeout', async () => {
+    const bus = createBus();
+    const proxy = new PanelLeaderSyncProxy(bus.panelSender, bus.panelSubscriber, {});
+    // No offscreen handler — request hangs.
+    await expect(proxy.resetTray(50)).rejects.toThrow(/timed out/i);
+  });
+
+  it('two concurrent resets resolve independently by requestId', async () => {
+    const bus = createBus();
+    const proxy = new PanelLeaderSyncProxy(bus.panelSender, bus.panelSubscriber, {});
+    const seen: string[] = [];
+    bus.offscreenHub.onPanelMessage((env) => {
+      const msg = env.payload as any;
+      if (msg?.type !== 'leader-tray-reset') return;
+      seen.push(msg.requestId);
+      if (seen.length === 2) {
+        // Reply to the second request first (verify out-of-order works).
+        bus.offscreenHub.sendToPanel({
+          source: 'offscreen',
+          payload: {
+            type: 'leader-tray-reset-response',
+            requestId: seen[1],
+            ok: true,
+            status: { state: 'second', session: null, error: null, reconnectAttempts: 0 } as any,
+          },
+        });
+        bus.offscreenHub.sendToPanel({
+          source: 'offscreen',
+          payload: {
+            type: 'leader-tray-reset-response',
+            requestId: seen[0],
+            ok: true,
+            status: { state: 'first', session: null, error: null, reconnectAttempts: 0 } as any,
+          },
+        });
+      }
+    });
+    const [a, b] = await Promise.all([proxy.resetTray(1000), proxy.resetTray(1000)]);
+    expect(a.state).toBe('first');
+    expect(b.state).toBe('second');
+  });
+});

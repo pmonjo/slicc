@@ -14,6 +14,9 @@ import type {
   LeaderActiveScoopMsg,
   LeaderRequestLeaderModeStateMsg,
   LeaderModeChangedMsg,
+  LeaderTrayResetRequestMsg,
+  LeaderTrayResetResponseMsg,
+  LeaderTrayRuntimeStatusEnvelope,
   SprinkleSummaryEnvelope,
 } from './messages.js';
 import type { LeaderSyncManager } from '../../webapp/src/scoops/tray-leader-sync.js';
@@ -51,6 +54,15 @@ function discriminateMsg<T extends { type: string }>(payload: unknown, type: T['
 export class PanelLeaderSyncProxy {
   private disposed = false;
   private readonly unsubscribe: () => void;
+  private readonly pendingResets = new Map<
+    string,
+    {
+      resolve: (status: LeaderTrayRuntimeStatusEnvelope) => void;
+      reject: (err: Error) => void;
+      timer: ReturnType<typeof setTimeout>;
+    }
+  >();
+  private nextResetId = 1;
 
   constructor(
     private readonly sender: PanelMessageSender,
@@ -64,6 +76,19 @@ export class PanelLeaderSyncProxy {
       const mode = discriminateMsg<LeaderModeChangedMsg>(envelope.payload, 'leader-mode-changed');
       if (mode) {
         this.listeners.onLeaderModeChange?.(mode.active);
+        return;
+      }
+      const resp = discriminateMsg<LeaderTrayResetResponseMsg>(
+        envelope.payload,
+        'leader-tray-reset-response'
+      );
+      if (resp) {
+        const pending = this.pendingResets.get(resp.requestId);
+        if (!pending) return;
+        this.pendingResets.delete(resp.requestId);
+        clearTimeout(pending.timer);
+        if (resp.ok && resp.status) pending.resolve(resp.status);
+        else pending.reject(new Error(resp.error ?? 'tray reset failed'));
         return;
       }
     });
@@ -111,10 +136,29 @@ export class PanelLeaderSyncProxy {
     this.sender.send({ source: 'panel', payload });
   }
 
+  resetTray(timeoutMs = 30_000): Promise<LeaderTrayRuntimeStatusEnvelope> {
+    if (this.disposed) return Promise.reject(new Error('PanelLeaderSyncProxy disposed'));
+    const requestId = `tray-reset-${Date.now()}-${this.nextResetId++}`;
+    return new Promise<LeaderTrayRuntimeStatusEnvelope>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.pendingResets.delete(requestId);
+        reject(new Error(`leader-tray-reset timed out after ${timeoutMs}ms`));
+      }, timeoutMs);
+      this.pendingResets.set(requestId, { resolve, reject, timer });
+      const payload: LeaderTrayResetRequestMsg = { type: 'leader-tray-reset', requestId };
+      this.sender.send({ source: 'panel', payload });
+    });
+  }
+
   dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
     this.unsubscribe();
+    for (const entry of this.pendingResets.values()) {
+      clearTimeout(entry.timer);
+      entry.reject(new Error('PanelLeaderSyncProxy disposed'));
+    }
+    this.pendingResets.clear();
   }
 }
 
