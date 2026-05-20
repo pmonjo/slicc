@@ -120,4 +120,95 @@ describe('bedrock-camp built-in provider', () => {
       })
     );
   });
+
+  it.each([
+    ['us.anthropic.claude-opus-4-6', 'max'],
+    ['us.anthropic.claude-opus-4-7', 'max'],
+    ['global.anthropic.claude-opus-4-7', 'max'],
+    ['us.anthropic.claude-sonnet-4-6', 'high'],
+    ['us.anthropic.claude-sonnet-4-7', 'high'],
+    ['us.anthropic.claude-haiku-4-7', 'high'],
+  ])(
+    'uses adaptive thinking (not type.enabled) for Claude 4.6+ models (%s)',
+    async (modelId, expectedEffort) => {
+      const fetchMock = vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({
+          output: { message: { content: [{ text: 'ok' }] } },
+          usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+          stopReason: 'end_turn',
+        }),
+      });
+      vi.stubGlobal('fetch', fetchMock);
+
+      let captured: any;
+      const stream = streamSimpleBedrockCamp(
+        {
+          id: modelId,
+          provider: 'amazon-bedrock',
+          api: 'bedrock-camp-converse',
+          baseUrl: 'https://bedrock-runtime.us-west-2.amazonaws.com',
+          maxTokens: 128_000,
+          input: ['text'],
+          reasoning: true,
+          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+        } as any,
+        { messages: [{ role: 'user', content: 'hi' }] } as any,
+        {
+          apiKey: 'ABSK-test',
+          reasoning: 'xhigh',
+          onPayload(payload: unknown) {
+            captured = payload;
+          },
+        }
+      );
+
+      await stream.result();
+
+      expect(captured.additionalModelRequestFields).toEqual({
+        thinking: { type: 'adaptive' },
+        output_config: { effort: expectedEffort },
+      });
+      expect(captured.additionalModelRequestFields.thinking.type).not.toBe('enabled');
+    }
+  );
+
+  it('keeps legacy thinking.type=enabled for pre-4.6 Claude models', async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        output: { message: { content: [{ text: 'ok' }] } },
+        usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+        stopReason: 'end_turn',
+      }),
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    let captured: any;
+    const stream = streamSimpleBedrockCamp(
+      {
+        id: 'us.anthropic.claude-sonnet-4-5',
+        provider: 'amazon-bedrock',
+        api: 'bedrock-camp-converse',
+        baseUrl: 'https://bedrock-runtime.us-west-2.amazonaws.com',
+        maxTokens: 64_000,
+        input: ['text'],
+        reasoning: true,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      } as any,
+      { messages: [{ role: 'user', content: 'hi' }] } as any,
+      {
+        apiKey: 'ABSK-test',
+        reasoning: 'medium',
+        onPayload(payload: unknown) {
+          captured = payload;
+        },
+      }
+    );
+
+    await stream.result();
+
+    expect(captured.additionalModelRequestFields.thinking.type).toBe('enabled');
+    expect(captured.additionalModelRequestFields.thinking.budget_tokens).toBeGreaterThan(0);
+  });
 });

@@ -275,13 +275,10 @@ function supportsThinkingSignature(model: Model<Api>): boolean {
   return id.includes('anthropic.claude') || id.includes('anthropic/claude');
 }
 
+const ADAPTIVE_THINKING_RE = /(?:opus|sonnet|haiku)-4[-.](?:[6-9]|\d{2,})/;
+
 function supportsAdaptiveThinking(modelId: string): boolean {
-  return (
-    modelId.includes('opus-4-6') ||
-    modelId.includes('opus-4.6') ||
-    modelId.includes('sonnet-4-6') ||
-    modelId.includes('sonnet-4.6')
-  );
+  return ADAPTIVE_THINKING_RE.test(modelId);
 }
 
 // ── Tool config ─────────────────────────────────────────────────────
@@ -322,7 +319,7 @@ function mapThinkingLevelToEffort(level: ThinkingLevel | undefined, modelId: str
     case 'high':
       return 'high';
     case 'xhigh':
-      return modelId.includes('opus-4-6') || modelId.includes('opus-4.6') ? 'max' : 'high';
+      return /opus-4[-.](?:[6-9]|\d{2,})/.test(modelId) ? 'max' : 'high';
     default:
       return 'high';
   }
