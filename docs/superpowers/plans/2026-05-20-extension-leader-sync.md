@@ -10,6 +10,55 @@
 
 **Spec:** [`docs/superpowers/specs/2026-05-20-extension-leader-sync-design.md`](../specs/2026-05-20-extension-leader-sync-design.md) (revision 5 — read it first; this plan assumes the spec is authoritative on every design decision).
 
+**Revision 2 (2026-05-20):** First-review fixes applied. Verified each
+review claim against current `main` HEAD before patching. Summary:
+
+- **Task 2 rewritten** — `OffscreenClient.selectScoop()` doesn't exist;
+  selection mutation lives at four sites in `mainExtension`
+  (main.ts:657, 700, 723, 802). Plan now adds
+  `OffscreenClient.setSelectedScoopJid(jid)` setter that fires
+  listeners and routes all four mutations through it.
+- **Task 4 narrowed** — drop the `case 'leader-active-scoop'` envelope
+  handler from the bridge's panel message switch. The leader-sync hub
+  adapter (Task 9) is the single inbound route; bridge holds the
+  cache via the public setter only. Avoids dual listeners on
+  `chrome.runtime.onMessage`.
+- **Task 17 extended** — added `onFollowerCountChanged` callback that
+  writes `slicc.leaderTrayFollowers` (parity with standalone
+  main.ts:2465-2476). `host-command.ts:74-84` reads it as a fallback
+  when the getter is null.
+- **Task 11 test approach corrected** — `LeaderSyncManager.getMessages`
+  is an option callback, not a public method. Tests now capture
+  `syncOptions` via a factory test seam (`_onSyncOptions` callback)
+  instead of calling non-existent `handle.sync.getMessages()`.
+- **Task 11 import fix** — `ChannelMessage` lives in
+  `webapp/src/scoops/types.ts:154`, not `messages.ts`.
+- **Task 12 test reordered** — `vi.spyOn` now precedes the
+  `options.onFollowerMessage(...)` invocation so the broadcast
+  assertion actually catches the call.
+- **Task 17 test fixed** — `handle.leader.start` is called once
+  (the reset's start), not twice. The factory itself doesn't call
+  start() on boot — Task 19's offscreen.ts caller does.
+- **Task 18 test expanded** — teardown order now asserts the full
+  sequence including `clearInterval`, `setConnectedFollowersGetter(null)`,
+  `setTrayResetter(null)`, `removeListener`, `signalLeaderMode(false)`,
+  `detach()`.
+- **Task 20 clarified** — extension panel terminal runs in offscreen
+  via `RemoteTerminalView` (main.ts:622-624, 869-879). Panel-side
+  `setTrayResetter` would not bind the shell that processes
+  `host reset`. Task 17's offscreen-side `setTrayResetter` is
+  authoritative; Task 20 no longer wires `setTrayResetter` on the
+  panel side. Import path corrected to `../shell/...`. Panel
+  sender/subscriber pattern referenced from existing
+  `followerSprinkleSender` at main.ts:1436.
+- **Task 22 adds coverage gate** — `npm run test:coverage:chrome-extension`
+  (CI enforces 55/55/60/45 floors per root CLAUDE.md).
+- **Task 1 test helper** — uses existing `beforeEach` setup (the
+  helper `makeSprinkleManager()` doesn't exist in the codebase).
+- **Task 3 dedup** — `SprinkleSummaryEnvelope` already exists at
+  `messages.ts:30` (non-exported). Plan now exports the existing one
+  rather than defining a duplicate.
+
 ---
 
 ## Pre-flight
@@ -43,48 +92,50 @@ The leader's panel-side `installLeaderHooks` needs to push a sprinkle snapshot e
 
 - [ ] **Step 1: Write the failing test**
 
-  Add to `packages/webapp/tests/ui/sprinkle-manager.test.ts`:
+  Existing tests use a `beforeEach` block (sprinkle-manager.test.ts:66-76)
+  that constructs `mgr` from a `VirtualFS` instance. Add a nested
+  `describe` block that reuses the same `mgr`:
 
   ```ts
   describe('SprinkleManager.onChange', () => {
     it('fires once after refresh() completes', async () => {
-      const sm = makeSprinkleManager(); // existing test helper
       const calls: number[] = [];
-      const off = sm.onChange(() => calls.push(Date.now()));
-      await sm.refresh();
+      const off = mgr.onChange(() => calls.push(Date.now()));
+      await mgr.refresh();
       expect(calls.length).toBe(1);
       off();
     });
 
     it('fires once per open()/close() state change', async () => {
-      const sm = makeSprinkleManager();
-      await sm.refresh(); // seed
+      await mgr.refresh(); // seed
       const calls: number[] = [];
-      sm.onChange(() => calls.push(Date.now()));
-      await sm.open('welcome');
+      mgr.onChange(() => calls.push(Date.now()));
+      await mgr.open('welcome');
       expect(calls.length).toBe(1);
-      sm.close('welcome');
+      mgr.close('welcome');
       expect(calls.length).toBe(2);
     });
 
     it('returns an unsubscribe that stops firing', async () => {
-      const sm = makeSprinkleManager();
       const calls: number[] = [];
-      const off = sm.onChange(() => calls.push(Date.now()));
+      const off = mgr.onChange(() => calls.push(Date.now()));
       off();
-      await sm.refresh();
+      await mgr.refresh();
       expect(calls.length).toBe(0);
     });
 
     it('coalesces multiple refreshes within one microtask', async () => {
-      const sm = makeSprinkleManager();
       const calls: number[] = [];
-      sm.onChange(() => calls.push(Date.now()));
-      await Promise.all([sm.refresh(), sm.refresh(), sm.refresh()]);
+      mgr.onChange(() => calls.push(Date.now()));
+      await Promise.all([mgr.refresh(), mgr.refresh(), mgr.refresh()]);
       expect(calls.length).toBe(1);
     });
   });
   ```
+
+  If the test file's existing `mgr` is seeded with sprinkle files
+  (e.g. via `await fs.writeFile('/workspace/skills/welcome/welcome.shtml', …)`),
+  use those names in the `open`/`close` calls. Adjust if names differ.
 
 - [ ] **Step 2: Run test to verify it fails**
 
@@ -168,47 +219,68 @@ The leader's panel-side hook needs to forward scoop selection changes to offscre
 - Modify: `packages/webapp/src/ui/offscreen-client.ts`
 - Test: `packages/chrome-extension/tests/offscreen-bridge.test.ts` (or a new `packages/webapp/tests/ui/offscreen-client.test.ts` if one doesn't exist — check first)
 
-- [ ] **Step 1: Verify selectScoop location**
+**Reality check:** `OffscreenClient` does not have a `selectScoop` method.
+`selectedScoopJid` is a public field on the class (offscreen-client.ts:94)
+and is mutated directly by `mainExtension` at four sites: main.ts:657, 700,
+723, and 802. The cleanest fix is to add a public setter
+`setSelectedScoopJid(jid)` on `OffscreenClient` that fires the listeners,
+then refactor those four sites to use it.
+
+- [ ] **Step 1: Locate all selectedScoopJid mutation sites**
 
   ```bash
-  grep -n "selectScoop\|selectedScoopJid =" packages/webapp/src/ui/offscreen-client.ts | head -10
+  grep -n "client.selectedScoopJid\|\.selectedScoopJid = " packages/webapp/src/ui/main.ts
   ```
 
-  Confirm `selectScoop(jid)` is the single mutator. If multiple sites mutate, route them through one private setter before continuing.
+  Expected: four assignment sites in `mainExtension` (~lines 657, 700, 723,
+  802). Locking these down in this step prevents Task 20 from breaking on a
+  missed mutation point.
 
 - [ ] **Step 2: Write the failing test**
 
-  Add `packages/webapp/tests/ui/offscreen-client.test.ts` (create if needed):
+  Add `packages/webapp/tests/ui/offscreen-client.test.ts` (create if missing):
 
   ```ts
-  import { describe, it, expect, vi } from 'vitest';
+  import { describe, it, expect } from 'vitest';
   import { OffscreenClient } from '../../src/ui/offscreen-client.js';
 
-  describe('OffscreenClient.onScoopSelected', () => {
-    it('fires when selectScoop is called with a new jid', () => {
-      const client = new OffscreenClient(); // adjust constructor if it needs args
+  describe('OffscreenClient.setSelectedScoopJid + onScoopSelected', () => {
+    it('setSelectedScoopJid updates the field and fires listeners', () => {
+      const client = new OffscreenClient();
       const calls: string[] = [];
       client.onScoopSelected((jid) => calls.push(jid));
-      client.selectScoop('scoop-1');
+      client.setSelectedScoopJid('scoop-1');
+      expect(client.selectedScoopJid).toBe('scoop-1');
       expect(calls).toEqual(['scoop-1']);
     });
 
-    it('does not fire when selectScoop is called with the same jid', () => {
+    it('does not fire when the same jid is set twice', () => {
       const client = new OffscreenClient();
-      client.selectScoop('scoop-1');
+      client.setSelectedScoopJid('scoop-1');
       const calls: string[] = [];
       client.onScoopSelected((jid) => calls.push(jid));
-      client.selectScoop('scoop-1');
+      client.setSelectedScoopJid('scoop-1');
       expect(calls).toEqual([]);
     });
 
     it('returns an unsubscribe that stops firing', () => {
       const client = new OffscreenClient();
-      const calls: string[] = [];
-      const off = client.onScoopSelected((jid) => calls.push(jid));
+      const off = client.onScoopSelected(() => {
+        throw new Error('should not fire after off()');
+      });
       off();
-      client.selectScoop('scoop-2');
-      expect(calls).toEqual([]);
+      expect(() => client.setSelectedScoopJid('scoop-2')).not.toThrow();
+    });
+
+    it('handler throws are logged but do not break other listeners', () => {
+      const client = new OffscreenClient();
+      const calls: string[] = [];
+      client.onScoopSelected(() => {
+        throw new Error('first handler bad');
+      });
+      client.onScoopSelected((jid) => calls.push(jid));
+      client.setSelectedScoopJid('scoop-3');
+      expect(calls).toEqual(['scoop-3']);
     });
   });
   ```
@@ -219,41 +291,80 @@ The leader's panel-side hook needs to forward scoop selection changes to offscre
   npx vitest run packages/webapp/tests/ui/offscreen-client.test.ts
   ```
 
-  Expected: FAIL with `client.onScoopSelected is not a function`.
+  Expected: FAIL — `client.setSelectedScoopJid is not a function`.
 
-- [ ] **Step 4: Implement `onScoopSelected`**
+- [ ] **Step 4: Implement the setter + event hook**
 
-  In `packages/webapp/src/ui/offscreen-client.ts`, add to the class:
+  In `packages/webapp/src/ui/offscreen-client.ts`, the field is already
+  declared as `selectedScoopJid: string | null = null` (line 94). Make it
+  private and expose the setter + listener:
 
   ```ts
+  // Change the field declaration:
+  private _selectedScoopJid: string | null = null;
+
+  get selectedScoopJid(): string | null {
+    return this._selectedScoopJid;
+  }
+
+  // Existing direct assignments inside this class continue to work via the
+  // setter (declare it as a real setter, OR convert every internal
+  // assignment to setSelectedScoopJid). Easiest: keep `_selectedScoopJid`
+  // for internal writes that should NOT notify, and route external writes
+  // through the setter below.
+
   private readonly scoopSelectedListeners = new Set<(jid: string) => void>();
 
   onScoopSelected(handler: (jid: string) => void): () => void {
     this.scoopSelectedListeners.add(handler);
     return () => this.scoopSelectedListeners.delete(handler);
   }
-  ```
 
-  Then in `selectScoop`, fire after the mutation:
-
-  ```ts
-  selectScoop(jid: string): void {
-    if (this.selectedScoopJid === jid) return; // no-op on same selection
-    this.selectedScoopJid = jid;
+  setSelectedScoopJid(jid: string | null): void {
+    if (this._selectedScoopJid === jid) return;
+    this._selectedScoopJid = jid;
+    if (jid === null) return; // listeners only care about non-null selections
     for (const fn of this.scoopSelectedListeners) {
-      try { fn(jid); } catch (err) {
-        log.warn('onScoopSelected handler threw', {
-          error: err instanceof Error ? err.message : String(err),
-        });
+      try {
+        fn(jid);
+      } catch (err) {
+        // eslint-disable-next-line no-console -- logger may not be in scope here
+        console.warn('[offscreen-client] onScoopSelected handler threw:', err);
       }
     }
-    // … existing post-selection logic (e.g. request-scoop-messages send)
   }
   ```
 
-  Make sure the early-return on same-jid doesn't break existing behavior — check for any callsites that rely on `selectScoop` being idempotent-with-side-effects (e.g. re-requesting messages). If so, keep those side effects but gate only the listener fire.
+  **Important:** every internal read of `this.selectedScoopJid` in the file
+  still works via the getter. Find every internal assignment to
+  `this.selectedScoopJid` and decide whether it should notify or not
+  (internal bookkeeping = use `_selectedScoopJid`; user-initiated = use
+  `setSelectedScoopJid`). Search:
 
-- [ ] **Step 5: Run test to verify it passes**
+  ```bash
+  grep -n "this.selectedScoopJid =\|this._selectedScoopJid =" packages/webapp/src/ui/offscreen-client.ts
+  ```
+
+  Convert each one. The current code has none — the field is mutated only
+  externally — so this is purely additive.
+
+- [ ] **Step 5: Refactor mainExtension's four mutation sites**
+
+  In `packages/webapp/src/ui/main.ts`, replace each
+  `client.selectedScoopJid = X` with `client.setSelectedScoopJid(X)`. The
+  four sites are at approximately:
+  - main.ts:657 — inside the local `selectScoop` function
+  - main.ts:700 — inside `onReady` first-scoop init
+  - main.ts:723 — cone-fallback init
+  - main.ts:802 — switch-on-tab-click handler
+
+  ```bash
+  grep -n "client.selectedScoopJid = " packages/webapp/src/ui/main.ts
+  ```
+
+  Run the grep again after edits to confirm zero matches remain.
+
+- [ ] **Step 6: Run test to verify it passes**
 
   ```bash
   npx vitest run packages/webapp/tests/ui/offscreen-client.test.ts
@@ -261,23 +372,29 @@ The leader's panel-side hook needs to forward scoop selection changes to offscre
 
   Expected: PASS.
 
-- [ ] **Step 6: Format + run webapp tests**
+- [ ] **Step 7: Format + run webapp tests**
 
   ```bash
-  npx prettier --write packages/webapp/src/ui/offscreen-client.ts packages/webapp/tests/ui/offscreen-client.test.ts
+  npx prettier --write packages/webapp/src/ui/offscreen-client.ts packages/webapp/src/ui/main.ts packages/webapp/tests/ui/offscreen-client.test.ts
+  npm run typecheck
   npx vitest run packages/webapp/tests/ui/
   ```
 
-  Expected: all webapp ui tests pass.
+  Expected: typecheck clean (the `get`-only accessor on `selectedScoopJid`
+  blocks external assignment — the typecheck catches any sites I missed in
+  step 5). All webapp ui tests pass.
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 8: Commit**
 
   ```bash
-  git add packages/webapp/src/ui/offscreen-client.ts packages/webapp/tests/ui/offscreen-client.test.ts
-  git commit -m "feat(webapp): OffscreenClient.onScoopSelected event hook
+  git add packages/webapp/src/ui/offscreen-client.ts packages/webapp/src/ui/main.ts packages/webapp/tests/ui/offscreen-client.test.ts
+  git commit -m "feat(webapp): OffscreenClient.setSelectedScoopJid + onScoopSelected (#682)
 
-  Prerequisite for #682 — extension-leader panel push of active scoop
-  selection to offscreen so LeaderSyncManager.getScoopJid() resolves
+  selectedScoopJid was a public field mutated directly from mainExtension
+  at four sites. Field is now backed by a getter; writes go through a
+  public setter that fires listeners. All four mainExtension sites
+  refactored. Required for #682 extension-leader's panel push of the
+  active scoop to offscreen so LeaderSyncManager.getScoopJid() resolves
   to the panel-viewed scoop, not always the cone.
 
   Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>"
@@ -362,32 +479,18 @@ All eight new message types are purely additive (no behavior change yet). Adding
 
 - [ ] **Step 3: Add the types to `messages.ts`**
 
-  Append to `packages/chrome-extension/src/messages.ts` (above the union types if they're inline, or at the appropriate spot if the file uses sections):
+  Note: `SprinkleSummaryEnvelope` already exists at `messages.ts:30` as a
+  non-exported `interface`. Convert that existing declaration to `export
+interface SprinkleSummaryEnvelope` (so the leader bridge in Task 9 can
+  import it). The existing `_AssertSprinkleSummaryEnvelopeMatches`
+  assertion in `follower-sprinkle-bridge.ts:43` continues to guard the
+  shape — no new assertion needed.
+
+  Then append to `packages/chrome-extension/src/messages.ts`:
 
   ```ts
   import type { LeaderTrayRuntimeStatus } from '../../webapp/src/scoops/tray-leader.js';
   import type { MessageAttachment } from '../../webapp/src/core/attachments.js';
-
-  /** Shape-compatible envelope for SprinkleSummary[] across the wire.
-   *  Mirrored inline (not imported) to keep tray-sync-protocol's value
-   *  imports out of the chrome-extension build graph. */
-  export interface SprinkleSummaryEnvelope {
-    name: string;
-    title: string;
-    path: string;
-    open: boolean;
-    autoOpen: boolean;
-    icon?: string;
-  }
-
-  // Compile-time invariant: envelope shape stays assignable to SprinkleSummary.
-  type _AssertLeaderSprinkleSummaryEnvelopeMatches =
-    SprinkleSummaryEnvelope[] extends import('../../webapp/src/scoops/tray-sync-protocol.js').SprinkleSummary[]
-      ? import('../../webapp/src/scoops/tray-sync-protocol.js').SprinkleSummary[] extends SprinkleSummaryEnvelope[]
-        ? true
-        : never
-      : never;
-  const _leaderSprinkleSummaryEnvelopeMatches: _AssertLeaderSprinkleSummaryEnvelopeMatches = true;
 
   export interface LeaderSprinklesSnapshotMsg {
     type: 'leader-sprinkles-snapshot';
@@ -481,7 +584,7 @@ All eight new message types are purely additive (no behavior change yet). Adding
 
 ### Task 4: Extend `OffscreenBridge` — active-scoop tracking
 
-`OffscreenBridge` becomes the single source of truth for the panel's active scoop (replacing the always-cone behavior at `offscreen-bridge.ts:373`). Add a setter, getter, and an inbound `leader-active-scoop` envelope handler.
+`OffscreenBridge` becomes the single source of truth for the panel's active scoop (replacing the always-cone behavior at `offscreen-bridge.ts:373`). Add a setter + getter only — the inbound `leader-active-scoop` envelope route lives on the leader-sync hub adapter (Task 9), not on the bridge's panel message switch. Single listener per envelope avoids dual handlers on `chrome.runtime.onMessage`.
 
 **Files:**
 
@@ -511,22 +614,12 @@ All eight new message types are purely additive (no behavior change yet). Adding
       bridge.setActiveScoopJid(null);
       expect(bridge.getActiveScoopJid()).toBeNull();
     });
-
-    it('handles leader-active-scoop envelope', async () => {
-      const bridge = new OffscreenBridge(/* … */);
-      await bridge.bind(/* mock orchestrator */, undefined);
-      // Simulate a panel envelope by invoking the registered chrome.runtime
-      // listener with the typed payload.
-      const listener = mockChrome.runtime.onMessage.addListener.mock.calls.at(-1)![0];
-      listener(
-        { source: 'panel', payload: { type: 'leader-active-scoop', scoopJid: 'scoop-7' } },
-        {},
-        () => {}
-      );
-      expect(bridge.getActiveScoopJid()).toBe('scoop-7');
-    });
   });
   ```
+
+  Note: there is NO test for `leader-active-scoop` envelope handling here —
+  the hub adapter (Task 9) is the single inbound route and writes through
+  to this setter. Bridge only owns the cache via the public API.
 
 - [ ] **Step 2: Run test to verify it fails**
 
@@ -554,14 +647,10 @@ All eight new message types are purely additive (no behavior change yet). Adding
   }
   ```
 
-  In `setupMessageListener` (or wherever the panel-envelope switch lives), add the case:
-
-  ```ts
-  case 'leader-active-scoop': {
-    this.setActiveScoopJid(msg.scoopJid);
-    break;
-  }
-  ```
+  Do **not** add a `case 'leader-active-scoop':` to the bridge's panel
+  envelope switch — the hub adapter in Task 9 is the single inbound route
+  for that envelope. Keeping the bridge's `setupMessageListener` ignorant
+  of it avoids dual handlers on `chrome.runtime.onMessage`.
 
 - [ ] **Step 4: Run test to verify it passes**
 
@@ -1773,27 +1862,34 @@ First slice of the factory. Constructs `LeaderSyncManager` with the data-source 
   }
 
   describe('startExtensionLeaderTray — read-only callbacks', () => {
-    it('LeaderSyncManager.getMessages reads from bridge.getMessagesForJid(activeJid)', () => {
-      const orchestrator = makeMockOrchestrator([
-        { jid: 'cone-1', name: 'cone', isCone: true, folder: 'cone' },
-      ]);
-      const bridge = makeMockBridge({
-        coneJid: 'cone-1',
-        messages: { 'cone-1': [{ id: 'm1', role: 'user', content: 'hi' }] },
-      });
+    function startWithCapture(
+      overrides: Partial<Parameters<typeof startExtensionLeaderTray>[0]> = {}
+    ) {
+      let capturedOptions!: LeaderSyncManagerOptions;
+      const orchestrator =
+        overrides.orchestrator ??
+        makeMockOrchestrator([{ jid: 'cone-1', name: 'cone', isCone: true, folder: 'cone' }]);
+      const bridge = overrides.bridge ?? makeMockBridge({ coneJid: 'cone-1' });
       const handle = startExtensionLeaderTray({
         workerBaseUrl: 'wss://test',
         bridge: bridge as any,
         orchestrator: orchestrator as any,
-        sharedFs: makeMockSharedFs() as any,
-        browser: makeStubBrowser(),
+        sharedFs: overrides.sharedFs ?? (makeMockSharedFs() as any),
+        browser: overrides.browser ?? makeStubBrowser(),
         log: console as any,
-        // Inject test doubles for tray + peer constructors:
+        leaderBridge:
+          overrides.leaderBridge ??
+          ({
+            getSprinkles: () => [],
+            resolveSprinklePath: () => null,
+            signalLeaderMode: vi.fn(),
+            detach: vi.fn(),
+          } as any),
         _trayLeaderFactory: () =>
           ({
             start: vi.fn().mockResolvedValue({}),
             stop: vi.fn(),
-            clearSession: vi.fn(),
+            clearSession: vi.fn().mockResolvedValue(undefined),
             sendControlMessage: vi.fn(),
           }) as any,
         _peerManagerFactory: () =>
@@ -1802,19 +1898,25 @@ First slice of the factory. Constructs `LeaderSyncManager` with the data-source 
             getPeers: vi.fn(() => []),
             handleControlMessage: vi.fn().mockResolvedValue(undefined),
           }) as any,
-        _leaderBridge: {
-          getSprinkles: () => [],
-          resolveSprinklePath: () => null,
-          signalLeaderMode: vi.fn(),
-          detach: vi.fn(),
-        } as any,
+        _onSyncOptions: (opts) => {
+          capturedOptions = opts;
+        },
+        ...overrides,
       });
-      // The factory exposes `sync` for testing.
-      expect(handle.sync.getMessages?.()).toHaveLength(1);
+      return { handle, options: capturedOptions, orchestrator, bridge };
+    }
+
+    it('getMessages reads from bridge.getMessagesForJid(activeJid)', () => {
+      const bridge = makeMockBridge({
+        coneJid: 'cone-1',
+        messages: { 'cone-1': [{ id: 'm1', role: 'user', content: 'hi' }] },
+      });
+      const { handle, options } = startWithCapture({ bridge: bridge as any });
+      expect(options.getMessages()).toHaveLength(1);
       handle.stop();
     });
 
-    it('getScoops projects orchestrator scoops to SprinkleSummary shape', () => {
+    it('getScoops projects orchestrator scoops to ScoopSummary shape', () => {
       const orchestrator = makeMockOrchestrator([
         {
           jid: 'c',
@@ -1833,9 +1935,25 @@ First slice of the factory. Constructs `LeaderSyncManager` with the data-source 
           trigger: undefined,
         },
       ]);
-      const handle = startExtensionLeaderTray(/* … */); // wire similarly
-      // assert via private inspection of LeaderSyncManagerOptions
-      // (use a captured options object — see Step 3 for how)
+      const { handle, options } = startWithCapture({ orchestrator: orchestrator as any });
+      expect(options.getScoops?.()).toEqual([
+        {
+          jid: 'c',
+          name: 'cone',
+          folder: 'cone',
+          isCone: true,
+          assistantLabel: 'sliccy',
+          trigger: undefined,
+        },
+        {
+          jid: 's',
+          name: 'helper',
+          folder: 'helper',
+          isCone: false,
+          assistantLabel: 'helper',
+          trigger: undefined,
+        },
+      ]);
       handle.stop();
     });
 
@@ -1849,16 +1967,22 @@ First slice of the factory. Constructs `LeaderSyncManager` with the data-source 
         detach: vi.fn(),
       };
       const sharedFs = makeMockSharedFs({ '/welcome.shtml': '<p>hi</p>' });
-      const handle = startExtensionLeaderTray(/* wire with these */);
-      const content = await handle.sync.readSprinkleContent?.('w');
-      expect(content).toBe('<p>hi</p>');
-      expect(await handle.sync.readSprinkleContent?.('nope')).toBeNull();
+      const { handle, options } = startWithCapture({
+        leaderBridge: leaderBridge as any,
+        sharedFs: sharedFs as any,
+      });
+      expect(await options.readSprinkleContent?.('w')).toBe('<p>hi</p>');
+      expect(await options.readSprinkleContent?.('nope')).toBeNull();
       handle.stop();
     });
   });
   ```
 
-  (The test uses options-injection seams `_trayLeaderFactory`, `_peerManagerFactory`, `_leaderBridge` so we don't need real WebSocket / RTCDataChannel / SprinkleManager. Spec §test extraction calls this out.)
+  (The `startWithCapture` helper uses the `_onSyncOptions` test seam — see
+  Step 3 — to grab the `LeaderSyncManagerOptions` object the factory hands to
+  `new LeaderSyncManager()`. Tests then call the callbacks directly. This
+  avoids reaching for non-public `LeaderSyncManager` methods that don't
+  exist as a public API.)
 
 - [ ] **Step 2: Run + verify fail**
 
@@ -1888,7 +2012,7 @@ First slice of the factory. Constructs `LeaderSyncManager` with the data-source 
   import type { Orchestrator } from '../../webapp/src/scoops/orchestrator.js';
   import type { BrowserAPI } from '../../webapp/src/cdp/browser-api.js';
   import type { VirtualFS } from '../../webapp/src/fs/virtual-fs.js';
-  import type { ChannelMessage } from '../../webapp/src/scoops/messages.js';
+  import type { ChannelMessage } from '../../webapp/src/scoops/types.js';
   import type { OffscreenBridge } from './offscreen-bridge.js';
   import type { OffscreenLeaderSyncBridgeHandle } from './leader-sync-bridge.js';
 
@@ -1937,6 +2061,10 @@ First slice of the factory. Constructs `LeaderSyncManager` with the data-source 
     /** @internal */ _trayLeaderFactory?: (cfg: any) => LeaderTrayManager;
     /** @internal */ _peerManagerFactory?: (cfg: any) => LeaderTrayPeerManager;
     /** @internal */ _refreshIntervalMs?: number;
+    /** @internal Fires once with the LeaderSyncManagerOptions object the
+     *  factory constructed, so tests can drive the callbacks directly
+     *  without reaching for private LeaderSyncManager internals. */
+    _onSyncOptions?: (opts: LeaderSyncManagerOptions) => void;
   }
 
   export function startExtensionLeaderTray(
@@ -1993,6 +2121,7 @@ First slice of the factory. Constructs `LeaderSyncManager` with the data-source 
       vfs: sharedFs ?? undefined,
     };
     sync = new LeaderSyncManager(syncOptions);
+    options._onSyncOptions?.(syncOptions);
     browser.setTrayTargetProvider?.(sync);
 
     // Stubs for the bits we'll fill in later tasks:
@@ -2077,23 +2206,20 @@ Most subtle part of the factory. Sync work runs inline; orchestrator dispatch ru
 
   ```ts
   describe('startExtensionLeaderTray onFollowerMessage', () => {
-    it('emits panel echo, persists, rebroadcasts synchronously', async () => {
+    it('emits panel echo, persists, rebroadcasts synchronously', () => {
       const bridge = makeMockBridge({ coneJid: 'cone-1' });
-      const orchestrator = makeMockOrchestrator([
-        { jid: 'cone-1', name: 'cone', isCone: true, folder: 'cone' },
-      ]);
-      const handle = startExtensionLeaderTray(/* … */);
-      // Simulate a follower message by calling the option directly:
-      const options = (handle.sync as any).options as LeaderSyncManagerOptions;
+      const { handle, options } = startWithCapture({ bridge: bridge as any });
+      // Spy BEFORE invoking — otherwise the synchronous broadcast call
+      // happens before the spy is installed and the assertion can't catch it.
+      const broadcastSpy = vi.spyOn(handle.sync, 'broadcastUserMessage');
       options.onFollowerMessage('hi', 'm-99', undefined);
       expect(bridge.notifyPanelIncomingMessage).toHaveBeenCalledWith(
         'cone-1',
         expect.objectContaining({ id: 'm-99', channel: 'web' })
       );
       expect(bridge.persistScoop).toHaveBeenCalledWith('cone-1');
-      // Synchronous rebroadcast — assert before any microtask.
-      const broadcast = vi.spyOn(handle.sync, 'broadcastUserMessage');
-      // (use vi.spyOn before invoking the second time to verify)
+      expect(broadcastSpy).toHaveBeenCalledWith('hi', 'm-99', undefined);
+      handle.stop();
     });
 
     it('orchestrator.handleMessage runs in fire-and-forget IIFE (no await)', async () => {
@@ -2108,26 +2234,33 @@ Most subtle part of the factory. Sync work runs inline; orchestrator dispatch ru
             dispatchResolve = res;
           })
       );
-      const handle = startExtensionLeaderTray(/* … */);
-      const options = (handle.sync as any).options as LeaderSyncManagerOptions;
-      // Should return synchronously even though handleMessage is pending.
+      const { handle, options } = startWithCapture({
+        bridge: bridge as any,
+        orchestrator: orchestrator as any,
+      });
+      // The callback returns undefined synchronously even though
+      // handleMessage hasn't resolved.
       const returned = options.onFollowerMessage('hi', 'm-99', undefined);
       expect(returned).toBeUndefined();
-      // handleMessage was called but hasn't resolved yet.
       expect(orchestrator.handleMessage).toHaveBeenCalled();
+      expect(orchestrator.createScoopTab).not.toHaveBeenCalled();
       dispatchResolve();
       await Promise.resolve();
       expect(orchestrator.createScoopTab).toHaveBeenCalledWith('cone-1');
+      handle.stop();
     });
 
     it('no active scoop → no-op', () => {
       const bridge = makeMockBridge({ coneJid: null });
       const orchestrator = makeMockOrchestrator([]);
-      const handle = startExtensionLeaderTray(/* … */);
-      const options = (handle.sync as any).options as LeaderSyncManagerOptions;
+      const { handle, options } = startWithCapture({
+        bridge: bridge as any,
+        orchestrator: orchestrator as any,
+      });
       options.onFollowerMessage('hi', 'm-99', undefined);
       expect(bridge.notifyPanelIncomingMessage).not.toHaveBeenCalled();
       expect(orchestrator.handleMessage).not.toHaveBeenCalled();
+      handle.stop();
     });
   });
   ```
@@ -2604,12 +2737,12 @@ Panel terminal `host` reads from module-level `host-command.ts` singletons. Wire
   });
 
   it('leader-tray-reset envelope triggers reset + replies with status', async () => {
-    const handle = startExtensionLeaderTray(/* … */);
-    // Inject a mock chrome.runtime listener for the reset envelope:
+    const { handle } = startWithCapture();
+    // Find the reset listener registered on chrome.runtime.onMessage.
+    // It's the most recent addListener call; if multiple listeners are
+    // registered the test should filter by predicate.
     sentMessages.length = 0;
     const listener = mockChrome.runtime.onMessage.addListener.mock.calls.at(-1)![0];
-    handle.leader.start = vi.fn().mockResolvedValue({});
-    handle.leader.clearSession = vi.fn().mockResolvedValue(undefined);
     listener(
       { source: 'panel', payload: { type: 'leader-tray-reset', requestId: 'r-1' } },
       {},
@@ -2621,7 +2754,37 @@ Panel terminal `host` reads from module-level `host-command.ts` singletons. Wire
     ) as any;
     expect(reply.payload).toMatchObject({ requestId: 'r-1', ok: true });
     expect(handle.leader.clearSession).toHaveBeenCalled();
-    expect(handle.leader.start).toHaveBeenCalledTimes(2); // initial start + reset
+    // The factory itself doesn't call start() on boot — that's offscreen.ts's
+    // job (Task 19). In this isolated factory test, reset is the only start.
+    expect(handle.leader.start).toHaveBeenCalledTimes(1);
+  });
+
+  it('onFollowerCountChanged writes slicc.leaderTrayFollowers to localStorage', () => {
+    const setItem = vi.fn();
+    const originalLocalStorage = (globalThis as any).window?.localStorage;
+    (globalThis as any).window = { localStorage: { setItem } };
+    try {
+      const { handle, options } = startWithCapture();
+      handle.peers.getPeers = vi.fn(
+        () =>
+          [
+            {
+              bootstrapId: 'b1',
+              runtime: 'slicc-standalone',
+              connectedAt: '2026-05-20T00:00:00Z',
+            },
+          ] as any
+      );
+      options.onFollowerCountChanged?.(1);
+      expect(setItem).toHaveBeenCalledWith(
+        'slicc.leaderTrayFollowers',
+        JSON.stringify([
+          { runtimeId: 'b1', runtime: 'slicc-standalone', connectedAt: '2026-05-20T00:00:00Z' },
+        ])
+      );
+    } finally {
+      if (originalLocalStorage) (globalThis as any).window.localStorage = originalLocalStorage;
+    }
   });
   ```
 
@@ -2662,6 +2825,33 @@ Panel terminal `host` reads from module-level `host-command.ts` singletons. Wire
     return getLeaderTrayRuntimeStatus();
   };
   setTrayResetter(resetSequence);
+
+  // onFollowerCountChanged → write slicc.leaderTrayFollowers (parity with
+  // standalone main.ts:2465-2476). Extension panel terminal runs in
+  // offscreen via RemoteTerminalView and shares this realm's
+  // localStorage, so the host-command.ts fallback at lines 74-84 picks
+  // up the value.
+  syncOptions.onFollowerCountChanged = (_count: number) => {
+    const peers = trayPeers.getPeers().map((p) => ({
+      runtimeId: p.bootstrapId,
+      runtime: p.runtime,
+      connectedAt: p.connectedAt ?? undefined,
+    }));
+    try {
+      window.localStorage.setItem('slicc.leaderTrayFollowers', JSON.stringify(peers));
+    } catch (err) {
+      log.warn('Failed to persist leaderTrayFollowers', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  };
+  // (If the factory has already constructed `sync` before reaching this
+  // point, this assignment mutates the options object the sync holds a
+  // reference to. If sync clones its options at construction time, declare
+  // the callback inside the syncOptions object literal in Task 11
+  // instead — verify by reading LeaderSyncManager.constructor, currently
+  // tray-leader-sync.ts:155 stores `this.options = options` by reference,
+  // so post-construction mutation works.)
 
   // leader-tray-reset RPC listener.
   const resetListener = (message: unknown) => {
@@ -2737,15 +2927,20 @@ Order: `unsubAgent` → clear intervals → `sync.stop()` → `peers.stop()` →
   it('stop() tears down in the standalone order', () => {
     const calls: string[] = [];
     const unsubAgent = vi.fn(() => calls.push('unsubAgent'));
+    const bridge = makeMockBridge({ coneJid: 'cone-1' });
     bridge.onAgentEvent.mockImplementation(() => unsubAgent);
     const leaderBridge = {
       getSprinkles: () => [],
       resolveSprinklePath: () => null,
-      signalLeaderMode: vi.fn(),
+      signalLeaderMode: vi.fn(() => calls.push('signalLeaderMode(false)')),
       detach: vi.fn(() => calls.push('leaderBridge.detach')),
     };
-    const handle = startExtensionLeaderTray({
-      /* …, _leaderBridge: leaderBridge */
+    const removeListenerSpy = vi.fn(() => calls.push('removeListener'));
+    mockChrome.runtime.onMessage.removeListener = removeListenerSpy as any;
+
+    const { handle } = startWithCapture({
+      bridge: bridge as any,
+      leaderBridge: leaderBridge as any,
     });
     vi.spyOn(handle.sync, 'stop').mockImplementation(() => {
       calls.push('sync');
@@ -2757,11 +2952,29 @@ Order: `unsubAgent` → clear intervals → `sync.stop()` → `peers.stop()` →
       calls.push('leader');
     });
     handle.stop();
-    expect(calls).toEqual(['unsubAgent', 'sync', 'peers', 'leader', 'leaderBridge.detach']);
+    expect(calls).toEqual([
+      'unsubAgent',
+      'sync',
+      'peers',
+      'leader',
+      'removeListener',
+      'signalLeaderMode(false)',
+      'leaderBridge.detach',
+    ]);
+    // signalLeaderMode receives `false`.
+    expect(leaderBridge.signalLeaderMode).toHaveBeenCalledWith(false);
+  });
+
+  it('stop() also clears intervals + host-command setters', () => {
+    const clearSpy = vi.spyOn(global, 'clearInterval');
+    const { handle } = startWithCapture();
+    handle.stop();
+    expect(clearSpy).toHaveBeenCalled();
+    expect(getConnectedFollowers()).toEqual([]); // setter cleared
   });
 
   it('stop() is idempotent', () => {
-    const handle = startExtensionLeaderTray(/* … */);
+    const { handle } = startWithCapture();
     handle.stop();
     expect(() => handle.stop()).not.toThrow();
   });
@@ -3018,8 +3231,12 @@ In `mainExtension` (the side-panel boot path), construct `PanelLeaderSyncProxy`,
     sprinkleManager.setSendToSprinkleHook(handleSprinkleUpdate);
     layout.panels.chat.setOnLocalUserMessage(handleLocalUserMessage);
 
-    // Panel terminal `host reset` → offscreen RPC.
-    setTrayResetter(() => leaderSyncProxy.resetTray());
+    // NOTE: do NOT wire setTrayResetter here. The extension panel terminal
+    // executes in offscreen via RemoteTerminalView (main.ts:622-624,
+    // 869-879), so `host reset` runs the offscreen-side host-command
+    // singletons — Task 17 already wires setTrayResetter there. Adding a
+    // panel-side setTrayResetter would bind a different module instance
+    // that the terminal shell never consults.
   }
 
   function removeLeaderHooks() {
@@ -3031,7 +3248,6 @@ In `mainExtension` (the side-panel boot path), construct `PanelLeaderSyncProxy`,
     offSprinklesChanged = null;
     sprinkleManager.setSendToSprinkleHook(undefined);
     layout.panels.chat.setOnLocalUserMessage(undefined);
-    setTrayResetter(null);
   }
 
   // Boot-time: ask offscreen to re-emit its current state so popouts
@@ -3039,14 +3255,25 @@ In `mainExtension` (the side-panel boot path), construct `PanelLeaderSyncProxy`,
   leaderSyncProxy.requestModeState();
   ```
 
-  Add imports:
+  Add imports (path is relative to `packages/webapp/src/ui/main.ts`):
 
   ```ts
   import { PanelLeaderSyncProxy } from '../../../chrome-extension/src/leader-sync-bridge.js';
-  import { setTrayResetter } from './shell/supplemental-commands/host-command.js';
   ```
 
-  Construct `panelSender` / `panelSubscriber` from `chrome.runtime` if not already available; check the existing patterns used by `PanelFollowerSprinkleProxy` for the canonical shape (it should be present already in mainExtension).
+  Construct `panelSender` / `panelSubscriber` using the same shape as
+  `followerSprinkleSender` at `main.ts:1436-1467` (the canonical
+  chrome.runtime sender + subscriber for the panel). Specifically the
+  `followerSprinkleSender` is `{ send: (envelope) => chrome.runtime.sendMessage(envelope).catch(…) }`
+  and the matching subscriber is built from `chrome.runtime.onMessage.addListener`.
+  Copy that exact shape (rename if you want a distinct identifier) — do
+  not invent your own.
+
+  The `PanelLeaderSyncProxy` exposes the `resetTray()` method but in
+  extension mode no panel-side consumer calls it (host reset goes through
+  offscreen, per Task 17). It's still useful to expose for future
+  panel-realm callers — leave it on the class but don't wire it from
+  install/removeLeaderHooks.
 
 - [ ] **Step 3: Format + typecheck + build**
 
@@ -3152,17 +3379,21 @@ Update `architecture.md` and `packages/chrome-extension/CLAUDE.md` to reflect th
 
 Run the complete CI gate the repo uses. Then drive the 13-step manual test plan from the spec.
 
-- [ ] **Step 1: Run all four CI gates**
+- [ ] **Step 1: Run all CI gates including coverage**
 
   ```bash
   npx prettier --check .
   npm run typecheck
   npm run test
+  npm run test:coverage:chrome-extension
   npm run build
   npm run build -w @slicc/chrome-extension
   ```
 
-  Expected: all five pass. (Note: `npm run test:coverage` is also a gate but locally optional; CI enforces it.)
+  Expected: all six pass. The `test:coverage:chrome-extension` gate
+  enforces the 55/55/60/45 floors documented in root `CLAUDE.md` —
+  most #682 additions land in `packages/chrome-extension/` so this
+  is the gate most likely to bite. Run it locally before pushing.
 
 - [ ] **Step 2: Manual test 1 — Boot extension as leader**
 
