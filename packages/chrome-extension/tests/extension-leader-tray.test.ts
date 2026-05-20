@@ -190,6 +190,67 @@ describe('startExtensionLeaderTray — read-only callbacks', () => {
     expect(await options.readSprinkleContent?.('nope')).toBeNull();
     handle.stop();
   });
+
+  it('readSprinkleContent silently returns null on ENOENT (file deleted between snapshot and read)', async () => {
+    // ENOENT is the expected race: the leader broadcasts a sprinkles
+    // snapshot, a follower asks for the content, the file gets deleted
+    // in between. That's not an error worth logging — it's normal
+    // concurrent edits. Anything ELSE (disk full, permission denied,
+    // etc.) IS an error and must surface.
+    const leaderBridge = {
+      getSprinkles: () => [
+        { name: 'w', title: 'W', path: '/welcome.shtml', open: false, autoOpen: false },
+      ],
+      resolveSprinklePath: (_name: string) => '/welcome.shtml',
+      signalLeaderMode: vi.fn(),
+      detach: vi.fn(),
+    };
+    const sharedFs = {
+      readFile: vi.fn(async () => {
+        const err = new Error('not found') as Error & { code?: string };
+        err.code = 'ENOENT';
+        throw err;
+      }),
+    };
+    const log = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() };
+    const { handle, options } = startWithCapture({
+      leaderBridge: leaderBridge as any,
+      sharedFs: sharedFs as any,
+      log: log as any,
+    });
+    expect(await options.readSprinkleContent?.('w')).toBeNull();
+    // ENOENT must NOT trip the error log — it's expected.
+    expect(log.error).not.toHaveBeenCalled();
+    handle.stop();
+  });
+
+  it('readSprinkleContent logs at error level on non-ENOENT failures (e.g. disk full)', async () => {
+    const leaderBridge = {
+      getSprinkles: () => [
+        { name: 'w', title: 'W', path: '/welcome.shtml', open: false, autoOpen: false },
+      ],
+      resolveSprinklePath: (_name: string) => '/welcome.shtml',
+      signalLeaderMode: vi.fn(),
+      detach: vi.fn(),
+    };
+    const sharedFs = {
+      readFile: vi.fn(async () => {
+        throw new Error('disk full');
+      }),
+    };
+    const log = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() };
+    const { handle, options } = startWithCapture({
+      leaderBridge: leaderBridge as any,
+      sharedFs: sharedFs as any,
+      log: log as any,
+    });
+    expect(await options.readSprinkleContent?.('w')).toBeNull();
+    expect(log.error).toHaveBeenCalledWith(
+      'readSprinkleContent failed',
+      expect.objectContaining({ name: 'w', error: 'disk full' })
+    );
+    handle.stop();
+  });
 });
 
 describe('startExtensionLeaderTray onFollowerMessage', () => {

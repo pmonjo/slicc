@@ -485,4 +485,33 @@ describe('OffscreenClient.setSelectedScoopJid + onScoopSelected', () => {
     localClient.setSelectedScoopJid('scoop-3');
     expect(calls).toEqual(['scoop-3']);
   });
+
+  it('setSelectedScoopJid(null) updates the field but does NOT fire listeners', () => {
+    // The deliberate contract: a null clear is internal bookkeeping
+    // (no scoop selected), not a selection event. Listeners ONLY fire
+    // on transitions to a non-null jid. Without this gate, downstream
+    // observers (e.g. the extension-leader hooks pushing active-scoop
+    // to offscreen) would mistakenly broadcast a "selection" with a
+    // null payload on every clear.
+    localClient.setSelectedScoopJid('scoop-1');
+    const calls: string[] = [];
+    localClient.onScoopSelected((jid) => calls.push(jid));
+    localClient.setSelectedScoopJid(null);
+    expect(localClient.selectedScoopJid).toBeNull();
+    expect(calls).toEqual([]);
+  });
+
+  it('setSelectedScoopJid(null) followed by non-null fires the listener', () => {
+    // The flip side of the contract above: clearing to null and then
+    // selecting a new scoop MUST fire the listener for the new scoop.
+    // (If the null clear silently advanced state without resetting the
+    // change-detection gate, the next selection could be treated as
+    // unchanged.)
+    localClient.setSelectedScoopJid('scoop-1');
+    localClient.setSelectedScoopJid(null);
+    const calls: string[] = [];
+    localClient.onScoopSelected((jid) => calls.push(jid));
+    localClient.setSelectedScoopJid('scoop-2');
+    expect(calls).toEqual(['scoop-2']);
+  });
 });

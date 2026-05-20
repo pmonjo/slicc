@@ -244,6 +244,33 @@ describe('createExtensionLeaderHooks', () => {
     expect(handle.isInstalled()).toBe(false);
   });
 
+  it('disposed → leader-mode-changed: true is a no-op (does not re-install)', () => {
+    // The disposed-gate at extension-leader-hooks.ts:118 prevents a
+    // late offscreen activation from re-installing hooks after teardown.
+    // Without that gate, an offscreen-side late `leader-mode-changed: true`
+    // (e.g., a delayed reply from a previous session) would reach a
+    // disposed handle and re-attach listeners against now-dead bus
+    // subscribers — silent leak.
+    const bus = createBus();
+    const s = makeStubs();
+    const handle = createExtensionLeaderHooks({
+      sender: bus.panelSender,
+      subscriber: bus.panelSubscriber,
+      ...s,
+    });
+    handle.dispose();
+    // After dispose, a late offscreen activation must NOT re-install hooks.
+    bus.offscreenToPanel({
+      source: 'offscreen',
+      payload: { type: 'leader-mode-changed', active: true },
+    });
+    expect(handle.isInstalled()).toBe(false);
+    expect(s.client.onScoopSelected).not.toHaveBeenCalled();
+    expect(s.sprinkleManager.onChange).not.toHaveBeenCalled();
+    expect(s.sprinkleManager.setSendToSprinkleHook).not.toHaveBeenCalled();
+    expect(s.chat.setOnLocalUserMessage).not.toHaveBeenCalled();
+  });
+
   it('sends requestModeState() at construction', () => {
     const bus = createBus();
     const s = makeStubs();
