@@ -110,23 +110,23 @@ export class OffscreenBridge implements KernelFacade {
   private transportUnsubscribe: (() => void) | null = null;
   /**
    * The panel's currently-viewed scoop jid. Single source of truth for
-   * the leader-sync hub adapter (Task 9), which writes this via
-   * `setActiveScoopJid()` whenever a `leader-active-scoop` envelope
-   * arrives from the panel. Read by snapshot/leader-broadcast paths to
-   * replace the always-cone behavior previously baked into
-   * `state-snapshot.activeScoopJid`. The bridge owns only the cache; no
-   * envelope handler lives on the panel-message switch (the hub adapter
-   * is the single inbound route).
+   * the leader-sync hub adapter (`OffscreenLeaderSyncBridge` in
+   * `leader-sync-bridge.ts`), which writes this via `setActiveScoopJid()`
+   * whenever a `leader-active-scoop` envelope arrives from the panel.
+   * Read by snapshot/leader-broadcast paths to replace the always-cone
+   * behavior previously baked into `state-snapshot.activeScoopJid`. The
+   * bridge owns only the cache; no envelope handler lives on the
+   * panel-message switch (the hub adapter is the single inbound route).
    */
   private activeScoopJid: string | null = null;
   /**
    * Subscribers to the post-emit `agent-event` fan-out. Each handler
    * receives the same `AgentEvent` shape the panel sees (`ui/types.ts`),
    * not the wire envelope — the bridge does the same wire→UI translation
-   * server-side that `offscreen-client.ts:handleAgentEvent` does. Reused
-   * by the leader factory (Task 15) to forward synchronized agent
-   * events to followers without re-implementing the `message_start`
-   * gating.
+   * server-side that `offscreen-client.ts` `handleAgentEvent` does.
+   * Reused by `startExtensionLeaderTray` in `extension-leader-tray.ts`
+   * to forward synchronized agent events to followers without
+   * re-implementing the `message_start` gating.
    */
   private readonly agentEventListeners = new Set<(scoopJid: string, event: AgentEvent) => void>();
   /**
@@ -360,10 +360,10 @@ export class OffscreenBridge implements KernelFacade {
    * Emit a canonical `incoming-message` wire envelope to the panel.
    *
    * Extracted from the `onIncomingMessage` orchestrator callback so the
-   * future leader factory's `onFollowerMessage` (Task 12) can emit this
-   * envelope explicitly — `'web'`-channel messages don't trigger
-   * `orchestrator.onIncomingMessage` (gated by `isExternalLickChannel`
-   * at `orchestrator.ts:1297` — `'web'` is excluded from
+   * leader factory's `onFollowerMessage` in `extension-leader-tray.ts`
+   * can emit this envelope explicitly — `'web'`-channel messages don't
+   * trigger `orchestrator.onIncomingMessage` (gated by
+   * `isExternalLickChannel`; `'web'` is excluded from
    * `EXTERNAL_LICK_CHANNELS`), so the panel echo path needs a direct
    * helper.
    *
@@ -486,8 +486,9 @@ export class OffscreenBridge implements KernelFacade {
 
   /**
    * Update the cached active-scoop jid. Called by the leader-sync hub
-   * adapter (Task 9) when a `leader-active-scoop` envelope arrives from
-   * the panel. Pass `null` to clear.
+   * adapter (`OffscreenLeaderSyncBridge` in `leader-sync-bridge.ts`)
+   * when a `leader-active-scoop` envelope arrives from the panel. Pass
+   * `null` to clear.
    */
   setActiveScoopJid(jid: string | null): void {
     this.activeScoopJid = jid;
@@ -508,18 +509,21 @@ export class OffscreenBridge implements KernelFacade {
    * mapping or the `message_start` gating against `currentMessageId`.
    * Returns an unsubscribe function.
    *
-   * Used by the leader factory (Task 15) to broadcast synchronized
-   * agent events to followers — the active-scoop filter lives in the
-   * caller, not here.
+   * Used by `startExtensionLeaderTray` (in `extension-leader-tray.ts`)
+   * to broadcast synchronized agent events to followers — the
+   * active-scoop filter lives in the caller, not here.
    *
    * The fan-out runs AFTER the panel-bound `chrome.runtime.sendMessage`
    * in `emit()`, so a slow/throwing listener can't gate panel delivery.
    * Per-listener errors are caught and logged.
    *
    * NB: `turn_end` synthesis is intentionally NOT emitted — the wire
-   * envelope only carries `response_done`, and adding a synthesized
-   * `turn_end` here is the subject of spec open question #1 (defer
-   * until the standalone wire diff confirms the desired behavior).
+   * envelope only carries `response_done`. Do NOT synthesize `turn_end`
+   * here without first capturing the standalone leader's `agent.event`
+   * wire payload under a multi-turn scenario and diffing against the
+   * events this synthesizer produces — adding a phantom `turn_end`
+   * risks duplicate events on followers that already see one from the
+   * standalone wire path.
    */
   onAgentEvent(handler: (scoopJid: string, event: AgentEvent) => void): () => void {
     this.agentEventListeners.add(handler);
@@ -609,16 +613,19 @@ export class OffscreenBridge implements KernelFacade {
         if (!messageId) return;
         events.push({ type: 'content_done', messageId });
         this.fanOutMessageId.delete(scoopJid);
-        // NB: revision 4 of the spec left turn_end synthesis as an open
-        // question. Do NOT synthesize turn_end here; verify with the
-        // standalone wire diff (open question #1) before adding it.
+        // NB: `turn_end` synthesis is deliberately deferred. Do NOT
+        // synthesize `turn_end` here without first capturing the
+        // standalone leader's `agent.event` wire payload under a
+        // multi-turn scenario and diffing against the events this
+        // synthesizer produces — adding a phantom `turn_end` risks
+        // duplicate events on followers that already see one from the
+        // standalone wire path.
         break;
       }
       case 'turn_end': {
-        // No emit — turn_end synthesis is deferred (see comment above +
-        // spec open question #1). But the gating-state still needs
-        // cleanup, mirroring the panel-side reference at
-        // offscreen-client.ts:615.
+        // No emit — `turn_end` synthesis is deferred (see comment
+        // above). The gating-state still needs cleanup, mirroring the
+        // panel-side reference in `offscreen-client.ts` `handleAgentEvent`.
         this.fanOutMessageId.delete(scoopJid);
         break;
       }
@@ -942,7 +949,7 @@ export class OffscreenBridge implements KernelFacade {
    *
    * Public so `ExtensionLeaderBridge` (consumed by `startExtensionLeaderTray`)
    * can call it from the leader-tray adapter — same buffer-persistence
-   * semantics as the standalone leader (spec §6).
+   * semantics as the standalone leader.
    */
   persistScoop(jid: string): void {
     if (!this.sessionStore || !this.orchestrator) return;
@@ -1322,9 +1329,12 @@ export class OffscreenBridge implements KernelFacade {
   /** Send a message to all panels via the kernel transport. */
   private emit(payload: OffscreenToPanelMessage): void {
     this.transport.send(payload);
-    // Fan-out AFTER the panel-bound send so a slow/throwing
-    // `onAgentEvent` listener can't gate panel delivery. Cheap when the
-    // payload isn't an agent-event (no listeners → early return).
+    // Fan out to leader-sync subscribers when the payload is an
+    // agent-event. Cheap when it isn't — the type check skips
+    // `fanOutAgentEvent` entirely. (Listener count is deliberately NOT
+    // checked here; the fan-out maintains `fanOutMessageId` gating
+    // state for every wire envelope regardless of subscriber presence
+    // — see the comment in `fanOutAgentEvent`.)
     if ((payload as { type?: string }).type === 'agent-event') {
       this.fanOutAgentEvent(payload as AgentEventMsg);
     }

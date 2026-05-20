@@ -436,7 +436,7 @@ async function init(): Promise<void> {
 
     if (trayRuntimeConfig?.workerBaseUrl) {
       // Build the panel↔offscreen hub. The leader and follower branches
-      // each own their own hub instance and detach on switch (spec §8).
+      // each own their own hub instance and detach on switch.
       const hub: OffscreenMessageHub = {
         sendToPanel: (envelope) => {
           chrome.runtime.sendMessage(envelope).catch((err: unknown) => {

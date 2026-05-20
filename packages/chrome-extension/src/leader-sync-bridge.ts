@@ -4,7 +4,8 @@
  * Mirror of follower-sprinkle-bridge.ts but for the leader role:
  * panel pushes sprinkle snapshot / sprinkle updates / user-message
  * echo / active-scoop selection. Offscreen pushes leader-mode-changed
- * and leader-tray-reset-response (the latter wired in Task 10).
+ * and leader-tray-reset-response (the latter wired by
+ * `PanelLeaderSyncProxy.resetTray` below).
  */
 
 import type {

@@ -1521,9 +1521,10 @@ async function mainExtension(app: HTMLElement, options?: { detached?: boolean })
     chat: layout.panels.chat,
     log,
   });
-  // Dispose on unload — mirrors offscreen.ts:155-163's host.dispose()
-  // pattern. Without this the chrome.runtime listener leaks across HMR
-  // cycles, and any in-flight resetTray timers float.
+  // Dispose on unload — mirrors the `host.dispose()` pattern in
+  // `offscreen.ts` (kernel host teardown on unload). Without this the
+  // chrome.runtime listener leaks across HMR cycles, and any in-flight
+  // resetTray timers float.
   window.addEventListener('beforeunload', () => leaderHooks.dispose(), { once: true });
 
   // Auto-surface newly-added .shtml files in the rail. The panel's

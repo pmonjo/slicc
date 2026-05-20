@@ -32,13 +32,13 @@ import { ServiceWorkerLeaderTraySocket } from './tray-socket-proxy.js';
 import type { LeaderTrayResetRequestMsg, LeaderTrayResetResponseMsg } from './messages.js';
 
 export interface ExtensionLeaderTrayHandle {
-  /** Canonical teardown — runs the full sequence documented at
-   *  `extension-leader-tray.ts` `stop()` (unsubAgent → clearIntervals →
-   *  sync.stop → trayPeers.stop → trayLeader.stop → clear host-command
-   *  setters → removeListener → signalLeaderMode(false) →
-   *  leaderBridge.detach). Idempotent. ALL external callers must use
-   *  this — never call `.stop()` on the individual `sync` / `peers` /
-   *  `leader` fields below or the teardown order is broken. */
+  /** Canonical teardown — runs the full sequence documented on the
+   *  returned `stop()` method (unsubAgent → clearIntervals → sync.stop
+   *  → trayPeers.stop → trayLeader.stop → clear host-command setters →
+   *  removeListener → signalLeaderMode(false) → leaderBridge.detach).
+   *  Idempotent. ALL external callers must use this — never call
+   *  `.stop()` on the individual `sync` / `peers` / `leader` fields
+   *  below or the teardown order is broken. */
   stop(): void;
 
   /** Reset the tray session by stopping + restarting the leader and
@@ -170,13 +170,12 @@ export function startExtensionLeaderTray(
       };
 
       // (1) Panel echo. `'web'` is NOT in EXTERNAL_LICK_CHANNELS
-      // (lick-formatting.ts:29-37), so orchestrator.handleMessage's gated
-      // onIncomingMessage call at orchestrator.ts:1297-1306 does NOT fire
-      // for this channel. Without the explicit emit below, the follower's
-      // typed message never reaches the leader's panel UI.
+      // (see `EXTERNAL_LICK_CHANNELS` in `lick-formatting.ts`), so
+      // `orchestrator.handleMessage`'s gated `onIncomingMessage` call
+      // does NOT fire for this channel. Without the explicit emit below,
+      // the follower's typed message never reaches the leader's panel UI.
       bridge.notifyPanelIncomingMessage(activeJid, channelMsg);
 
-      // (2) Buffer + persist (matches offscreen-bridge.ts:784-791).
       bridge.getBuffer(activeJid).push({
         id: messageId,
         role: 'user',
@@ -187,10 +186,15 @@ export function startExtensionLeaderTray(
       bridge.persistScoop(activeJid);
 
       // (3) Rebroadcast immediately — don't gate on the agent turn.
-      // Matches main.ts:2462 ordering for sibling followers.
+      // Matches the standalone path's `sync.broadcastUserMessage`
+      // ordering in `page-leader-tray.ts`/`main.ts` for sibling followers.
       sync.broadcastUserMessage(text, messageId, attachments);
 
-      // (4) Async orchestrator dispatch in fire-and-forget IIFE.
+      // Orchestrator dispatch runs in a fire-and-forget IIFE so the outer
+      // signature stays `void` (the `LeaderSyncManagerOptions.onFollowerMessage`
+      // declaration in `tray-leader-sync.ts` is `=> void` and the caller
+      // doesn't await). Errors are caught and logged so they don't become
+      // unhandled rejections.
       void (async () => {
         try {
           await orchestrator.handleMessage(channelMsg);
@@ -214,23 +218,24 @@ export function startExtensionLeaderTray(
   options._onSyncOptions?.(syncOptions);
   browser.setTrayTargetProvider?.(sync);
 
-  // LeaderSyncManager.broadcastEvent (tray-leader-sync.ts:300-304) tags the
-  // wire payload with options.getScoopJid() (the active scoop) and ignores
-  // the event's own scoopJid. Without filtering at the tap, a background
-  // scoop's stream would be broadcast tagged as the active scoop — wrong
-  // content + wrong scope. Filter `eventScoopJid !== getActiveJid()` here so
-  // only events from the currently-active scoop are forwarded, matching the
-  // standalone path's implicit filter in offscreen-client.ts:496.
+  // `LeaderSyncManager.broadcastEvent` tags the wire payload with
+  // `options.getScoopJid()` (the active scoop) and ignores the event's
+  // own `scoopJid`. Without filtering at the tap, a background scoop's
+  // stream would be broadcast tagged as the active scoop — wrong content
+  // + wrong scope. Filter `eventScoopJid !== getActiveJid()` here so
+  // only events from the currently-active scoop are forwarded, matching
+  // the standalone path's filter in `offscreen-client.ts` `handleAgentEvent`.
   const unsubAgent = bridge.onAgentEvent((eventScoopJid, event) => {
     if (eventScoopJid !== getActiveJid()) return;
     sync.broadcastEvent(event);
   });
 
-  // Periodic refreshes mirror page-leader-tray.ts:234-285. setLocalTargets
-  // is the LEADER API (tray-leader-sync.ts:725) — do NOT confuse with
-  // advertiseTargets, which is the follower API (tray-follower-sync.ts:315).
-  // CDP errors are throttled via ThrottledErrorTracker so a flapping CDP
-  // transport doesn't spam the log.
+  // Periodic refreshes mirror the standalone `page-leader-tray.ts`
+  // refresh wiring. `setLocalTargets` is the LEADER API on
+  // `LeaderSyncManager` — do NOT confuse with `advertiseTargets`, which
+  // is the follower API on `FollowerSyncManager`. CDP errors are
+  // throttled via `ThrottledErrorTracker` so a flapping CDP transport
+  // doesn't spam the log.
   const cdpThrottle = new ThrottledErrorTracker(options.log as any, {
     failureMessage: 'Extension leader CDP target refresh failed (best-effort, throttled)',
     recoveryMessage: 'Extension leader CDP target refresh recovered',
@@ -339,9 +344,10 @@ export function startExtensionLeaderTray(
   };
   setTrayResetter(resetSequence);
 
-  // onFollowerCountChanged — parity with standalone main.ts:2465-2476.
-  // LeaderSyncManager stores options by reference (tray-leader-sync.ts:155),
-  // so assigning after construction mutates the live options.
+  // `onFollowerCountChanged` — parity with the standalone
+  // `page-leader-tray.ts` `onFollowerCountChanged` wiring.
+  // `LeaderSyncManager` stores `options` by reference, so assigning
+  // after construction mutates the live options.
   syncOptions.onFollowerCountChanged = (_count: number) => {
     const peers = trayPeers.getPeers().map((p) => ({
       runtimeId: p.bootstrapId,
@@ -358,9 +364,9 @@ export function startExtensionLeaderTray(
   };
 
   // leader-tray-reset RPC listener. Matches the envelope shape from
-  // PanelLeaderSyncProxy.resetTray (Task 10): `{ source: 'panel',
-  // payload: { type: 'leader-tray-reset', requestId } }`. Replies with
-  // `{ source: 'offscreen', payload: { type: 'leader-tray-reset-response', ... } }`.
+  // `PanelLeaderSyncProxy.resetTray` in `leader-sync-bridge.ts`:
+  // `{ source: 'panel', payload: { type: 'leader-tray-reset', requestId } }`.
+  // Replies with `{ source: 'offscreen', payload: { type: 'leader-tray-reset-response', ... } }`.
   const resetListener = (message: unknown): boolean => {
     if (typeof message !== 'object' || message === null) return false;
     const env = message as { source?: string; payload?: { type?: string } };
@@ -412,22 +418,16 @@ export function startExtensionLeaderTray(
   chrome.runtime.onMessage.addListener(resetListener);
 
   return {
+    /**
+     * Canonical teardown order (mirrors `page-leader-tray.ts`):
+     * unsubscribe agent events → clear intervals → stop sync/peers/leader
+     * → clear host-command setters → remove reset listener →
+     * `signalLeaderMode(false)` → `leaderBridge.detach()`.
+     * `signalLeaderMode(false)` runs BEFORE `detach()` so the panel sees
+     * the deactivation signal before the hub listener goes away.
+     * Idempotent via the `stopped` flag.
+     */
     stop() {
-      // Canonical teardown order — mirrors page-leader-tray.ts:316-323
-      // and extends it with extension-only steps:
-      //   1. unsubAgent — stop new agent events before sync stops
-      //   2. clearInterval — stop new broadcasts
-      //   3. sync.stop — close follower data channels
-      //   4. trayPeers.stop — close peer manager
-      //   5. trayLeader.stop — close tray WebSocket
-      //   6. setConnectedFollowersGetter(null) — clear host-command singleton
-      //   7. setTrayResetter(null) — clear host-command singleton
-      //   8. removeListener — drop the reset RPC listener
-      //   9. signalLeaderMode(false) — tell panel leader-mode is OFF
-      //      (BEFORE detach, so the panel sees the deactivation signal
-      //      before the hub listener goes away)
-      //  10. leaderBridge.detach — stop hub listener
-      // Idempotent via the `stopped` flag — re-entry is a no-op.
       if (stopped) return;
       stopped = true;
       unsubAgent();

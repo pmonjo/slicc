@@ -216,7 +216,7 @@ export function startPageLeaderTray(options: StartPageLeaderTrayOptions): PageLe
 
   // --- Agent event tap → broadcast to all followers. The helper owns
   // this subscription (and unsubscribes on stop) so the caller doesn't
-  // have to track it. See spec §6.6.
+  // have to track it.
   const unsubscribeAgent = options.onAgentEvent((event) => sync.broadcastEvent(event));
 
   // --- Periodic refreshes. Each fires every `refreshIntervalMs` (5s
