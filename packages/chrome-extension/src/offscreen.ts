@@ -479,9 +479,14 @@ async function init(): Promise<void> {
       });
 
       void activeHandle.leader.start().catch((err) => {
-        log.warn('Extension leader tray start failed', {
+        log.error('Extension leader tray start failed — reverting leader mode', {
           error: err instanceof Error ? err.message : String(err),
         });
+        // Retract the leader-mode claim so the panel removes its hooks.
+        leaderBridge.signalLeaderMode(false);
+        // Tear down the now-dead handle so any user retry starts cleanly.
+        activeHandle?.stop();
+        activeHandle = null;
       });
 
       stopTrayRuntime = () => {

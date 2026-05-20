@@ -106,12 +106,24 @@ export function startExtensionLeaderTray(
       try {
         const raw = await sharedFs.readFile(path, { encoding: 'utf-8' });
         return typeof raw === 'string' ? raw : new TextDecoder().decode(raw);
-      } catch {
+      } catch (err) {
+        const code = (err as { code?: string })?.code;
+        if (code === 'ENOENT') return null; // expected — sprinkle file deleted between snapshot and read
+        options.log.error('readSprinkleContent failed', {
+          name,
+          error: err instanceof Error ? err.message : String(err),
+        });
         return null;
       }
     },
     onSprinkleLick: (name, body, targetScoop) => {
-      void bridge.routeSprinkleLick(name, body, targetScoop);
+      void bridge.routeSprinkleLick(name, body, targetScoop).catch((err) => {
+        options.log.error('routeSprinkleLick failed', {
+          name,
+          targetScoop,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      });
     },
     onFollowerMessage: (text, messageId, attachments) => {
       const activeJid = getActiveJid();
@@ -260,7 +272,7 @@ export function startExtensionLeaderTray(
         return;
       }
       void trayPeers.handleControlMessage(message).catch((err) => {
-        options.log.warn('Tray leader bootstrap handling failed', {
+        options.log.error('Tray leader bootstrap handling failed', {
           error: err instanceof Error ? err.message : String(err),
         });
       });
@@ -270,7 +282,7 @@ export function startExtensionLeaderTray(
     onReconnected: (session: any) =>
       options.log.info('Extension leader tray reconnected', { trayId: session.trayId }),
     onReconnectGaveUp: (lastError: any, attempts: number) =>
-      options.log.warn('Extension leader tray reconnect gave up', { lastError, attempts }),
+      options.log.error('Extension leader tray reconnect gave up', { lastError, attempts }),
   });
 
   // Panel terminal `host` reads from host-command.ts module singletons.
@@ -310,7 +322,7 @@ export function startExtensionLeaderTray(
     try {
       window.localStorage.setItem('slicc.leaderTrayFollowers', JSON.stringify(peers));
     } catch (err) {
-      options.log.warn('Failed to persist leaderTrayFollowers', {
+      options.log.error('Failed to persist leaderTrayFollowers', {
         error: err instanceof Error ? err.message : String(err),
       });
     }
@@ -335,7 +347,17 @@ export function startExtensionLeaderTray(
           ok: true,
           status,
         };
-        chrome.runtime.sendMessage({ source: 'offscreen', payload: reply }).catch(() => {});
+        chrome.runtime
+          .sendMessage({ source: 'offscreen', payload: reply })
+          .catch((err: unknown) => {
+            const errMsg = err instanceof Error ? err.message : String(err);
+            if (/receiving end does not exist/i.test(errMsg)) return;
+            options.log.error('Failed to deliver leader-tray-reset-response', {
+              requestId: req.requestId,
+              ok: reply.ok,
+              error: errMsg,
+            });
+          });
       } catch (err) {
         const reply: LeaderTrayResetResponseMsg = {
           type: 'leader-tray-reset-response',
@@ -343,7 +365,17 @@ export function startExtensionLeaderTray(
           ok: false,
           error: err instanceof Error ? err.message : String(err),
         };
-        chrome.runtime.sendMessage({ source: 'offscreen', payload: reply }).catch(() => {});
+        chrome.runtime
+          .sendMessage({ source: 'offscreen', payload: reply })
+          .catch((err: unknown) => {
+            const errMsg = err instanceof Error ? err.message : String(err);
+            if (/receiving end does not exist/i.test(errMsg)) return;
+            options.log.error('Failed to deliver leader-tray-reset-response', {
+              requestId: req.requestId,
+              ok: reply.ok,
+              error: errMsg,
+            });
+          });
       }
     })();
     return false;

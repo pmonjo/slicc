@@ -629,7 +629,7 @@ export class OffscreenBridge implements KernelFacade {
         try {
           fn(scoopJid, event);
         } catch (err) {
-          log.warn('onAgentEvent listener threw', {
+          log.error('onAgentEvent listener threw', {
             error: err instanceof Error ? err.message : String(err),
           });
         }
@@ -735,7 +735,9 @@ export class OffscreenBridge implements KernelFacade {
     if (this.sessionStore) {
       const sessionId = cone.isCone ? 'session-cone' : `session-${cone.folder}`;
       this.sessionStore.saveMessages(sessionId, messages).catch((err) => {
-        console.warn('[offscreen-bridge] applyFollowerSnapshot persist failed:', err);
+        log.error('applyFollowerSnapshot persist failed', {
+          error: err instanceof Error ? err.message : String(err),
+        });
       });
     }
     this.emit({
@@ -926,7 +928,10 @@ export class OffscreenBridge implements KernelFacade {
           });
         }
       } catch (err) {
-        console.warn('[offscreen-bridge] sessionStore load failed:', sessionId, err);
+        log.error('sessionStore load failed', {
+          sessionId,
+          error: err instanceof Error ? err.message : String(err),
+        });
       }
     }
   }
@@ -948,7 +953,10 @@ export class OffscreenBridge implements KernelFacade {
     if (!buf || buf.length === 0) return;
     // BufferedChatMessage is structurally compatible with ChatMessage
     this.sessionStore.saveMessages(sessionId, buf as unknown as ChatMessage[]).catch((err) => {
-      console.warn('[offscreen-bridge] persistScoop failed:', sessionId, err);
+      log.error('persistScoop failed', {
+        sessionId,
+        error: err instanceof Error ? err.message : String(err),
+      });
     });
   }
 

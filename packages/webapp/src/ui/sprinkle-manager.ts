@@ -383,7 +383,7 @@ export class SprinkleManager {
         try {
           fn();
         } catch (err) {
-          log.warn('SprinkleManager.onChange handler threw', {
+          log.error('SprinkleManager.onChange handler threw', {
             error: err instanceof Error ? err.message : String(err),
           });
         }

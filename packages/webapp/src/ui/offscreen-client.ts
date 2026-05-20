@@ -125,7 +125,9 @@ export class OffscreenClient implements KernelClientFacade {
       try {
         fn(jid);
       } catch (err) {
-        log.warn('onScoopSelected handler threw', err);
+        log.error('onScoopSelected handler threw', {
+          error: err instanceof Error ? err.message : String(err),
+        });
       }
     }
   }
