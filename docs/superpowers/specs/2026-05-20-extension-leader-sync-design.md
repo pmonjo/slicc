@@ -3,7 +3,7 @@
 **Issue:** [#682](https://github.com/ai-ecoverse/slicc/issues/682)
 **Branch:** `fix/extension-leader-sync-682`
 **Date:** 2026-05-20
-**Revision:** 5 (fourth-review doc-drift fixes — see "Revision history" below)
+**Revision:** 6 (mirror plan revision 2 on scoop selection — see "Revision history" below)
 
 ## Problem
 
@@ -788,11 +788,18 @@ function removeLeaderHooks() {
 leaderSyncProxy.requestModeState();
 ```
 
-`client.onScoopSelected(handler): () => void` is a new event hook on
-`OffscreenClient` — it fires when `selectScoop` sets `selectedScoopJid` and
-returns an unsubscribe. Required so we don't poll. Each `on*` hook returns
-its own unsubscribe (consistent with `OffscreenMessageHub.onPanelMessage`,
-`SprinkleManager.onChange`).
+`client.setSelectedScoopJid(jid)` + `client.onScoopSelected(handler): () => void`
+are new on `OffscreenClient`. The setter writes the field and fires the
+listeners; the existing four mutation sites in `mainExtension` (main.ts:657,
+700, 723, 802) plus the existing three direct-mutation sites in
+`offscreen-client.test.ts` (~lines 57, 72, 92) are refactored to use the
+setter. The standalone worker path's direct mutation at main.ts:1763 is
+left untouched (different boot path, unrelated to extension-leader hooks).
+The setter early-returns when the same `jid` is set twice, so listeners
+don't fire on redundant writes.
+
+`onScoopSelected(handler)` returns an unsubscribe — consistent with
+`OffscreenMessageHub.onPanelMessage` and `SprinkleManager.onChange`.
 
 **Detached popout:** because the panel boot path runs every time the side
 panel or detached tab opens, and the `leader-mode-changed` envelope is emitted
@@ -1055,6 +1062,17 @@ body is extracted into a testable helper.
 - Architecture: `docs/architecture.md` "Multi-Browser Sync (Tray) Architecture"
 
 ## Revision history
+
+**Revision 6 (2026-05-20):** Single-section update to mirror plan
+revision 2. Open question #3 (single mutation site for `selectedScoopJid`)
+turned out to be four sites in `mainExtension` plus three in the existing
+test file. `OffscreenClient` has no `selectScoop` method — selection
+happens via direct field writes today. Spec §6 now describes the
+canonical fix as `setSelectedScoopJid(jid)` setter + getter-only field +
+refactor of the seven existing direct-mutation call sites (with the
+standalone worker path at main.ts:1763 explicitly excluded). No
+architectural change; just resolves the spec/code drift the plan review
+flagged. Closes open question #3.
 
 **Revision 5 (2026-05-20):** Internal-consistency pass after fourth review.
 All changes are documentation-drift fixes — no architectural shift. Verified

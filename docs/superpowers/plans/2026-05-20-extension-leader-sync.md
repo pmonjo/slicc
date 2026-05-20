@@ -110,9 +110,9 @@ The leader's panel-side `installLeaderHooks` needs to push a sprinkle snapshot e
       await mgr.refresh(); // seed
       const calls: number[] = [];
       mgr.onChange(() => calls.push(Date.now()));
-      await mgr.open('welcome');
+      await mgr.open('dash');
       expect(calls.length).toBe(1);
-      mgr.close('welcome');
+      mgr.close('dash');
       expect(calls.length).toBe(2);
     });
 
@@ -133,9 +133,9 @@ The leader's panel-side `installLeaderHooks` needs to push a sprinkle snapshot e
   });
   ```
 
-  If the test file's existing `mgr` is seeded with sprinkle files
-  (e.g. via `await fs.writeFile('/workspace/skills/welcome/welcome.shtml', …)`),
-  use those names in the `open`/`close` calls. Adjust if names differ.
+  The existing test file seeds `/shared/sprinkles/dash/dash.shtml`
+  (sprinkle-manager.test.ts:98, 130) — that's why `open()` / `close()`
+  use `'dash'`. If the seeded set ever changes, update accordingly.
 
 - [ ] **Step 2: Run test to verify it fails**
 
@@ -210,21 +210,30 @@ The leader's panel-side `installLeaderHooks` needs to push a sprinkle snapshot e
 
 ---
 
-### Task 2: Add `OffscreenClient.onScoopSelected` event hook
+### Task 2: Add `OffscreenClient.setSelectedScoopJid` + `onScoopSelected` event hook
 
-The leader's panel-side hook needs to forward scoop selection changes to offscreen. `OffscreenClient.selectScoop` mutates `selectedScoopJid` at one site; add a subscriber list.
+The leader's panel-side hook needs to forward scoop selection changes to
+offscreen. **`OffscreenClient` has no `selectScoop` method** —
+`selectedScoopJid` is a public field (offscreen-client.ts:94) mutated
+directly by `mainExtension` at four sites (main.ts:657, 700, 723, 802) and
+by the existing tests at offscreen-client.test.ts:57, 72, 92. This task
+introduces a public setter that fires listeners and routes every existing
+mutation through it.
+
+> **Note on spec drift:** the spec at §6 still says
+> `client.onScoopSelected` fires when `selectScoop` sets `selectedScoopJid`.
+> That wording predates this verification step. Follow this task body, not
+> the stale spec prose. (Spec open question #3 was about confirming the
+> single mutation site; it turned out to be four.)
 
 **Files:**
 
 - Modify: `packages/webapp/src/ui/offscreen-client.ts`
-- Test: `packages/chrome-extension/tests/offscreen-bridge.test.ts` (or a new `packages/webapp/tests/ui/offscreen-client.test.ts` if one doesn't exist — check first)
-
-**Reality check:** `OffscreenClient` does not have a `selectScoop` method.
-`selectedScoopJid` is a public field on the class (offscreen-client.ts:94)
-and is mutated directly by `mainExtension` at four sites: main.ts:657, 700,
-723, and 802. The cleanest fix is to add a public setter
-`setSelectedScoopJid(jid)` on `OffscreenClient` that fires the listeners,
-then refactor those four sites to use it.
+- Modify: `packages/webapp/src/ui/main.ts` (four mutation sites in `mainExtension`)
+- Modify: `packages/webapp/tests/ui/offscreen-client.test.ts` (existing — three direct mutations)
+- Test: append a new `describe` block to the existing
+  `packages/webapp/tests/ui/offscreen-client.test.ts` (file already exists,
+  ~400 lines, uses `new OffscreenClient(callbacks)` — see Step 2).
 
 - [ ] **Step 1: Locate all selectedScoopJid mutation sites**
 
@@ -232,54 +241,70 @@ then refactor those four sites to use it.
   grep -n "client.selectedScoopJid\|\.selectedScoopJid = " packages/webapp/src/ui/main.ts
   ```
 
-  Expected: four assignment sites in `mainExtension` (~lines 657, 700, 723,
-  802). Locking these down in this step prevents Task 20 from breaking on a
-  missed mutation point.
+  Expected output anchors: **lines 657, 700, 723, 802 are the four
+  `mainExtension` sites — refactor these.** Line 1763 is the standalone
+  worker path (different boot, unrelated to extension-leader); **do NOT
+  touch line 1763**. The standalone path doesn't go through the leader-mode
+  hooks added in Task 20, so leaving it untouched is correct.
+
+  Also run:
+
+  ```bash
+  grep -n "client.selectedScoopJid =\|\.selectedScoopJid = " packages/webapp/tests/ui/offscreen-client.test.ts
+  ```
+
+  Expected: three existing test sites (~lines 57, 72, 92) that write
+  `client.selectedScoopJid = …` directly. These will break when Step 4
+  makes the field getter-only; update them in Step 5 to use the new
+  `setSelectedScoopJid` setter.
 
 - [ ] **Step 2: Write the failing test**
 
-  Add `packages/webapp/tests/ui/offscreen-client.test.ts` (create if missing):
+  The file `packages/webapp/tests/ui/offscreen-client.test.ts` already
+  exists. The existing setup uses `new OffscreenClient(callbacks)` — see
+  the `beforeEach` block at the top of the file. **Append** a new
+  `describe` block at the end of the file:
 
   ```ts
-  import { describe, it, expect } from 'vitest';
-  import { OffscreenClient } from '../../src/ui/offscreen-client.js';
-
   describe('OffscreenClient.setSelectedScoopJid + onScoopSelected', () => {
+    // Reuse the same callbacks stub the existing file uses — search for
+    // the `beforeEach` near the top to copy the canonical shape.
+    let localClient: OffscreenClient;
+    beforeEach(() => {
+      localClient = new OffscreenClient(callbacks);
+    });
+
     it('setSelectedScoopJid updates the field and fires listeners', () => {
-      const client = new OffscreenClient();
       const calls: string[] = [];
-      client.onScoopSelected((jid) => calls.push(jid));
-      client.setSelectedScoopJid('scoop-1');
-      expect(client.selectedScoopJid).toBe('scoop-1');
+      localClient.onScoopSelected((jid) => calls.push(jid));
+      localClient.setSelectedScoopJid('scoop-1');
+      expect(localClient.selectedScoopJid).toBe('scoop-1');
       expect(calls).toEqual(['scoop-1']);
     });
 
     it('does not fire when the same jid is set twice', () => {
-      const client = new OffscreenClient();
-      client.setSelectedScoopJid('scoop-1');
+      localClient.setSelectedScoopJid('scoop-1');
       const calls: string[] = [];
-      client.onScoopSelected((jid) => calls.push(jid));
-      client.setSelectedScoopJid('scoop-1');
+      localClient.onScoopSelected((jid) => calls.push(jid));
+      localClient.setSelectedScoopJid('scoop-1');
       expect(calls).toEqual([]);
     });
 
     it('returns an unsubscribe that stops firing', () => {
-      const client = new OffscreenClient();
-      const off = client.onScoopSelected(() => {
+      const off = localClient.onScoopSelected(() => {
         throw new Error('should not fire after off()');
       });
       off();
-      expect(() => client.setSelectedScoopJid('scoop-2')).not.toThrow();
+      expect(() => localClient.setSelectedScoopJid('scoop-2')).not.toThrow();
     });
 
     it('handler throws are logged but do not break other listeners', () => {
-      const client = new OffscreenClient();
       const calls: string[] = [];
-      client.onScoopSelected(() => {
+      localClient.onScoopSelected(() => {
         throw new Error('first handler bad');
       });
-      client.onScoopSelected((jid) => calls.push(jid));
-      client.setSelectedScoopJid('scoop-3');
+      localClient.onScoopSelected((jid) => calls.push(jid));
+      localClient.setSelectedScoopJid('scoop-3');
       expect(calls).toEqual(['scoop-3']);
     });
   });
@@ -348,21 +373,35 @@ then refactor those four sites to use it.
   Convert each one. The current code has none — the field is mutated only
   externally — so this is purely additive.
 
-- [ ] **Step 5: Refactor mainExtension's four mutation sites**
+- [ ] **Step 5: Refactor existing call sites**
 
-  In `packages/webapp/src/ui/main.ts`, replace each
-  `client.selectedScoopJid = X` with `client.setSelectedScoopJid(X)`. The
-  four sites are at approximately:
+  Three groups of edits:
+
+  **a) `mainExtension` mutation sites (main.ts).** Replace each
+  `client.selectedScoopJid = X` with `client.setSelectedScoopJid(X)`:
   - main.ts:657 — inside the local `selectScoop` function
-  - main.ts:700 — inside `onReady` first-scoop init
+  - main.ts:700 — `onReady` first-scoop init
   - main.ts:723 — cone-fallback init
   - main.ts:802 — switch-on-tab-click handler
 
+  **Do NOT change main.ts:1763** — that's the standalone worker path; it
+  doesn't go through extension-leader hooks and the field-write semantics
+  are fine there.
+
+  **b) Existing test mutations (offscreen-client.test.ts).** The existing
+  test file mutates `client.selectedScoopJid` at ~lines 57, 72, 92.
+  Replace each `client.selectedScoopJid = 'cone_123'` with
+  `client.setSelectedScoopJid('cone_123')`. Without this, the
+  getter-only field added in Step 4 will fail typecheck.
+
+  **c) Verify**:
+
   ```bash
-  grep -n "client.selectedScoopJid = " packages/webapp/src/ui/main.ts
+  grep -n "client.selectedScoopJid =" packages/webapp/src/ui/main.ts packages/webapp/tests/
   ```
 
-  Run the grep again after edits to confirm zero matches remain.
+  Expected: only line 1763 remains (the deliberately-untouched standalone
+  worker path).
 
 - [ ] **Step 6: Run test to verify it passes**
 
@@ -667,9 +706,12 @@ interface SprinkleSummaryEnvelope` (so the leader bridge in Task 9 can
   git add packages/chrome-extension/src/offscreen-bridge.ts packages/chrome-extension/tests/offscreen-bridge.test.ts
   git commit -m "feat(extension): OffscreenBridge active-scoop tracking (#682)
 
-  Single source of truth for the panel's currently-viewed scoop.
-  Replaces the always-cone behavior in state-snapshot.activeScoopJid
-  with a panel-pushed value via the new leader-active-scoop envelope.
+  Single source of truth for the panel's currently-viewed scoop. The
+  setter is written by the leader-sync hub adapter (Task 9) when a
+  panel-pushed leader-active-scoop envelope arrives. Replaces the
+  always-cone behavior in state-snapshot.activeScoopJid. Bridge holds
+  only the cache; no envelope handler on the bridge's panel-message
+  switch (single inbound route — see Task 9).
 
   Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>"
   ```
@@ -3163,7 +3205,13 @@ Delegate the `workerBaseUrl` branch to `startExtensionLeaderTray`. Construct the
 
 ### Task 20: Panel-side wiring in `main.ts` — install/remove leader hooks
 
-In `mainExtension` (the side-panel boot path), construct `PanelLeaderSyncProxy`, install the leader-mode listener, wire the four push handlers, and call `setTrayResetter` for the panel terminal's `host reset`.
+In `mainExtension` (the side-panel boot path), construct
+`PanelLeaderSyncProxy`, install the leader-mode listener, and wire the
+four push handlers (active scoop, sprinkles snapshot, sprinkle update,
+local user echo). **Do NOT wire `setTrayResetter` here** — the panel
+terminal runs in offscreen via `RemoteTerminalView`, so Task 17's
+offscreen-side `setTrayResetter` is what `host reset` actually
+consults. See Step 2 for the rationale.
 
 **Files:**
 
@@ -3300,12 +3348,14 @@ In `mainExtension` (the side-panel boot path), construct `PanelLeaderSyncProxy`,
   git add -u
   git commit -m "feat(webapp): extension-leader panel hooks in mainExtension (#682)
 
-  Installs PanelLeaderSyncProxy + the four push handlers when offscreen
+  Installs PanelLeaderSyncProxy + the four push handlers (active scoop,
+  sprinkles snapshot, sprinkle update, local user echo) when offscreen
   signals leader-mode active. Handles named so removeLeaderHooks can
-  actually unsubscribe. setTrayResetter wires the panel terminal's
-  'host reset' to the offscreen RPC. Boot-time requestModeState() so
-  detached popouts opening after offscreen activated still install
-  hooks.
+  actually unsubscribe. Boot-time requestModeState() so detached popouts
+  opening after offscreen activated still install hooks. setTrayResetter
+  is NOT wired panel-side — the extension panel terminal runs in
+  offscreen via RemoteTerminalView, so Task 17's offscreen-side wiring
+  is authoritative.
 
   Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>"
   ```
@@ -3482,7 +3532,7 @@ After writing the plan, the following spec sections must all be covered:
 - §4 extension-leader-tray.ts → **Tasks 11–18**
 - §5 OffscreenBridge additions → **Tasks 4, 5, 6, 7**
 - §6 main.ts panel-side wiring → **Task 20**
-- §6a host reset → **Tasks 10 (proxy side), 17 (factory side), 20 (panel wire-up)**
+- §6a host reset → **Tasks 10 (PanelLeaderSyncProxy.resetTray RPC, unused by extension panel terminal but kept for future panel-realm callers) + 17 (factory-side setTrayResetter + listener — this is what the extension panel terminal actually invokes via the offscreen-resident host-command singleton)**
 - §7 SprinkleManager.onChange → **Task 1**
 - §8 Lifecycle → **Tasks 17, 18, 20**
 - Tests → covered per task
