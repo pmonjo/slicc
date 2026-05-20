@@ -163,6 +163,15 @@ export function buildChromeLaunchArgs(options: {
     '--no-default-browser-check',
     '--disable-crash-reporter',
     '--disable-background-tracing',
+    // Suppress the `navigator.webdriver` flag that Chrome sets whenever
+    // `--remote-debugging-port` is on. Slicc isn't a test harness — the
+    // user is sitting in front of the browser — but Cloudflare Turnstile,
+    // accounts.x.ai, hCaptcha, and a long tail of bot-detection scripts
+    // treat `navigator.webdriver === true` as an instant block signal.
+    // See https://crbug.com/1052084 (Chromium's tracking issue for this
+    // misuse). Setting it via `--disable-blink-features=AutomationControlled`
+    // is the canonical mitigation.
+    '--disable-blink-features=AutomationControlled',
     `--user-data-dir=${options.profile.userDataDir}`,
   ];
 
