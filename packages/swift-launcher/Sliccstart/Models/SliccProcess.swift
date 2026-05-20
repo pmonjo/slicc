@@ -92,6 +92,14 @@ final class SliccProcess {
     /// of the legacy stopAll() path.
     var isPreparingForUpdate = false
 
+    /// One-shot latch tracking whether `detachAll()` already ran. The
+    /// full-app update path calls it from `onBeginUpdate` and the
+    /// delegate calls it again from `applicationWillTerminate`; without
+    /// this guard the second call would persist an empty snapshot
+    /// (because the first call cleared `launchRecords`) and erase the
+    /// reattach data the next launch needs.
+    private var hasDetached = false
+
     let recordStore: LaunchRecordStore
     let cdpLiveProbe: CDPLiveProbe
 
@@ -339,7 +347,45 @@ final class SliccProcess {
     /// keep running. Called immediately before AppUpdater swaps the .app
     /// bundle and relaunches Sliccstart.
     @discardableResult
+    /// Test-only seam — inserts a synthetic `LaunchRecord` into the
+    /// in-memory map so `detachAll()` has something to snapshot in unit
+    /// tests. Underscored to make the intent obvious at call sites.
+    func _testing_seedLaunchRecord(
+        id: String,
+        process: Process,
+        targetType: AppTargetType,
+        launchedAppPaths: [String] = [],
+        cdpPort: UInt16,
+        servePort: UInt16,
+        electronAppPath: String? = nil,
+        targetName: String,
+        staticRoot: String? = nil
+    ) {
+        launchRecords[id] = LaunchRecord(
+            process: process,
+            targetType: targetType,
+            launchedAppPaths: launchedAppPaths,
+            cdpPort: cdpPort,
+            servePort: servePort,
+            electronAppPath: electronAppPath,
+            targetName: targetName,
+            startedAt: Date(),
+            observedAppPID: nil,
+            staticRoot: staticRoot
+        )
+    }
+
+    @discardableResult
     func detachAll() -> [PersistedLaunchRecord] {
+        // Idempotency latch — `applicationWillTerminate` re-invokes this
+        // after `onBeginUpdate` already did, and the second pass would
+        // otherwise overwrite the persisted JSON with an empty array
+        // (because the first pass cleared `launchRecords`).
+        if hasDetached {
+            log.info("detachAll: already detached; returning persisted snapshot")
+            return recordStore.load()
+        }
+        hasDetached = true
         let snapshot = launchRecords.compactMap { id, record -> PersistedLaunchRecord? in
             guard record.process.isRunning else { return nil }
             return PersistedLaunchRecord(

@@ -91,6 +91,13 @@ struct WebappOverlayStore {
 
     /// Install an already-downloaded zip as the overlay for `version`.
     /// Idempotent — if the overlay directory exists, it's removed first.
+    ///
+    /// Zip entries are validated before extraction to defend against
+    /// zip-slip path traversal (`../`, absolute paths) and symlink
+    /// tricks that point outside `overlayDir`. The asset comes from the
+    /// network, so we don't trust it even though `SmoothUpdateCoordinator`
+    /// re-checks the sha256 afterwards: a content-hash check would still
+    /// happen *after* files had already been written to disk.
     func install(zipURL: URL, version: String) throws -> URL {
         let fm = FileManager.default
         let overlayDir = try overlayDirectory(for: version)
@@ -99,8 +106,13 @@ struct WebappOverlayStore {
         }
         try fm.createDirectory(at: overlayDir, withIntermediateDirectories: true)
 
+        try validateArchiveEntries(zipURL: zipURL)
+
         let task = Process()
         task.executableURL = URL(fileURLWithPath: "/usr/bin/unzip")
+        // `-X` strips owner/permission metadata, but more importantly we
+        // already vetted the entry list above so unzip can't be coerced
+        // into writing outside `overlayDir`.
         task.arguments = ["-o", "-q", zipURL.path, "-d", overlayDir.path]
         let stderr = Pipe()
         task.standardError = stderr
@@ -115,6 +127,82 @@ struct WebappOverlayStore {
             throw OverlayError.unzipFailed(detail.trimmingCharacters(in: .whitespacesAndNewlines))
         }
         return overlayDir
+    }
+
+    /// Inspect zip entries with `zipinfo` and reject anything that would
+    /// escape the destination directory: absolute paths, `..` segments,
+    /// backslash separators, NUL bytes, and symlinks. Refusing the whole
+    /// archive on the first bad entry is safer than relying on `unzip`'s
+    /// own checks, which historically have had bypasses.
+    func validateArchiveEntries(zipURL: URL) throws {
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/usr/bin/zipinfo")
+        // `-1` lists one file per line (just the path).
+        // `-h` would add a header — omit so output is purely entries.
+        task.arguments = ["-1", zipURL.path]
+        let stdout = Pipe()
+        let stderr = Pipe()
+        task.standardOutput = stdout
+        task.standardError = stderr
+        try task.run()
+        task.waitUntilExit()
+        guard task.terminationStatus == 0 else {
+            let detail = String(
+                data: stderr.fileHandleForReading.readDataToEndOfFile(),
+                encoding: .utf8
+            ) ?? ""
+            throw OverlayError.unzipFailed("zipinfo failed: \(detail)")
+        }
+        let listing = String(
+            data: stdout.fileHandleForReading.readDataToEndOfFile(),
+            encoding: .utf8
+        ) ?? ""
+
+        for raw in listing.split(separator: "\n") {
+            let entry = String(raw)
+            if entry.isEmpty { continue }
+            if entry.hasPrefix("/") {
+                throw OverlayError.unsafeEntry(entry: entry, reason: "absolute path")
+            }
+            if entry.contains("..") {
+                // Catch both `../foo` and `foo/../bar` — `unzip` would
+                // happily resolve the latter outside `overlayDir`.
+                let components = entry.split(separator: "/", omittingEmptySubsequences: false)
+                if components.contains(where: { $0 == ".." }) {
+                    throw OverlayError.unsafeEntry(entry: entry, reason: "parent traversal")
+                }
+            }
+            if entry.contains("\\") {
+                throw OverlayError.unsafeEntry(entry: entry, reason: "backslash separator")
+            }
+            if entry.contains("\0") {
+                throw OverlayError.unsafeEntry(entry: entry, reason: "embedded NUL")
+            }
+        }
+
+        // Use `unzip -Z1l` to surface entries with non-regular file types
+        // (symlinks have a leading `l` in the long listing). We don't want
+        // a malicious symlink → unzip would happily write through it.
+        let longList = Process()
+        longList.executableURL = URL(fileURLWithPath: "/usr/bin/unzip")
+        longList.arguments = ["-Z", "-l", zipURL.path]
+        let longPipe = Pipe()
+        longList.standardOutput = longPipe
+        longList.standardError = FileHandle.nullDevice
+        try longList.run()
+        longList.waitUntilExit()
+        let longOutput = String(
+            data: longPipe.fileHandleForReading.readDataToEndOfFile(),
+            encoding: .utf8
+        ) ?? ""
+        for line in longOutput.split(separator: "\n") {
+            // `unzip -Z -l` lines start with the file-mode flags. A leading
+            // `l` (lowercase L) marks a symlink entry.
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if trimmed.hasPrefix("l") {
+                throw OverlayError.unsafeEntry(entry: trimmed, reason: "symlink not permitted")
+            }
+        }
     }
 
     /// Delete every overlay other than `version`. Called after a
@@ -133,13 +221,16 @@ struct WebappOverlayStore {
         let version: String
     }
 
-    enum OverlayError: LocalizedError {
+    enum OverlayError: LocalizedError, Equatable {
         case unzipFailed(String)
+        case unsafeEntry(entry: String, reason: String)
 
         var errorDescription: String? {
             switch self {
             case .unzipFailed(let detail):
                 return "Failed to unzip webapp overlay: \(detail)"
+            case .unsafeEntry(let entry, let reason):
+                return "Refusing to extract \(entry): \(reason)"
             }
         }
     }

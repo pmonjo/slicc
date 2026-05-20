@@ -103,8 +103,9 @@ launched:
 
 1. **Detach** — on quit-to-update, Sliccstart sends `SIGUSR1` to every
    `slicc-server` it spawned. Each server shuts down its HTTP listener but
-   **leaves the browser/Electron CDP session open**. The PID, port, and
-   target name are persisted to
+   **leaves the browser/Electron CDP session open**. The serve port, CDP
+   port, target name/type, optional Electron app path, and optional UI
+   overlay path are persisted to
    `~/Library/Application Support/Sliccstart/launch-records.json`.
 2. **Reattach** — on next launch, Sliccstart probes the persisted CDP
    ports via `/json/version`. For ports that are still live it respawns

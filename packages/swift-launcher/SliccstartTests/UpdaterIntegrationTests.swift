@@ -186,11 +186,26 @@ final class UpdaterIntegrationTests: XCTestCase {
         while process.isRunning {
             if Date() > deadline {
                 process.terminate()
+                // SIGTERM may be ignored by a wedged probe; escalate to
+                // SIGKILL after a brief grace period so the subsequent
+                // `readDataToEndOfFile()` reads close to EOF instead of
+                // blocking forever and deadlocking CI.
+                let killBy = Date().addingTimeInterval(1.0)
+                while process.isRunning && Date() < killBy {
+                    Thread.sleep(forTimeInterval: 0.05)
+                }
+                if process.isRunning {
+                    kill(process.processIdentifier, SIGKILL)
+                }
                 XCTFail("probe binary hung; killed at deadline")
                 break
             }
             Thread.sleep(forTimeInterval: 0.05)
         }
+        // Make sure the OS has finished reaping the process and closed
+        // the pipe FDs before we ask for data — otherwise the read can
+        // block on a dangling write end.
+        process.waitUntilExit()
 
         let stdoutData = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
         let stderrData = stderrPipe.fileHandleForReading.readDataToEndOfFile()

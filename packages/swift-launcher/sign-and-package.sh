@@ -93,7 +93,9 @@ WEBAPP_ZIP="$PROJECT_ROOT/artifacts/release/webapp-${VERSION}.zip"
 MANIFEST="$PROJECT_ROOT/artifacts/release/manifest-${VERSION}.json"
 
 echo "Creating webapp-only zip..."
-( cd "$WEBAPP_DIR" && ditto -c -k --keepParent . "$WEBAPP_ZIP" )
+# No `--keepParent` — WebappOverlayStore.install() expects index.html at the
+# root of the extracted overlay, not nested under a `ui/` directory.
+( cd "$WEBAPP_DIR" && ditto -c -k . "$WEBAPP_ZIP" )
 
 echo "Writing manifest..."
 SLICCSTART_HASH="$(shasum -a 256 "$APP_DIR/Contents/MacOS/Sliccstart" | awk '{print $1}')"
@@ -102,10 +104,12 @@ SERVER_HASH="$(shasum -a 256 "$APP_DIR/Contents/Resources/slicc-server" | awk '{
 # Deterministic webapp hash: sort relative paths, hash "<path>:<sha256>" lines.
 # Mirrors `sha256Directory` in `Sliccstart/Models/UpdateManifest.swift` so
 # the value in the published manifest matches what Sliccstart computes
-# from the running app bundle.
+# from the running app bundle. The Swift side uses `.skipsHiddenFiles`, so
+# we must drop every dotfile/dotdir here too — otherwise hashes diverge
+# the first time a `.well-known/` or similar slips into `dist/ui`.
 WEBAPP_HASH="$(
   cd "$WEBAPP_DIR" && \
-  find . -type f -not -name '.DS_Store' \
+  find . -type f -not -path '*/.*' \
     | sed 's|^\./||' \
     | sort \
     | while read -r f; do

@@ -58,7 +58,7 @@ Use this path when an Electron app disables remote debugging in production build
 
 ## Smooth-Update Modules
 
-- `Models/LaunchRecordStore.swift` — persisted `PersistedLaunchRecord` JSON (PID, servePort, CDP port, electronAppPath, staticRoot, target name) at `~/Library/Application Support/Sliccstart/launch-records.json`, plus `CDPLiveProbe` for liveness checks via `/json/version`.
+- `Models/LaunchRecordStore.swift` — persisted `PersistedLaunchRecord` JSON (servePort, CDP port, electronAppPath, staticRoot, target name, target type) at `~/Library/Application Support/Sliccstart/launch-records.json`, plus `CDPLiveProbe` for liveness checks via `/json/version`. No PID is stored — process identity isn't needed for reattach because the CDP port answering `/json/version` is what we use to decide whether the previous browser is still alive.
 - `Models/UpdateManifest.swift` — `UpdateManifest`, `RunningAppHashes`, streaming `sha256File` / deterministic `sha256Directory`, `ReleaseAssetResolver`, `UpdateManifestFetcher`.
 - `Models/WebappOverlayStore.swift` — versioned overlays under `~/Library/Application Support/Sliccstart/ui-overlays/` with an `active.json` pointer, atomic activation, and prune.
 - `Models/SmoothUpdateCoordinator.swift` — `@Observable` state machine driving the UI-only update flow (`idle / checking / noUpdate / fullUpdateRequired / webappOnlyAvailable / applying / applied / failed`).

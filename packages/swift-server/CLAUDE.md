@@ -68,7 +68,7 @@ Swift-server includes `OAuthSecretStore.swift` for OAuth token replicas plus mat
 - `Sources/Server/GracefulShutdown.swift` registers handlers for `SIGINT`, `SIGTERM`, and `SIGUSR1`.
 - `SIGINT` / `SIGTERM` run the full shutdown sequence with `closeBrowser: true` — the browser/Electron session is torn down.
 - `SIGUSR1` calls `detach()`, which runs the same sequence with `closeBrowser: false`. The HTTP listener and CDP proxy stop, but the launched browser stays open. Sliccstart uses this to swap binaries without killing the user's session; see `packages/swift-launcher/CLAUDE.md` ("Smooth-Update Modules") for the launcher-side reattach flow.
-- A second signal after `detach()` is a no-op, guarded by `GracefulShutdownHandler.isShuttingDown`.
+- A second signal after `detach()` is a no-op, guarded by the private `GracefulShutdownHandler.shuttingDown` latch.
 
 ## Related Guides
 

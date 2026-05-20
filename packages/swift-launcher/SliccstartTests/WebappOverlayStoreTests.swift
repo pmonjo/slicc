@@ -58,6 +58,66 @@ final class WebappOverlayStoreTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: overlayDir.appendingPathComponent("a.txt").path))
     }
 
+    /// Regression test for the zip-slip hardening added during PR
+    /// review: `install()` must refuse any archive containing a path
+    /// that would write outside the destination directory.
+    func testInstallRejectsZipWithParentTraversal() throws {
+        let zipURL = try makeZipWithEntry(name: "../escape.txt", body: "pwned")
+        XCTAssertThrowsError(try store.install(zipURL: zipURL, version: "9.9.9")) { error in
+            assertUnsafeEntry(error, expectedReasonContains: "traversal")
+        }
+        let escapedPath = tempDir.appendingPathComponent("escape.txt").path
+        XCTAssertFalse(FileManager.default.fileExists(atPath: escapedPath),
+                       "no file may land outside the overlay directory on a rejected install")
+    }
+
+    func testValidateArchiveEntriesRejectsAbsolutePath() throws {
+        let zipURL = try makeZipWithEntry(name: "/etc/passwd-mock", body: "x")
+        XCTAssertThrowsError(try store.validateArchiveEntries(zipURL: zipURL)) { error in
+            assertUnsafeEntry(error, expectedReasonContains: "absolute path")
+        }
+    }
+
+    func testValidateArchiveEntriesRejectsBackslashSeparator() throws {
+        let zipURL = try makeZipWithEntry(name: "a\\b.txt", body: "x")
+        XCTAssertThrowsError(try store.validateArchiveEntries(zipURL: zipURL)) { error in
+            assertUnsafeEntry(error, expectedReasonContains: "backslash")
+        }
+    }
+
+    private func assertUnsafeEntry(_ error: Error, expectedReasonContains: String) {
+        if let overlayError = error as? WebappOverlayStore.OverlayError,
+           case .unsafeEntry(_, let reason) = overlayError {
+            XCTAssertTrue(reason.contains(expectedReasonContains),
+                          "expected reason to contain \(expectedReasonContains), got '\(reason)'")
+        } else {
+            XCTFail("expected OverlayError.unsafeEntry, got \(error)")
+        }
+    }
+
+    /// Build a zip whose central directory contains a single entry with
+    /// the literal path `name`. We use python3 because the macOS `zip`
+    /// CLI normalizes traversal paths and strips leading slashes —
+    /// exactly the bypass our validator needs to defend against.
+    private func makeZipWithEntry(name: String, body: String) throws -> URL {
+        let zipURL = tempDir.appendingPathComponent("\(UUID().uuidString).zip")
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        let script = """
+        import zipfile, sys
+        z = zipfile.ZipFile(sys.argv[1], 'w')
+        z.writestr(sys.argv[2], sys.argv[3])
+        z.close()
+        """
+        task.arguments = ["python3", "-c", script, zipURL.path, name, body]
+        try task.run()
+        task.waitUntilExit()
+        guard task.terminationStatus == 0 else {
+            throw XCTSkip("python3 unavailable; cannot build malicious zip fixture")
+        }
+        return zipURL
+    }
+
     func testPruneOthersKeepsOnlyTheNamedOverlay() throws {
         let oldDir = tempDir.appendingPathComponent("2.50.0", isDirectory: true)
         let newDir = tempDir.appendingPathComponent("2.55.0", isDirectory: true)
