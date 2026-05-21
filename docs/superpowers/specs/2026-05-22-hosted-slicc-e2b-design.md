@@ -58,10 +58,85 @@ The compute substrate is **e2b.dev sandboxes** with a custom baked SLICC templat
 - **Filesystem API on paused-or-running sandboxes**: `sbx.files.read/write` from the SDK, used by the CLI to (a) upload `secrets.env` after `Sandbox.create` and (b) read `/tmp/slicc-join.json` to surface the join URL.
 - **Pricing** is per-second compute + memory + storage while running; storage-only while paused ([E2B pricing](https://e2b.dev/pricing)). Pause cost is the dominant lever for letting users park sessions cheaply.
 
-Rejected alternatives:
+Alternatives:
 
-- **Cloudflare Sandbox** (the prior draft's substrate) — viable but tangles in CF-specific DOs as per-session coordinator and an egress proxy. e2b is simpler for an MVP that does not need worker-mediated session ownership.
-- **Self-managed VM (Fly.io, Cloud Run, etc.)** — more operational surface, no built-in pause/resume.
+- **Cloudflare Sandbox** (the prior draft's substrate) — viable, but its natural fit is worker/DO-orchestrated (per-session DO owning the sandbox lifecycle), not laptop-CLI-orchestrated. Deferred to future work as an alternate substrate; the §"Substrate seam" below ensures it can be added without rewriting `cloud/`.
+- **Self-managed VM (Fly.io, Cloud Run, etc.)** — more operational surface, no built-in pause/resume. Could plug in as a substrate but no MVP motivation.
+
+## Substrate seam
+
+The CLI does not call the e2b SDK directly. It calls a `SandboxSubstrate` interface — a small TypeScript abstraction over the substrate-specific operations the CLI subcommands need. MVP ships exactly one implementation (e2b); the interface exists so a future Cloudflare Sandbox (or any other) substrate slots in without rewriting `cloud/`.
+
+```ts
+// packages/node-server/src/cloud/substrate.ts
+export type SubstrateId = 'e2b' | 'cloudflare-sandbox';
+
+export interface SandboxSubstrate {
+  readonly id: SubstrateId;
+  create(opts: CreateOpts): Promise<SandboxHandle>;
+  connect(sandboxId: string): Promise<SandboxHandle>;
+  list(filter?: ListFilter): Promise<SandboxSummary[]>;
+}
+
+export interface SandboxHandle {
+  readonly sandboxId: string;
+  readonly substrate: SubstrateId;
+  pause(): Promise<void>;
+  kill(): Promise<void>;
+  getInfo(): Promise<SandboxInfo>;
+  writeFile(path: string, contents: string | Uint8Array): Promise<void>;
+  readFile(path: string): Promise<string>;
+  run(cmd: string): Promise<{ stdout: string; stderr: string; exitCode: number }>;
+}
+
+export interface CreateOpts {
+  template: string; // substrate-specific identifier (e2b template name, CF image, etc.)
+  envVars: Record<string, string>;
+  metadata: Record<string, string>; // sliccVersion + substrate-specific opaque blob
+  autoPauseOnCap: boolean; // semantic flag; substrate decides how to honor
+  name?: string;
+}
+
+export function createSubstrate(id: SubstrateId, opts: SubstrateConfig): SandboxSubstrate;
+```
+
+**What each substrate maps to:**
+
+| Concept                | `e2b` impl                                                               | `cloudflare-sandbox` impl (future)                                                                 |
+| ---------------------- | ------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------- |
+| `create`               | `Sandbox.create({template, autoPause, envs, metadata})` from the e2b SDK | POST to a worker control endpoint that calls CF Sandbox's create API; or direct SDK if creds local |
+| `connect`              | `Sandbox.connect(sandboxId)`                                             | Re-attach to the persistent CF Sandbox via its SDK (the worker DO holds the binding)               |
+| `pause`                | `sbx.pause()`                                                            | CF Sandbox's snapshot+stop (managed by the DO)                                                     |
+| `kill`                 | `sbx.kill()`                                                             | CF Sandbox destroy via worker / SDK                                                                |
+| `writeFile`            | `sbx.files.write(path, contents)`                                        | CF Sandbox FS API                                                                                  |
+| `run`                  | `sbx.commands.run(cmd)`                                                  | CF Sandbox shell-run primitive                                                                     |
+| `autoPauseOnCap: true` | `autoPause: true` at create                                              | DO alarm scheduled at cap-minus-safety; alarm calls `pause`                                        |
+| Public URL             | `https://{port}-{sandboxId}.e2b.app/` (unused)                           | CF Sandbox's worker-routed URL (also unused; both substrates route through tray)                   |
+| Credential boundary    | User's local `E2B_API_KEY`                                               | Worker-side (preferred) or local (alternative)                                                     |
+
+**The CLI subcommands are substrate-agnostic.** `start.ts` reads `substrate: SubstrateId` from CLI flags (`--substrate e2b` default) or `~/.slicc/cloud-sessions.json` for resume/list, calls `createSubstrate(id, cfg)`, and never references e2b directly. The registry tags every session with its substrate:
+
+```json
+{
+  "sessions": [
+    {
+      "sandboxId": "ix7p9q...",
+      "substrate": "e2b",
+      "name": "task-1",
+      "createdAt": "2026-05-22T12:00:00Z",
+      "joinUrl": "https://www.sliccy.ai/join/<token>",
+      "lastSeen": "2026-05-22T14:30:00Z",
+      "state": "running"
+    }
+  ]
+}
+```
+
+**What stays substrate-agnostic outside `cloud/`:** the webapp's hosted-leader boot path, `node-server --hosted` mode, `/api/cloud-status` / `/api/leader-restart`, the container Chrome flags, the worker's `kind: 'hosted'` plumbing and 30-day reclaim TTL, `SLICC_TRAY_WORKER_BASE_URL`. None of these reference e2b semantically — they sit above the substrate seam.
+
+**What is substrate-specific outside `cloud/`:** the template package. `packages/dev-tools/e2b-template/` is e2b-only; a future CF Sandbox substrate adds a sibling `packages/dev-tools/cf-sandbox-image/` with its own image format and build pipeline. The webapp + node-server binaries baked into both are identical.
+
+**MVP scope.** Ship the interface, the e2b implementation, and the registry tag. Do not ship a CF Sandbox stub. Cost overhead vs an e2b-coupled CLI is ~50 LoC of interface + light wrapper; saved retrofit cost when CF Sandbox becomes real is significant (every CLI subcommand would otherwise be peppered with e2b SDK calls).
 
 ## Architecture
 
@@ -154,29 +229,41 @@ The `onLeaderReady` and `kind` options are additive: legacy callers ignore them,
 Five subcommands under `sliccy --cloud`. All call the e2b SDK from the local CLI; no other dependencies.
 
 ```
-sliccy --cloud start [--env-file <path>] [--name <label>]
-  • Reads E2B_API_KEY from process.env or ~/.slicc/secrets.env
-  • Reads --env-file or default ~/.slicc/secrets.env
-  • Calls Sandbox.create({template: "slicc", autoPause: true,
-                          metadata: {sliccVersion, createdBy, name}})
-  • Uploads env file: sbx.files.write("/slicc/secrets.env", contents)
-  • Polls sbx.files.read("/tmp/slicc-join.json") every 500ms, up to 60s
+All subcommands resolve a `SandboxSubstrate` instance via `createSubstrate(id, cfg)`
+(see §"Substrate seam"). `id` defaults to `'e2b'` for MVP; `--substrate <id>` flag
+overrides. The subcommand bodies below use abstract `substrate.*` / `handle.*`
+calls — the e2b SDK only appears in `cloud/substrates/e2b.ts`.
+
+sliccy --cloud start [--env-file <path>] [--name <label>] [--substrate <id>]
+  • Resolves substrate (default e2b). Reads its credential (E2B_API_KEY for
+    e2b) from process.env or ~/.slicc/secrets.env.
+  • Reads --env-file or default ~/.slicc/secrets.env.
+  • handle = await substrate.create({
+      template: "slicc", autoPauseOnCap: true,
+      envVars: {SLICC_TRAY_WORKER_BASE_URL, ...},
+      metadata: {sliccVersion, createdBy, name},
+    })
+  • Uploads env file: handle.writeFile("/slicc/secrets.env", contents)
+  • Polls handle.readFile("/tmp/slicc-join.json") every 500ms, up to 60s
   • Prints: joinUrl, sandboxId, "Open in iOS / browser / desktop SLICC"
-  • Appends entry to ~/.slicc/cloud-sessions.json
+  • Appends {substrate, sandboxId, name, ...} entry to ~/.slicc/cloud-sessions.json
 
 sliccy --cloud list
   • Reads ~/.slicc/cloud-sessions.json
-  • For each entry, calls sbx.getInfo() to enrich state
-  • Prints table: sandboxId, name, state (running|paused|dead), joinUrl, age
+  • Groups entries by substrate; for each group, calls substrate.list() to
+    enrich state.
+  • Prints table: substrate, sandboxId, name, state (running|paused|dead),
+    joinUrl, age
 
 sliccy --cloud pause <sandboxId|name>
-  • sbx.pause(); updates local registry to state=paused
+  • handle = await substrate.connect(sandboxId)
+  • handle.pause(); updates local registry to state=paused
 
 sliccy --cloud resume <sandboxId|name>
-  • sbx = await Sandbox.connect(sandboxId)
+  • handle = await substrate.connect(sandboxId)
   • Issues a "kick" to the resumed leader to recover from the case where
     reconnect attempts had already given up before the pause:
-      sbx.commands.run("curl -X POST localhost:5710/api/leader-restart")
+      handle.run("curl -X POST localhost:5710/api/leader-restart")
     node-server's /api/leader-restart endpoint (--hosted only) signals the
     cloud webapp via CDP Page.reload(). After the reload, the
     hosted-leader boot path runs again and posts a fresh
@@ -190,13 +277,14 @@ sliccy --cloud resume <sandboxId|name>
     local registry with the new joinUrl and surfaces a clear "tray
     was rebuilt; a new join URL is in effect; followers must re-attach"
     notice. Old followers fail with 404 on the stale token.
-  • If the running sandbox's template version (read from sandbox
+  • If the running sandbox's template version (read from handle.getInfo()'s
     metadata.sliccVersion) differs from the local CLI's, prints a soft
     warning but proceeds.
   • Prints joinUrl (same or new).
 
 sliccy --cloud kill <sandboxId|name>
-  • sbx.kill(); removes registry entry
+  • handle = await substrate.connect(sandboxId)
+  • handle.kill(); removes registry entry
 ```
 
 **Local registry** (`~/.slicc/cloud-sessions.json`):
@@ -205,6 +293,7 @@ sliccy --cloud kill <sandboxId|name>
 {
   "sessions": [
     {
+      "substrate": "e2b",
       "sandboxId": "ix7p9q...",
       "name": "task-1",
       "createdAt": "2026-05-22T12:00:00Z",
@@ -392,7 +481,9 @@ const reclaimMs = tray.kind === 'hosted' ? HOSTED_TRAY_RECLAIM_TTL_MS : TRAY_REC
 | Path / artifact                                     | Status                                   | Notes                                                                                                                                                                                                                                                                         |
 | --------------------------------------------------- | ---------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `packages/dev-tools/e2b-template/`                  | **NEW** directory (NOT an npm workspace) | Dockerfile, e2b.toml, start.sh, build scripts. Owns template version pinning. Carries its own `package.json` only if needed by the `e2b template build` tooling; not part of `workspaces` in root `package.json`.                                                             |
-| `packages/node-server/src/cloud/`                   | **NEW** subdirectory                     | `start.ts`, `list.ts`, `pause.ts`, `resume.ts`, `kill.ts` — one file per subcommand. `registry.ts` for `~/.slicc/cloud-sessions.json` I/O. `e2b-client.ts` for SDK wrapping.                                                                                                  |
+| `packages/node-server/src/cloud/`                   | **NEW** subdirectory                     | `start.ts`, `list.ts`, `pause.ts`, `resume.ts`, `kill.ts` — one file per subcommand, substrate-agnostic. `registry.ts` for `~/.slicc/cloud-sessions.json` I/O (each entry tagged with `substrate: SubstrateId`).                                                              |
+| `packages/node-server/src/cloud/substrate.ts`       | **NEW**                                  | `SandboxSubstrate` interface, `SandboxHandle`, `CreateOpts`, `createSubstrate(id, cfg)` factory. The only place CLI code couples to substrate-specific shapes.                                                                                                                |
+| `packages/node-server/src/cloud/substrates/e2b.ts`  | **NEW**                                  | E2B implementation of `SandboxSubstrate` — thin wrapper over the e2b TS SDK. Sole holder of e2b SDK imports in the codebase.                                                                                                                                                  |
 | `packages/node-server/src/index.ts`                 | **MODIFIED**                             | New `--hosted` flag (parallels `--serve-only`); new `--cloud <subcmd>` dispatcher. The hosted flag triggers container Chrome args, disables auto-open, registers `/api/cloud-status` and `/api/leader-restart`. `/api/runtime-config` reads `SLICC_TRAY_WORKER_BASE_URL` env. |
 | `packages/node-server/src/chrome-launch.ts`         | **MODIFIED**                             | New `--hosted` code path that appends container flags (`--headless=new`, `--no-sandbox`, `--disable-dev-shm-usage`, `--disable-gpu`, `--font-render-hinting=none`). Honors `CHROME_USER_DATA_DIR` env. Non-hosted path unchanged.                                             |
 | `packages/webapp/src/ui/runtime-mode.ts`            | **MODIFIED**                             | Add `'hosted-leader'` to `UiRuntimeMode`; teach `resolveUiRuntimeMode` and `shouldUseRuntimeModeTrayDefaults` about it.                                                                                                                                                       |
@@ -477,7 +568,8 @@ Each phase is independently shippable and reviewable. Phases 2–4 are the bulk 
 
 - **OAuth relay via the follower.** Adds the missing provider class. Tray-mediated; preserves the "credentials never leave the user's machine" model for the OAuth flow itself.
 - **Periodic snapshot for crash recovery.** Cheap, opt-in `--cloud start --snapshot-every 10m`.
-- **Worker-side `--cloud` (Approach B from brainstorm).** Worker holds an e2b key on behalf of users without an e2b account; web UI at `sliccy.ai/cloud`. Builds on top of MVP without rewiring it.
+- **Cloudflare Sandbox as alternate substrate.** New `cloud/substrates/cloudflare-sandbox.ts` implementing `SandboxSubstrate`; new `packages/dev-tools/cf-sandbox-image/`. CLI gains `--substrate cloudflare-sandbox`. The webapp, node-server, tray hub, and `kind=hosted` worker plumbing are untouched. The prior 2026-04-28 CF Sandbox draft's full lifecycle product (6-state DO, read-only projections, lick-while-asleep) is a _separate_ future workstream — this substrate addition is the minimum needed to swap the runtime.
+- **Worker-side `--cloud` (Approach B from brainstorm).** Worker holds the substrate key on behalf of users without their own account; web UI at `sliccy.ai/cloud`. Builds on top of MVP without rewiring it.
 - **Token re-mint on resume.** Removes the 30-day cliff; CLI calls a small worker endpoint, gets a fresh controller token, pushes into the resumed sandbox via `sbx.commands.run` writing to webapp localStorage. Implementation cost: ~2 days.
 - **Wake-on-webhook for hosted trays.** Worker endpoint that calls e2b `Sandbox.connect()` (resume) when a webhook arrives for a paused hosted tray, then forwards the webhook event after the leader reconnects. Removes the "no webhooks while paused" limitation.
 - **`--cloud logs <id>`.** Stream `/tmp/slicc-stderr.log` and chromium console via e2b SDK. Necessary for production-quality debugging.
