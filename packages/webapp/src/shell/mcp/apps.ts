@@ -35,7 +35,8 @@ interface MinimalFs {
   exists: (path: string) => Promise<boolean>;
 }
 
-async function openFs(): Promise<MinimalFs> {
+async function openFs(injected?: MinimalFs | null): Promise<MinimalFs> {
+  if (injected) return injected;
   const { VirtualFS } = await import('../../fs/index.js');
   return (await VirtualFS.create({ dbName: GLOBAL_FS_DB_NAME })) as unknown as MinimalFs;
 }
@@ -115,11 +116,12 @@ export function renderAppSprinkle(serverName: string, app: McpAppDef): string {
  */
 export async function materializeAppSprinkles(
   serverName: string,
-  apps: McpAppDef[]
+  apps: McpAppDef[],
+  injectedFs?: MinimalFs | null
 ): Promise<string[]> {
-  const fs = await openFs();
+  const fs = await openFs(injectedFs);
   const dir = `${MCP_SPRINKLES_DIR}/${serverName}`;
-  await removeAppSprinkles(serverName);
+  await removeAppSprinkles(serverName, injectedFs);
   const renderable = apps.filter(
     (a) => typeof a.templateUri === 'string' && a.templateUri.length > 0
   );
@@ -141,8 +143,11 @@ export async function materializeAppSprinkles(
 }
 
 /** Remove the entire per-server sprinkles directory. ENOENT is swallowed. */
-export async function removeAppSprinkles(serverName: string): Promise<boolean> {
-  const fs = await openFs();
+export async function removeAppSprinkles(
+  serverName: string,
+  injectedFs?: MinimalFs | null
+): Promise<boolean> {
+  const fs = await openFs(injectedFs);
   const dir = `${MCP_SPRINKLES_DIR}/${serverName}`;
   try {
     if (!(await fs.exists(dir))) return false;

@@ -43,7 +43,8 @@ async function loadFsModule(): Promise<typeof import('../../fs/index.js')> {
   return cachedFsModule;
 }
 
-async function openFs(): Promise<MinimalFs> {
+async function openFs(injected?: MinimalFs | null): Promise<MinimalFs> {
+  if (injected) return injected;
   if (cachedFs && cachedFs.dbName === GLOBAL_FS_DB_NAME) {
     return cachedFs.instance as MinimalFs;
   }
@@ -74,9 +75,9 @@ function normalize(raw: unknown): McpServersFile {
 }
 
 /** Read the entire `servers.json`. Returns an empty file if missing/invalid. */
-export async function readServersFile(): Promise<McpServersFile> {
+export async function readServersFile(injectedFs?: MinimalFs | null): Promise<McpServersFile> {
   try {
-    const fs = await openFs();
+    const fs = await openFs(injectedFs);
     const content = (await fs.readFile(MCP_STORE_PATH, { encoding: 'utf-8' })) as string;
     try {
       return normalize(JSON.parse(content));
@@ -96,8 +97,11 @@ export async function readServersFile(): Promise<McpServersFile> {
 }
 
 /** Atomically replace the entire `servers.json`. */
-export async function writeServersFile(file: McpServersFile): Promise<void> {
-  const fs = await openFs();
+export async function writeServersFile(
+  file: McpServersFile,
+  injectedFs?: MinimalFs | null
+): Promise<void> {
+  const fs = await openFs(injectedFs);
   await fs.mkdir(MCP_DIR, { recursive: true });
   const payload: McpServersFile = {
     version: file.version || CURRENT_VERSION,
@@ -107,32 +111,41 @@ export async function writeServersFile(file: McpServersFile): Promise<void> {
 }
 
 /** Read a single server entry by name (or null if missing). */
-export async function getServer(name: string): Promise<McpServerEntry | null> {
-  const file = await readServersFile();
+export async function getServer(
+  name: string,
+  injectedFs?: MinimalFs | null
+): Promise<McpServerEntry | null> {
+  const file = await readServersFile(injectedFs);
   return file.servers[name] ?? null;
 }
 
 /** Upsert a server entry. Merges with the existing entry if present. */
-export async function setServer(name: string, entry: McpServerEntry): Promise<McpServerEntry> {
-  const file = await readServersFile();
+export async function setServer(
+  name: string,
+  entry: McpServerEntry,
+  injectedFs?: MinimalFs | null
+): Promise<McpServerEntry> {
+  const file = await readServersFile(injectedFs);
   const merged: McpServerEntry = { ...file.servers[name], ...entry };
   file.servers[name] = merged;
-  await writeServersFile(file);
+  await writeServersFile(file, injectedFs);
   return merged;
 }
 
 /** Delete a server entry. Returns true if anything was removed. */
-export async function deleteServer(name: string): Promise<boolean> {
-  const file = await readServersFile();
+export async function deleteServer(name: string, injectedFs?: MinimalFs | null): Promise<boolean> {
+  const file = await readServersFile(injectedFs);
   if (!(name in file.servers)) return false;
   delete file.servers[name];
-  await writeServersFile(file);
+  await writeServersFile(file, injectedFs);
   return true;
 }
 
 /** List all server entries keyed by name. */
-export async function listServers(): Promise<Record<string, McpServerEntry>> {
-  const file = await readServersFile();
+export async function listServers(
+  injectedFs?: MinimalFs | null
+): Promise<Record<string, McpServerEntry>> {
+  const file = await readServersFile(injectedFs);
   return file.servers;
 }
 
@@ -156,7 +169,7 @@ export async function readMcpAuthEntries(): Promise<McpServerAuthRecord[]> {
   return out;
 }
 
-export type { McpAuthEntry, McpServerAuthRecord, McpServerEntry, McpServersFile };
+export type { McpAuthEntry, McpServerAuthRecord, McpServerEntry, McpServersFile, MinimalFs };
 
 // ── Test-only hooks ─────────────────────────────────────────────────
 

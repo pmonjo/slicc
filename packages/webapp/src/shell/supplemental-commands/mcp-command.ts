@@ -16,9 +16,11 @@
 
 import { defineCommand } from 'just-bash';
 import type { Command } from 'just-bash';
+import type { VirtualFS } from '../../fs/index.js';
 import type { McpAppDef, McpFetchLike, McpServerEntry, McpToolDef } from '../mcp/types.js';
 import type { OAuthLauncher } from '../../providers/types.js';
 import type { FetchLike } from '../mcp/oauth.js';
+import type { ScriptCatalog } from '../script-catalog.js';
 import { createLogger } from '../../core/logger.js';
 
 const log = createLogger('mcp-command');
@@ -31,6 +33,21 @@ export interface McpCommandDeps {
   oauthFetchImpl?: FetchLike;
   /** Override the OAuth browser launcher. */
   oauthLauncher?: OAuthLauncher;
+  /**
+   * Shared shell `VirtualFS`. When present, alias shims, the server
+   * store, and the sprinkles writes all go through this instance so
+   * the shell's `ScriptCatalog` FsWatcher fires immediately. When
+   * absent (tests / legacy callers), the store/apps modules fall back
+   * to opening their own `GLOBAL_FS_DB_NAME` instance.
+   */
+  fs?: VirtualFS;
+  /**
+   * Shared script-discovery catalog. When present, `mcp add` /
+   * `mcp delete` invalidate the `.jsh` cache after writing/removing
+   * the alias so the new (or removed) command resolves on the PATH
+   * in the same shell session.
+   */
+  scriptCatalog?: ScriptCatalog;
 }
 
 const ALIASES_DIR = '/workspace/.mcp/aliases';
@@ -80,7 +97,7 @@ export function createMcpCommand(deps: McpCommandDeps = {}): Command {
           return await cmdAdd(rest, deps);
         case 'list':
         case 'ls':
-          return await cmdList(rest);
+          return await cmdList(rest, deps);
         case 'delete':
         case 'rm':
           return await cmdDelete(rest, deps);
@@ -129,7 +146,7 @@ short name resolves on the PATH.
   }
 
   const { getServer, setServer } = await import('../mcp/store.js');
-  const existing = await getServer(name);
+  const existing = await getServer(name, deps.fs);
   if (existing) {
     return err(`mcp add: a server named "${name}" already exists`);
   }
@@ -160,22 +177,24 @@ short name resolves on the PATH.
 
   // Phase 5: persist
   const now = new Date().toISOString();
+  // Note: do NOT persist `sessionId`. Sessions are issued by the server on
+  // every `initialize` and don't survive across reloads — sending a stale
+  // id on the next `initialize` is a Streamable-HTTP protocol violation.
   const entry: McpServerEntry = {
     url,
-    sessionId: client.getSessionId(),
     tools,
     apps,
     addedAt: now,
     lastRefreshedAt: now,
     ...(authBlock ? { auth: authBlock } : {}),
   };
-  await setServer(name, entry);
+  await setServer(name, entry, deps.fs);
 
   // Phase 6: alias shim
-  await writeAliasShim(name);
+  await writeAliasShim(name, deps);
 
   // Phase 7: materialize Apps as sprinkles (best-effort)
-  const sprinkles = await materializeAppSprinklesSafe(name, apps);
+  const sprinkles = await materializeAppSprinklesSafe(name, apps, deps);
 
   // Phase 8: register the provider in-session (if we set up OAuth)
   if (authBlock) {
@@ -245,14 +264,14 @@ async function runOAuthForAdd(
 
 // ── list ────────────────────────────────────────────────────────────
 
-async function cmdList(args: string[]): Promise<ExecResult> {
+async function cmdList(args: string[], deps: McpCommandDeps): Promise<ExecResult> {
   if (args.includes('--help') || args.includes('-h')) {
     return ok('usage: mcp list\n');
   }
   const { ensureAllMcpProvidersRegistered } = await import('../mcp/provider.js');
   await ensureAllMcpProvidersRegistered();
   const { listServers } = await import('../mcp/store.js');
-  const servers = await listServers();
+  const servers = await listServers(deps.fs);
   const names = Object.keys(servers).sort();
   if (names.length === 0) {
     return ok('No MCP servers configured. Use `mcp add <url> <name>`.\n');
@@ -290,7 +309,7 @@ function formatTable(rows: string[][]): string {
 
 // ── delete ──────────────────────────────────────────────────────────
 
-async function cmdDelete(args: string[], _deps: McpCommandDeps): Promise<ExecResult> {
+async function cmdDelete(args: string[], deps: McpCommandDeps): Promise<ExecResult> {
   if (args.length === 0 || args[0] === '--help' || args[0] === '-h') {
     return args.length === 0
       ? err('mcp delete: expected <name>')
@@ -300,13 +319,13 @@ async function cmdDelete(args: string[], _deps: McpCommandDeps): Promise<ExecRes
   const { ensureMcpProviderRegistered, removeMcpProvider } = await import('../mcp/provider.js');
   await ensureMcpProviderRegistered(name);
   const { deleteServer } = await import('../mcp/store.js');
-  const removedServer = await deleteServer(name);
+  const removedServer = await deleteServer(name, deps.fs);
 
   // Best-effort filesystem cleanup. The store ENOENT path already
   // tolerates a missing file, but the alias + sprinkles paths are
   // independent so we swallow ENOENT individually.
-  await removeAliasShim(name);
-  await removeSprinklesDir(name);
+  await removeAliasShim(name, deps);
+  await removeSprinklesDir(name, deps);
 
   const providerId = `mcp:${name}`;
   let oauthRemoved = false;
@@ -353,7 +372,7 @@ async function cmdInvoke(args: string[], deps: McpCommandDeps): Promise<ExecResu
   await ensureMcpProviderRegistered(name);
 
   const { getServer } = await import('../mcp/store.js');
-  const entry = await getServer(name);
+  const entry = await getServer(name, deps.fs);
   if (!entry) {
     return err(`mcp invoke: unknown server "${name}" (run \`mcp add <url> ${name}\` first)`);
   }
@@ -385,7 +404,6 @@ async function cmdInvoke(args: string[], deps: McpCommandDeps): Promise<ExecResu
   const client = new McpClient({
     url: entry.url,
     fetchImpl: deps.fetchImpl,
-    sessionId: entry.sessionId,
     headers: entry.headers,
     getAuthHeader: entry.auth ? () => getMcpBearerHeader(name) : undefined,
   });
@@ -621,29 +639,32 @@ async function cmdRefresh(args: string[], deps: McpCommandDeps): Promise<ExecRes
   await ensureMcpProviderRegistered(name);
 
   const { getServer, setServer } = await import('../mcp/store.js');
-  const entry = await getServer(name);
+  const entry = await getServer(name, deps.fs);
   if (!entry) return err(`mcp refresh: unknown server "${name}"`);
 
   const { McpClient } = await import('../mcp/client.js');
   const client = new McpClient({
     url: entry.url,
     fetchImpl: deps.fetchImpl,
-    sessionId: entry.sessionId,
     headers: entry.headers,
     getAuthHeader: entry.auth ? () => getMcpBearerHeader(name) : undefined,
   });
   await client.initialize();
   const tools = await client.toolsList();
   const apps = await client.appsList();
+  // Drop any previously persisted `sessionId` — it's per-process state on
+  // the server and unsafe to re-send on the next `initialize`. Setting it
+  // to `undefined` ensures JSON.stringify in `writeServersFile` drops it
+  // even though `setServer` shallow-merges with the existing record.
   const merged: McpServerEntry = {
     ...entry,
-    sessionId: client.getSessionId() ?? entry.sessionId,
+    sessionId: undefined,
     tools,
     apps,
     lastRefreshedAt: new Date().toISOString(),
   };
-  await setServer(name, merged);
-  const sprinkles = await materializeAppSprinklesSafe(name, apps);
+  await setServer(name, merged, deps.fs);
+  const sprinkles = await materializeAppSprinklesSafe(name, apps, deps);
   return ok(
     `Refreshed "${name}" — tools: ${tools.length}, apps: ${apps.length} (${sprinkles} sprinkle${sprinkles === 1 ? '' : 's'})\n`
   );
@@ -712,18 +733,19 @@ async function resolveOAuthFetchImpl(override?: FetchLike): Promise<FetchLike> {
   };
 }
 
-async function openGlobalFs(): Promise<{
+interface AliasFs {
   readFile: (p: string, opts?: { encoding?: 'utf-8' | 'binary' }) => Promise<unknown>;
   writeFile: (p: string, c: string | Uint8Array) => Promise<void>;
   mkdir: (p: string, o?: { recursive?: boolean }) => Promise<void>;
   rm: (p: string, o?: { recursive?: boolean; force?: boolean }) => Promise<void>;
   exists: (p: string) => Promise<boolean>;
-}> {
-  const { VirtualFS } = await import('../../fs/index.js');
+}
+
+async function openGlobalFs(injected?: VirtualFS | null): Promise<AliasFs> {
+  if (injected) return injected as unknown as AliasFs;
+  const { VirtualFS: V } = await import('../../fs/index.js');
   const { GLOBAL_FS_DB_NAME } = await import('../../fs/global-db.js');
-  return (await VirtualFS.create({ dbName: GLOBAL_FS_DB_NAME })) as unknown as Awaited<
-    ReturnType<typeof openGlobalFs>
-  >;
+  return (await V.create({ dbName: GLOBAL_FS_DB_NAME })) as unknown as AliasFs;
 }
 
 function aliasContent(name: string): string {
@@ -744,14 +766,21 @@ exit(r.exitCode || 0);
 `;
 }
 
-async function writeAliasShim(name: string): Promise<void> {
-  const fs = await openGlobalFs();
+async function writeAliasShim(name: string, deps: McpCommandDeps): Promise<void> {
+  const fs = await openGlobalFs(deps.fs);
   await fs.mkdir(ALIASES_DIR, { recursive: true });
   await fs.writeFile(`${ALIASES_DIR}/${name}.jsh`, aliasContent(name));
+  // Drop the cached `.jsh` listing so the new alias resolves on the
+  // PATH within the same shell session. The catalog's FsWatcher only
+  // fires for writes through the same `VirtualFS` instance; when
+  // `deps.fs` is the shared shell FS this is redundant-but-cheap,
+  // and when it's a separate cached instance (e.g. `openGlobalFs()`
+  // fallback) the invalidation is what makes the alias visible.
+  deps.scriptCatalog?.invalidateJsh();
 }
 
-async function removeAliasShim(name: string): Promise<void> {
-  const fs = await openGlobalFs();
+async function removeAliasShim(name: string, deps: McpCommandDeps): Promise<void> {
+  const fs = await openGlobalFs(deps.fs);
   const path = `${ALIASES_DIR}/${name}.jsh`;
   try {
     if (await fs.exists(path)) await fs.rm(path);
@@ -761,17 +790,26 @@ async function removeAliasShim(name: string): Promise<void> {
       error: e instanceof Error ? e.message : String(e),
     });
   }
+  deps.scriptCatalog?.invalidateJsh();
 }
 
-async function removeSprinklesDir(name: string): Promise<void> {
+async function removeSprinklesDir(name: string, deps: McpCommandDeps): Promise<void> {
   const { removeAppSprinkles } = await import('../mcp/apps.js');
-  await removeAppSprinkles(name);
+  await removeAppSprinkles(name, deps.fs as unknown as Parameters<typeof removeAppSprinkles>[1]);
 }
 
-async function materializeAppSprinklesSafe(name: string, apps: McpAppDef[]): Promise<number> {
+async function materializeAppSprinklesSafe(
+  name: string,
+  apps: McpAppDef[],
+  deps: McpCommandDeps
+): Promise<number> {
   try {
     const { materializeAppSprinkles } = await import('../mcp/apps.js');
-    const written = await materializeAppSprinkles(name, apps);
+    const written = await materializeAppSprinkles(
+      name,
+      apps,
+      deps.fs as unknown as Parameters<typeof materializeAppSprinkles>[2]
+    );
     return written.length;
   } catch (e) {
     log.warn('mcp: failed to materialize app sprinkles', {

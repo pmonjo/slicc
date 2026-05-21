@@ -392,7 +392,10 @@ describe('mcp add / list / delete / invoke / refresh (integration)', () => {
 
     const file = await readServersFile();
     expect(file.servers.demo.url).toBe('https://server.test/sse');
-    expect(file.servers.demo.sessionId).toBe('sess-1');
+    // `sessionId` MUST NOT be persisted — sessions are per-process on the
+    // server and re-sending one on the next `initialize` is a protocol
+    // violation (MCP Streamable-HTTP).
+    expect(file.servers.demo.sessionId).toBeUndefined();
     expect(file.servers.demo.tools).toEqual([
       {
         name: 'echo',
@@ -613,6 +616,68 @@ describe('mcp invoke / delete / refresh', () => {
     const r = await runCmd(['invoke', 'ghost']);
     expect(r.exitCode).toBe(1);
     expect(r.stderr).toContain('unknown server "ghost"');
+  });
+
+  it('invoke does NOT pass a stale persisted sessionId to McpClient (initialize must be Mcp-Session-Id-free)', async () => {
+    // Seed an entry with a stale sessionId — historically `cmdInvoke` would
+    // thread this into the McpClient constructor, which then sent it on the
+    // `initialize` request and triggered a protocol violation.
+    await setServer('demo', {
+      url: 'https://server.test/sse',
+      sessionId: 'stale-from-old-version',
+      tools: [
+        {
+          name: 'echo',
+          inputSchema: {
+            type: 'object',
+            properties: { msg: { type: 'string' } },
+            required: ['msg'],
+          },
+        },
+      ],
+    });
+
+    const calls: Array<{
+      method?: string;
+      mcpSessionId?: string;
+    }> = [];
+    const fetchImpl: McpFetchLike = async (_url, init) => {
+      let body: RpcBody | undefined;
+      try {
+        body = JSON.parse((init?.body as string) ?? '{}') as RpcBody;
+      } catch {
+        /* ignore */
+      }
+      const headers = (init?.headers ?? {}) as Record<string, string>;
+      calls.push({ method: body?.method, mcpSessionId: headers['Mcp-Session-Id'] });
+      const id = body?.id ?? 1;
+      const result =
+        body?.method === 'tools/call'
+          ? { content: [{ type: 'text', text: 'pong' }] }
+          : body?.method === 'initialize'
+            ? { protocolVersion: '2025-06-18', capabilities: {} }
+            : { ok: true };
+      const respHeaders: Record<string, string> =
+        body?.method === 'initialize'
+          ? { 'content-type': 'application/json', 'Mcp-Session-Id': 'fresh-sess' }
+          : { 'content-type': 'application/json' };
+      return {
+        status: 200,
+        statusText: 'OK',
+        headers: respHeaders,
+        body: new TextEncoder().encode(JSON.stringify({ jsonrpc: '2.0', id, result })),
+      };
+    };
+
+    const r = await runCmd(['invoke', 'demo', 'echo', '--msg', 'hi'], { fetchImpl });
+    expect(r.exitCode).toBe(0);
+
+    const initCall = calls.find((c) => c.method === 'initialize');
+    const toolCall = calls.find((c) => c.method === 'tools/call');
+    expect(initCall?.mcpSessionId).toBeUndefined();
+    // The freshly issued session id (from the initialize response) is echoed
+    // on the subsequent tools/call within the same client instance.
+    expect(toolCall?.mcpSessionId).toBe('fresh-sess');
   });
 
   it('add materializes apps with templateUri as sprinkles under /workspace/.mcp/sprinkles/<name>', async () => {
@@ -870,5 +935,85 @@ describe('mcp add: defaultRedirectUri via getOAuthPageOrigin', () => {
     // Server should NOT have been persisted on failure.
     const file = await readServersFile();
     expect(file.servers.demo).toBeUndefined();
+  });
+});
+
+describe('mcp add/delete: shared fs + scriptCatalog invalidation', () => {
+  beforeEach(async () => {
+    _testOnly_resetStoreCache();
+    _testOnly_resetMcpProviderState();
+    unregisterProviderConfig(mcpProviderId('demo'));
+    await wipeGlobalFs();
+    localStorage.clear();
+    mockGetOAuthPageOrigin.mockReset();
+    mockGetOAuthPageOrigin.mockResolvedValue({
+      origin: window.location.origin,
+      href: window.location.href,
+    });
+  });
+
+  afterEach(async () => {
+    _testOnly_resetMcpProviderState();
+    unregisterProviderConfig(mcpProviderId('demo'));
+    await new Promise((r) => setTimeout(r, 600));
+    _testOnly_resetStoreCache();
+  });
+
+  it('add: invalidates the script catalog after writing the alias', async () => {
+    const { fetch } = makeMockMcpFetch({
+      tools: [{ name: 'echo' }],
+      sessionId: 'sess-1',
+    });
+    const invalidateJsh = vi.fn();
+    const scriptCatalog = { invalidateJsh } as unknown as Parameters<
+      typeof createMcpCommand
+    >[0]['scriptCatalog'];
+
+    const r = await runCmd(['add', 'https://server.test/sse', 'demo'], {
+      fetchImpl: fetch,
+      scriptCatalog,
+    });
+    expect(r.exitCode).toBe(0);
+    // At minimum, the alias-write path must have invalidated the catalog.
+    expect(invalidateJsh).toHaveBeenCalled();
+  });
+
+  it('delete: invalidates the script catalog after removing the alias', async () => {
+    // Seed an existing server + alias.
+    await setServer('demo', { url: 'https://server.test/sse' });
+    const fs = await VirtualFS.create({ dbName: GLOBAL_FS_DB_NAME });
+    await fs.mkdir('/workspace/.mcp/aliases', { recursive: true });
+    await fs.writeFile('/workspace/.mcp/aliases/demo.jsh', aliasContent('demo'));
+
+    const invalidateJsh = vi.fn();
+    const scriptCatalog = { invalidateJsh } as unknown as Parameters<
+      typeof createMcpCommand
+    >[0]['scriptCatalog'];
+
+    const r = await runCmd(['delete', 'demo'], { scriptCatalog });
+    expect(r.exitCode).toBe(0);
+    expect(invalidateJsh).toHaveBeenCalled();
+  });
+
+  it('add: writes the alias through the injected fs instance', async () => {
+    const { fetch } = makeMockMcpFetch({
+      tools: [{ name: 'echo' }],
+      sessionId: 'sess-1',
+    });
+    // Use the global db so provider registration / store reads still see
+    // the same persisted data, but inject this specific instance so we
+    // can spy on its writeFile to prove the alias went through it (not
+    // through a parallel `openGlobalFs()` instance).
+    const injectedFs = await VirtualFS.create({ dbName: GLOBAL_FS_DB_NAME });
+    const writeSpy = vi.spyOn(injectedFs, 'writeFile');
+
+    const r = await runCmd(['add', 'https://server.test/sse', 'demo'], {
+      fetchImpl: fetch,
+      fs: injectedFs,
+    });
+    expect(r.exitCode).toBe(0);
+
+    const aliasWrite = writeSpy.mock.calls.find(([p]) => p === '/workspace/.mcp/aliases/demo.jsh');
+    expect(aliasWrite).toBeDefined();
   });
 });

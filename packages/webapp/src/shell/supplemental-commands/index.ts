@@ -96,7 +96,7 @@ export function createSupplementalCommands(options: SupplementalCommandsConfig =
     createWebhookCommand(),
     createWebsocatCommand(),
     createCrontaskCommand(),
-    createMcpCommand(),
+    createMcpCommand({ fs: options.fs, scriptCatalog: options.scriptCatalog }),
     createFsWatchCommand(),
     createSprinkleCommand(),
     createPdftkCommand('pdftk'),

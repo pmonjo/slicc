@@ -173,6 +173,45 @@ describe('McpClient: Mcp-Session-Id round-trip', () => {
     await c.toolsList();
     expect(calls[1].init!.headers!['Mcp-Session-Id']).toBe('sess-1');
   });
+
+  it('does NOT attach Mcp-Session-Id on the initialize request even when constructor was given a stale id', async () => {
+    const { fetchImpl, calls } = stubFetch(() => ({
+      headers: { 'content-type': 'application/json', 'Mcp-Session-Id': 'srv-fresh' },
+      body: jsonRpc(1, {}),
+    }));
+    const c = new McpClient({
+      url: 'https://mcp.example/rpc',
+      fetchImpl,
+      sessionId: 'stale-123',
+    });
+    await c.initialize();
+    expect(calls).toHaveLength(1);
+    expect(calls[0].init!.headers!['Mcp-Session-Id']).toBeUndefined();
+    // The response-provided session id wins over the stale constructor value.
+    expect(c.getSessionId()).toBe('srv-fresh');
+  });
+
+  it('attaches the freshly issued Mcp-Session-Id on a tools/call after initialize', async () => {
+    let callCount = 0;
+    const { fetchImpl, calls } = stubFetch(() => {
+      callCount++;
+      if (callCount === 1) {
+        return {
+          headers: { 'content-type': 'application/json', 'Mcp-Session-Id': 'srv-abc' },
+          body: jsonRpc(1, {}),
+        };
+      }
+      return {
+        body: jsonRpc(2, { content: [{ type: 'text', text: 'ok' }] }),
+      };
+    });
+    const c = new McpClient({ url: 'https://mcp.example/rpc', fetchImpl });
+    await c.initialize();
+    await c.toolsCall('echo', { msg: 'hi' });
+    expect(calls).toHaveLength(2);
+    expect(calls[0].init!.headers!['Mcp-Session-Id']).toBeUndefined();
+    expect(calls[1].init!.headers!['Mcp-Session-Id']).toBe('srv-abc');
+  });
 });
 
 // ── Timeout / abort ────────────────────────────────────────────────

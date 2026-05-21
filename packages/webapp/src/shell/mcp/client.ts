@@ -214,7 +214,12 @@ export class McpClient {
       Accept: 'application/json, text/event-stream',
       ...this.staticHeaders,
     };
-    if (this.sessionId) headers['Mcp-Session-Id'] = this.sessionId;
+    // Per the MCP Streamable-HTTP spec the session id is established BY the
+    // server's response to `initialize`; sending one in is a protocol
+    // violation. All subsequent methods echo the captured id.
+    if (this.sessionId && method !== 'initialize') {
+      headers['Mcp-Session-Id'] = this.sessionId;
+    }
     if (this.getAuthHeader) {
       const auth = await this.getAuthHeader();
       if (auth) headers['Authorization'] = auth;
