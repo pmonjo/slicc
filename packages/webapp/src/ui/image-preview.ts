@@ -114,14 +114,11 @@ export function showImagePreview(src: string, originEl: HTMLElement): () => void
       }
     };
     const timeout = setTimeout(cleanup, 400);
-    overlay.addEventListener(
-      'transitionend',
-      () => {
-        clearTimeout(timeout);
-        cleanup();
-      },
-      { once: true }
-    );
+    overlay.addEventListener('transitionend', (e) => {
+      if (e.propertyName !== 'transform') return;
+      clearTimeout(timeout);
+      cleanup();
+    });
   };
 
   const onKey = (e: KeyboardEvent) => {
