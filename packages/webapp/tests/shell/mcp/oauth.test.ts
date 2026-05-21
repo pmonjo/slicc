@@ -236,6 +236,83 @@ describe('dynamicRegister', () => {
       )
     ).rejects.toThrow(/registration_endpoint/);
   });
+
+  it('omits refresh_token from grant_types when AS metadata excludes it', async () => {
+    let captured: any = null;
+    const fetchImpl = makeFetchStub([
+      {
+        matchUrl: 'https://auth.example.com/register',
+        handler: (_url, init) => {
+          captured = init;
+          return jsonResponse(201, { client_id: 'abc-123' });
+        },
+      },
+    ]);
+    await dynamicRegister(
+      {
+        issuer: 'https://auth.example.com',
+        authorizationEndpoint: 'https://auth.example.com/authorize',
+        tokenEndpoint: 'https://auth.example.com/token',
+        registrationEndpoint: 'https://auth.example.com/register',
+        grantTypes: ['authorization_code'],
+      },
+      'http://127.0.0.1/cb',
+      fetchImpl
+    );
+    const body = JSON.parse(captured.body);
+    expect(body.grant_types).toEqual(['authorization_code']);
+  });
+
+  it('keeps refresh_token when AS metadata is absent (no grant_types_supported)', async () => {
+    let captured: any = null;
+    const fetchImpl = makeFetchStub([
+      {
+        matchUrl: 'https://auth.example.com/register',
+        handler: (_url, init) => {
+          captured = init;
+          return jsonResponse(201, { client_id: 'abc-123' });
+        },
+      },
+    ]);
+    await dynamicRegister(
+      {
+        issuer: 'https://auth.example.com',
+        authorizationEndpoint: 'https://auth.example.com/authorize',
+        tokenEndpoint: 'https://auth.example.com/token',
+        registrationEndpoint: 'https://auth.example.com/register',
+      },
+      'http://127.0.0.1/cb',
+      fetchImpl
+    );
+    const body = JSON.parse(captured.body);
+    expect(body.grant_types).toEqual(['authorization_code', 'refresh_token']);
+  });
+
+  it('keeps refresh_token when AS advertises it explicitly', async () => {
+    let captured: any = null;
+    const fetchImpl = makeFetchStub([
+      {
+        matchUrl: 'https://auth.example.com/register',
+        handler: (_url, init) => {
+          captured = init;
+          return jsonResponse(201, { client_id: 'abc-123' });
+        },
+      },
+    ]);
+    await dynamicRegister(
+      {
+        issuer: 'https://auth.example.com',
+        authorizationEndpoint: 'https://auth.example.com/authorize',
+        tokenEndpoint: 'https://auth.example.com/token',
+        registrationEndpoint: 'https://auth.example.com/register',
+        grantTypes: ['authorization_code', 'refresh_token'],
+      },
+      'http://127.0.0.1/cb',
+      fetchImpl
+    );
+    const body = JSON.parse(captured.body);
+    expect(body.grant_types).toEqual(['authorization_code', 'refresh_token']);
+  });
 });
 
 // ── PKCE ────────────────────────────────────────────────────────────
@@ -452,6 +529,22 @@ describe('runAuthFlow', () => {
         clientId: 'cid',
         redirectUri: 'http://127.0.0.1/cb',
         launcher: async () => 'http://127.0.0.1/cb?code=X&state=WRONG',
+        fetchImpl,
+      })
+    ).rejects.toThrow(/state mismatch/);
+  });
+
+  it('rejects when state is missing from the callback (CSRF guard)', async () => {
+    // We always send a `state` on the authorize request, so a callback
+    // that omits it must be rejected as a CSRF signal — not silently
+    // proceed to token exchange.
+    const fetchImpl = makeFetchStub([]);
+    await expect(
+      runAuthFlow({
+        asMetadata: asMeta,
+        clientId: 'cid',
+        redirectUri: 'http://127.0.0.1/cb',
+        launcher: async () => 'http://127.0.0.1/cb?code=X',
         fetchImpl,
       })
     ).rejects.toThrow(/state mismatch/);

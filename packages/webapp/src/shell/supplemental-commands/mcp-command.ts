@@ -860,6 +860,20 @@ async function defaultLauncher(): Promise<OAuthLauncher> {
 }
 
 async function defaultRedirectUri(): Promise<string> {
+  // Extension offscreen runtime: the OAuth launcher routes through
+  // `chrome.identity.launchWebAuthFlow`, which only captures redirects
+  // matching the deterministic `<extension-id>.chromiumapp.org` URL.
+  // Both the authorize URL and the token-exchange redirect_uri must use
+  // the same value (RFC 6749 §10.6).
+  const chromeApi: any = typeof chrome !== 'undefined' ? chrome : undefined;
+  if (chromeApi?.runtime?.id) {
+    return (
+      chromeApi.identity?.getRedirectURL?.('mcp-callback') ??
+      `https://${chromeApi.runtime.id}.chromiumapp.org/mcp-callback`
+    );
+  }
+  // CLI / standalone webapp: the popup→postMessage + /api/oauth-result
+  // polling path captures the redirect on the page origin.
   const { getOAuthPageOrigin } = await import('../../providers/oauth-service.js');
   const { origin } = await getOAuthPageOrigin();
   return `${origin}/auth/callback`;

@@ -486,6 +486,78 @@ describe('mcp add / list / delete / invoke / refresh (integration)', () => {
     expect(acct.refreshToken).toBe('mcp-refresh-token');
   });
 
+  it('add: uses page-origin redirect URI when not running as a Chrome extension', async () => {
+    // CLI / standalone webapp path — the launcher captures the redirect
+    // on the page origin, so the URI registered with the AS must be
+    // `<origin>/auth/callback`.
+    const { fetch } = makeMockMcpFetch({
+      authRequired: true,
+      expectedToken: 'mcp-access-token',
+      tools: [{ name: 'foo' }],
+    });
+    const oauthFetch = makeMockOAuthFetch();
+    let capturedAuthorizeUrl = '';
+    const captureLauncher = async (authorizeUrl: string): Promise<string | null> => {
+      capturedAuthorizeUrl = authorizeUrl;
+      const u = new URL(authorizeUrl);
+      return `${u.searchParams.get('redirect_uri')}?code=test-code&state=${u.searchParams.get('state')}`;
+    };
+
+    const r = await runCmd(['add', 'https://server.test/sse', 'demo'], {
+      fetchImpl: fetch,
+      oauthFetchImpl: oauthFetch,
+      oauthLauncher: captureLauncher,
+    });
+    expect(r.exitCode).toBe(0);
+    const redirect = new URL(capturedAuthorizeUrl).searchParams.get('redirect_uri');
+    expect(redirect).toBe(`${window.location.origin}/auth/callback`);
+    expect(redirect).not.toMatch(/chromiumapp\.org/);
+  });
+
+  it('add: uses chromiumapp.org redirect URI when running as a Chrome extension', async () => {
+    // Extension offscreen path — `chrome.identity.launchWebAuthFlow` only
+    // captures redirects matching `<extension-id>.chromiumapp.org`, so
+    // the URI registered with the AS must match.
+    const originalChrome = (globalThis as any).chrome;
+    (globalThis as any).chrome = {
+      runtime: { id: 'abcdefghijklmnopabcdefghijklmnop' },
+      // `identity.getRedirectURL` is omitted so the production code
+      // exercises the deterministic `<id>.chromiumapp.org` fallback.
+      identity: undefined,
+    };
+    try {
+      const { fetch } = makeMockMcpFetch({
+        authRequired: true,
+        expectedToken: 'mcp-access-token',
+        tools: [{ name: 'foo' }],
+      });
+      const oauthFetch = makeMockOAuthFetch();
+      let capturedAuthorizeUrl = '';
+      const captureLauncher = async (authorizeUrl: string): Promise<string | null> => {
+        capturedAuthorizeUrl = authorizeUrl;
+        const u = new URL(authorizeUrl);
+        return `${u.searchParams.get('redirect_uri')}?code=test-code&state=${u.searchParams.get('state')}`;
+      };
+
+      const r = await runCmd(['add', 'https://server.test/sse', 'demo'], {
+        fetchImpl: fetch,
+        oauthFetchImpl: oauthFetch,
+        oauthLauncher: captureLauncher,
+      });
+      expect(r.exitCode).toBe(0);
+      const redirect = new URL(capturedAuthorizeUrl).searchParams.get('redirect_uri');
+      expect(redirect).toBe(
+        'https://abcdefghijklmnopabcdefghijklmnop.chromiumapp.org/mcp-callback'
+      );
+    } finally {
+      if (originalChrome === undefined) {
+        delete (globalThis as any).chrome;
+      } else {
+        (globalThis as any).chrome = originalChrome;
+      }
+    }
+  });
+
   it('list: empty + populated output', async () => {
     const empty = await runCmd(['list']);
     expect(empty.exitCode).toBe(0);

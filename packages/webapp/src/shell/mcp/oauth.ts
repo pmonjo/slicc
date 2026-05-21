@@ -208,11 +208,21 @@ export async function dynamicRegister(
   if (!asMetadata.registrationEndpoint) {
     throw new Error('Authorization server does not advertise a registration_endpoint (RFC 7591)');
   }
+  // Derive grant_types from discovered AS metadata so strict RFC 7591
+  // servers don't 400 us for advertising a grant they don't support.
+  // When the AS lists `grant_types_supported` and omits `refresh_token`,
+  // drop it from the registration body; otherwise keep both
+  // (`authorization_code` is always required for the PKCE flow we run).
+  const supportedGrants = asMetadata.grantTypes;
+  const grantTypes =
+    supportedGrants && supportedGrants.length > 0 && !supportedGrants.includes('refresh_token')
+      ? ['authorization_code']
+      : ['authorization_code', 'refresh_token'];
   const body = JSON.stringify({
     client_name: 'SLICC',
     redirect_uris: [redirectUri],
     token_endpoint_auth_method: 'none',
-    grant_types: ['authorization_code', 'refresh_token'],
+    grant_types: grantTypes,
     response_types: ['code'],
   });
   const res = await fetchImpl(asMetadata.registrationEndpoint, {
@@ -311,7 +321,9 @@ export async function runAuthFlow(opts: RunAuthFlowOptions): Promise<TokenRespon
   if (!redirectUrl) throw new Error('MCP OAuth flow cancelled or timed out');
   const { code, state: returnedState } = extractCodeFromUrl(redirectUrl);
   if (!code) throw new Error('MCP OAuth redirect missing `code` parameter');
-  if (returnedState && returnedState !== state) {
+  // We always send a `state`, so the callback MUST echo it back exactly
+  // (RFC 6749 §10.12). A missing or mismatched state is a CSRF signal.
+  if (returnedState !== state) {
     throw new Error('MCP OAuth state mismatch — possible CSRF');
   }
   return exchangeCode({

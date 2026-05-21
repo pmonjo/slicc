@@ -15,7 +15,6 @@ import {
   registerProviderConfig,
   unregisterProviderConfig,
 } from '../../providers/index.js';
-import { createOAuthLauncher } from '../../providers/oauth-service.js';
 import { saveOAuthAccount, getOAuthAccountInfo, getAccounts } from '../../ui/provider-settings.js';
 import { createLogger } from '../../core/logger.js';
 import {
@@ -73,10 +72,18 @@ const discoveryCache = new Map<string, DiscoveredAuth>();
 const registeredInSession = new Set<string>();
 
 async function defaultRedirectUri(): Promise<string> {
-  // For MCP we accept any loopback redirect — the OAuth launcher captures it.
-  // In all runtimes the launcher's interceptor / popup-postMessage path closes
-  // the loop, so this URI just needs to be syntactically valid + registered
-  // with the AS during DCR.
+  // Extension offscreen runtime: chrome.identity.launchWebAuthFlow only
+  // completes against the deterministic `<extension-id>.chromiumapp.org`
+  // redirect, so the URI registered at DCR time must match.
+  const chromeApi: any = typeof chrome !== 'undefined' ? chrome : undefined;
+  if (chromeApi?.runtime?.id) {
+    return (
+      chromeApi.identity?.getRedirectURL?.('mcp-callback') ??
+      `https://${chromeApi.runtime.id}.chromiumapp.org/mcp-callback`
+    );
+  }
+  // CLI / standalone: the popup→postMessage + /api/oauth-result polling
+  // path captures the redirect on the page origin.
   const { getOAuthPageOrigin } = await import('../../providers/oauth-service.js');
   const { origin } = await getOAuthPageOrigin();
   return `${origin}/auth/callback`;
