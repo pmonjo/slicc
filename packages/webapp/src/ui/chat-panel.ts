@@ -26,6 +26,7 @@ import {
 } from './dip.js';
 import { createToolUIRenderer, disposeToolUIRenderer } from './tool-ui-renderer.js';
 import { showImagePreview } from './image-preview.js';
+import { toPreviewUrl } from '../shell/supplemental-commands/shared.js';
 import {
   getToolDescriptor,
   createToolIcon,
@@ -2282,10 +2283,13 @@ export class ChatPanel {
       chip.appendChild(remove);
     }
 
-    if (attachment.kind === 'image' && attachment.data) {
+    if (attachment.kind === 'image' && (attachment.data || attachment.path)) {
       chip.style.cursor = 'pointer';
       chip.addEventListener('click', () => {
-        showImagePreview(`data:${attachment.mimeType};base64,${attachment.data}`, visual);
+        const src = attachment.data
+          ? `data:${attachment.mimeType};base64,${attachment.data}`
+          : toPreviewUrl(attachment.path!);
+        showImagePreview(src, visual);
       });
     }
 

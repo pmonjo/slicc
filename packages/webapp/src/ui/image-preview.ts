@@ -23,12 +23,6 @@ export function showImagePreview(src: string, originEl: HTMLElement): () => void
   activeOverlay = overlay;
 
   const originRect = originEl.getBoundingClientRect();
-  img.style.position = 'absolute';
-  img.style.top = `${originRect.top}px`;
-  img.style.left = `${originRect.left}px`;
-  img.style.width = `${originRect.width}px`;
-  img.style.height = `${originRect.height}px`;
-  img.style.borderRadius = `${Math.min(originRect.width, originRect.height) * 0.15}px`;
 
   const animateOpen = () => {
     const vw = window.innerWidth;
@@ -45,10 +39,31 @@ export function showImagePreview(src: string, originEl: HTMLElement): () => void
     const finalLeft = (vw - finalW) / 2;
     const finalTop = (vh - finalH) / 2;
 
-    img.style.top = `${finalTop}px`;
-    img.style.left = `${finalLeft}px`;
+    // Position image at final size and location using CSS positioning
+    img.style.position = 'absolute';
     img.style.width = `${finalW}px`;
     img.style.height = `${finalH}px`;
+    img.style.left = `${finalLeft}px`;
+    img.style.top = `${finalTop}px`;
+    img.style.borderRadius = '6px';
+
+    // Calculate transform to start from the origin thumbnail
+    const scaleX = originRect.width / finalW;
+    const scaleY = originRect.height / finalH;
+    const originCenterX = originRect.left + originRect.width / 2;
+    const originCenterY = originRect.top + originRect.height / 2;
+    const finalCenterX = finalLeft + finalW / 2;
+    const finalCenterY = finalTop + finalH / 2;
+    const translateX = originCenterX - finalCenterX;
+    const translateY = originCenterY - finalCenterY;
+
+    // Start at thumbnail position/size
+    img.style.transform = `translate(${translateX}px, ${translateY}px) scale(${scaleX}, ${scaleY})`;
+    img.style.borderRadius = `${6 / Math.min(scaleX, scaleY)}px`;
+
+    // Trigger reflow then animate to final position
+    img.offsetHeight; // eslint-disable-line @typescript-eslint/no-unused-expressions
+    img.style.transform = 'translate(0, 0) scale(1, 1)';
     img.style.borderRadius = '6px';
 
     overlay.classList.add('image-preview-overlay--visible');
@@ -64,19 +79,30 @@ export function showImagePreview(src: string, originEl: HTMLElement): () => void
     };
   }
 
+  let dismissed = false;
+
   const dismiss = () => {
-    if (!activeOverlay || overlay !== activeOverlay) return;
+    if (dismissed || !activeOverlay || overlay !== activeOverlay) return;
+    dismissed = true;
 
     overlay.classList.add('image-preview-overlay--closing');
     overlay.classList.remove('image-preview-overlay--visible');
 
+    // Animate back to origin if it's still in the DOM
     const currentOriginRect = originEl.getBoundingClientRect();
     if (currentOriginRect.width > 0 && currentOriginRect.height > 0) {
-      img.style.top = `${currentOriginRect.top}px`;
-      img.style.left = `${currentOriginRect.left}px`;
-      img.style.width = `${currentOriginRect.width}px`;
-      img.style.height = `${currentOriginRect.height}px`;
-      img.style.borderRadius = `${Math.min(currentOriginRect.width, currentOriginRect.height) * 0.15}px`;
+      const imgRect = img.getBoundingClientRect();
+      const scaleX = currentOriginRect.width / imgRect.width;
+      const scaleY = currentOriginRect.height / imgRect.height;
+      const originCenterX = currentOriginRect.left + currentOriginRect.width / 2;
+      const originCenterY = currentOriginRect.top + currentOriginRect.height / 2;
+      const imgCenterX = imgRect.left + imgRect.width / 2;
+      const imgCenterY = imgRect.top + imgRect.height / 2;
+      const translateX = originCenterX - imgCenterX;
+      const translateY = originCenterY - imgCenterY;
+
+      img.style.transform = `translate(${translateX}px, ${translateY}px) scale(${scaleX}, ${scaleY})`;
+      img.style.borderRadius = `${6 / Math.min(scaleX, scaleY)}px`;
     }
 
     const cleanup = () => {
@@ -89,8 +115,15 @@ export function showImagePreview(src: string, originEl: HTMLElement): () => void
         activeCleanup = null;
       }
     };
-    overlay.addEventListener('transitionend', cleanup, { once: true });
-    setTimeout(cleanup, 300);
+    const timeout = setTimeout(cleanup, 300);
+    overlay.addEventListener(
+      'transitionend',
+      () => {
+        clearTimeout(timeout);
+        cleanup();
+      },
+      { once: true }
+    );
   };
 
   const onKey = (e: KeyboardEvent) => {
