@@ -62,15 +62,14 @@ const discoveryCache = new Map<string, DiscoveredAuth>();
 /** Track which providers we've already registered in this page session. */
 const registeredInSession = new Set<string>();
 
-function defaultRedirectUri(): string {
+async function defaultRedirectUri(): Promise<string> {
   // For MCP we accept any loopback redirect — the OAuth launcher captures it.
   // In all runtimes the launcher's interceptor / popup-postMessage path closes
   // the loop, so this URI just needs to be syntactically valid + registered
   // with the AS during DCR.
-  if (typeof window !== 'undefined') {
-    return `${window.location.origin}/auth/callback`;
-  }
-  return 'http://127.0.0.1:5710/auth/callback';
+  const { getOAuthPageOrigin } = await import('../../providers/oauth-service.js');
+  const { origin } = await getOAuthPageOrigin();
+  return `${origin}/auth/callback`;
 }
 
 async function resolveFetchImpl(override?: FetchLike): Promise<FetchLike> {
@@ -136,7 +135,7 @@ function buildProviderConfig(opts: RegisterMcpProviderOptions): ProviderConfig {
         asMetadata,
         clientId: opts.auth.clientId,
         scope: opts.auth.scope,
-        redirectUri: defaultRedirectUri(),
+        redirectUri: await defaultRedirectUri(),
         launcher: effectiveLauncher,
         fetchImpl,
       });

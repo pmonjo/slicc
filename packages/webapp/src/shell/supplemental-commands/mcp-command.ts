@@ -210,7 +210,7 @@ async function runOAuthForAdd(
     discoveryPath: asMetadata.discoveryPath,
     issuer: asMetadata.issuer,
   });
-  const redirectUri = defaultRedirectUri();
+  const redirectUri = await defaultRedirectUri();
   const dcr = await dynamicRegister(asMetadata, redirectUri, fetchImpl);
   const scope =
     asMetadata.supportedScopes && asMetadata.supportedScopes.length > 0
@@ -681,9 +681,10 @@ async function defaultLauncher(): Promise<OAuthLauncher> {
   return createOAuthLauncher();
 }
 
-function defaultRedirectUri(): string {
-  if (typeof window !== 'undefined') return `${window.location.origin}/auth/callback`;
-  return 'http://127.0.0.1:5710/auth/callback';
+async function defaultRedirectUri(): Promise<string> {
+  const { getOAuthPageOrigin } = await import('../../providers/oauth-service.js');
+  const { origin } = await getOAuthPageOrigin();
+  return `${origin}/auth/callback`;
 }
 
 async function resolveOAuthFetchImpl(override?: FetchLike): Promise<FetchLike> {

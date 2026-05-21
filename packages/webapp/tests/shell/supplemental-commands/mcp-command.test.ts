@@ -19,6 +19,17 @@ const localStorageStub = {
   },
 };
 vi.stubGlobal('localStorage', localStorageStub);
+
+// Hoisted spy used by the partial mock below so per-test overrides take
+// effect against the *same* function reference the production code imports.
+const { mockGetOAuthPageOrigin } = vi.hoisted(() => ({
+  mockGetOAuthPageOrigin: vi.fn<[], Promise<{ origin: string; href: string }>>(),
+}));
+vi.mock('../../../src/providers/oauth-service.js', async (importOriginal) => {
+  const orig = await importOriginal<typeof import('../../../src/providers/oauth-service.js')>();
+  return { ...orig, getOAuthPageOrigin: mockGetOAuthPageOrigin };
+});
+
 import {
   createMcpCommand,
   coerceArgsBySchema,
@@ -339,6 +350,13 @@ describe('mcp add / list / delete / invoke / refresh (integration)', () => {
     unregisterProviderConfig(mcpProviderId('demo'));
     await wipeGlobalFs();
     localStorage.clear();
+    // Default: mimic the in-page path so the OAuth-required tests keep
+    // resolving a valid redirect URI without needing a panel-RPC bridge.
+    mockGetOAuthPageOrigin.mockReset();
+    mockGetOAuthPageOrigin.mockResolvedValue({
+      origin: window.location.origin,
+      href: window.location.href,
+    });
   });
 
   afterEach(async () => {
@@ -482,6 +500,11 @@ describe('mcp invoke / delete / refresh', () => {
     unregisterProviderConfig(mcpProviderId('demo'));
     await wipeGlobalFs();
     localStorage.clear();
+    mockGetOAuthPageOrigin.mockReset();
+    mockGetOAuthPageOrigin.mockResolvedValue({
+      origin: window.location.origin,
+      href: window.location.href,
+    });
   });
 
   afterEach(async () => {
@@ -703,5 +726,149 @@ describe('mcp invoke / delete / refresh', () => {
     // After the list call, the provider must be visible in the registry.
     expect(getRegisteredProviderConfig(mcpProviderId('demo'))).toBeDefined();
     expect(getRegisteredProviderIds()).toContain(mcpProviderId('demo'));
+  });
+});
+
+describe('mcp add: defaultRedirectUri via getOAuthPageOrigin', () => {
+  beforeEach(async () => {
+    _testOnly_resetStoreCache();
+    _testOnly_resetMcpProviderState();
+    unregisterProviderConfig(mcpProviderId('demo'));
+    await wipeGlobalFs();
+    localStorage.clear();
+    mockGetOAuthPageOrigin.mockReset();
+  });
+
+  afterEach(async () => {
+    _testOnly_resetMcpProviderState();
+    unregisterProviderConfig(mcpProviderId('demo'));
+    await new Promise((r) => setTimeout(r, 600));
+    _testOnly_resetStoreCache();
+  });
+
+  it('resolves redirect_uri from getOAuthPageOrigin and threads it through DCR + authorize + token exchange', async () => {
+    mockGetOAuthPageOrigin.mockResolvedValue({
+      origin: 'http://localhost:5711',
+      href: 'http://localhost:5711/',
+    });
+
+    // Capture the registration body so we can verify the DCR redirect URI.
+    let registeredRedirectUris: string[] | null = null;
+    // Capture the token-exchange body so we can verify the exchange redirect URI.
+    let exchangeRedirectUri: string | null = null;
+    // Capture the URL the launcher saw so we can verify the authorize redirect_uri.
+    let capturedAuthorizeUrl: string | null = null;
+
+    const oauthFetch: FetchLike = async (url, init) => {
+      const json = (payload: unknown) => ({
+        ok: true,
+        status: 200,
+        statusText: 'OK',
+        text: async () => JSON.stringify(payload),
+        json: async () => payload,
+        headers: { get: () => null },
+      });
+      if (url.includes('/.well-known/oauth-protected-resource')) {
+        return json({
+          authorization_servers: ['https://auth.test'],
+          scopes_supported: ['mcp:tools'],
+        });
+      }
+      if (url.includes('/.well-known/oauth-authorization-server')) {
+        return json({
+          issuer: 'https://auth.test',
+          authorization_endpoint: 'https://auth.test/authorize',
+          token_endpoint: 'https://auth.test/token',
+          registration_endpoint: 'https://auth.test/register',
+          code_challenge_methods_supported: ['S256'],
+          grant_types_supported: ['authorization_code', 'refresh_token'],
+        });
+      }
+      if (url === 'https://auth.test/register') {
+        const body = JSON.parse((init?.body as string) || '{}') as {
+          redirect_uris?: string[];
+        };
+        registeredRedirectUris = body.redirect_uris ?? null;
+        return json({ client_id: 'test-client-abc' });
+      }
+      if (url === 'https://auth.test/token') {
+        const params = new URLSearchParams((init?.body as string) ?? '');
+        if (params.get('grant_type') === 'authorization_code') {
+          exchangeRedirectUri = params.get('redirect_uri');
+        }
+        return json({
+          access_token: 'mcp-access-token',
+          refresh_token: 'mcp-refresh-token',
+          expires_in: 3600,
+          token_type: 'Bearer',
+          scope: 'mcp:tools',
+        });
+      }
+      return {
+        ok: false,
+        status: 404,
+        statusText: 'Not Found',
+        text: async () => '',
+        json: async () => ({}),
+        headers: { get: () => null },
+      };
+    };
+
+    const capturingLauncher = async (authorizeUrl: string): Promise<string | null> => {
+      capturedAuthorizeUrl = authorizeUrl;
+      const u = new URL(authorizeUrl);
+      const redirect = u.searchParams.get('redirect_uri') ?? '';
+      const state = u.searchParams.get('state') ?? '';
+      return `${redirect}?code=test-code&state=${state}`;
+    };
+
+    const { fetch } = makeMockMcpFetch({
+      authRequired: true,
+      expectedToken: 'mcp-access-token',
+      tools: [{ name: 'foo' }],
+    });
+
+    const r = await runCmd(['add', 'https://server.test/sse', 'demo'], {
+      fetchImpl: fetch,
+      oauthFetchImpl: oauthFetch,
+      oauthLauncher: capturingLauncher,
+    });
+    expect(r.exitCode).toBe(0);
+
+    expect(mockGetOAuthPageOrigin).toHaveBeenCalled();
+    const expected = 'http://localhost:5711/auth/callback';
+    expect(registeredRedirectUris).toEqual([expected]);
+    expect(capturedAuthorizeUrl).not.toBeNull();
+    const authorizeParams = new URL(capturedAuthorizeUrl as unknown as string).searchParams;
+    expect(authorizeParams.get('redirect_uri')).toBe(expected);
+    expect(exchangeRedirectUri).toBe(expected);
+  });
+
+  it('surfaces a clear error when getOAuthPageOrigin rejects (panel-RPC unavailable)', async () => {
+    mockGetOAuthPageOrigin.mockRejectedValue(
+      new Error('OAuth from worker context requires the panel-RPC bridge (no page-info available)')
+    );
+
+    const { fetch } = makeMockMcpFetch({
+      authRequired: true,
+      tools: [{ name: 'foo' }],
+    });
+
+    const r = await runCmd(['add', 'https://server.test/sse', 'demo'], {
+      fetchImpl: fetch,
+      oauthFetchImpl: makeMockOAuthFetch(),
+      oauthLauncher: stubLauncher,
+    });
+    expect(r.exitCode).toBe(1);
+    expect(r.stderr).toContain('mcp add:');
+    expect(r.stderr).toContain('panel-RPC');
+
+    // No silent fallback to a hardcoded loopback URI.
+    expect(r.stderr).not.toContain('127.0.0.1:5710');
+    expect(r.stderr).not.toContain('localhost:5710');
+
+    // Server should NOT have been persisted on failure.
+    const file = await readServersFile();
+    expect(file.servers.demo).toBeUndefined();
   });
 });
