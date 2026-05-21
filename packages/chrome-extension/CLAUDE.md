@@ -27,6 +27,45 @@ Offscreen Document
 - **Service worker**: routes messages between panel and offscreen, proxies CDP to `chrome.debugger`.
 - **Offscreen document**: runs the agent engine, orchestrator, VFS, and tool execution loop.
 
+### Tray leader
+
+When the user configures a worker base URL with no join URL, offscreen
+becomes a tray leader via `extension-leader-tray.ts:startExtensionLeaderTray`.
+Mirror of `page-leader-tray.ts` for the offscreen runtime.
+
+- Constructs `LeaderSyncManager` with data-source callbacks against
+  `OffscreenBridge` state (chat buffer, scoops, sprinkles snapshot cache).
+- `LeaderTrayPeerManager.onPeerConnected → sync.addFollower(bootstrapId, channel, …)` —
+  the headline gap fix for #682.
+- `webhook.event` control messages route directly to
+  `orchestrator.handleWebhookEvent` (no `lick-webhook-event` hop —
+  extension's lickManager is in-process).
+- Panel-side `PanelLeaderSyncProxy` in `leader-sync-bridge.ts` pushes
+  sprinkle snapshots, sprinkle updates, user-message echoes, and
+  active-scoop selection. Lifecycle via `leader-mode-changed`;
+  `host reset` via `leader-tray-reset` RPC.
+- `onFollowerMessage` uses synchronous panel echo (via
+  `bridge.notifyPanelIncomingMessage`) because `'web'` is not in
+  `EXTERNAL_LICK_CHANNELS` (`lick-formatting.ts:29-37`). Orchestrator
+  dispatch runs in a fire-and-forget IIFE so the wire signature stays
+  `void`.
+
+### Leaving a tray
+
+The offscreen publishes a `globalThis.__slicc_setTrayRuntime(joinUrl,
+workerBaseUrl)` hook that the in-offscreen agent shell uses to drive
+`syncTrayRuntime` directly — `chrome.runtime.sendMessage` does not
+deliver to the sender's own listeners, so the side-panel relay path is
+not reachable from the offscreen itself. The `refresh-tray-runtime`
+listener and the hook share `applyTrayRuntimeUpdate`. **Leave-entirely
+short-circuit**: when `applyTrayRuntimeUpdate(null, null)` runs (both
+storage keys cleared) it calls `stopTrayRuntime` directly instead of
+awaiting `syncTrayRuntime`, which would otherwise hit the
+`defaultWorkerBaseUrl` fallback in `resolveTrayRuntimeConfig` and
+silently rebuild a leader on the production worker. See
+`packages/webapp/src/scoops/tray-leave.ts` for the float-detecting
+helper used by both UI and shell.
+
 ## Detached Popout
 
 The extension supports popping the side panel out into a full-page tab
@@ -70,7 +109,7 @@ and self-close, but DO NOT count as the canonical detached tab.
 - `src/offscreen.ts` — offscreen runtime bootstrap
 - `src/offscreen-bridge.ts` — panel/offscreen message bridge
 - `src/messages.ts` — typed envelopes for panel, offscreen, and CDP traffic
-- `src/lick-manager-proxy.ts` — panel access to lick operations hosted in offscreen
+- `src/lick-manager-proxy.ts` — panel access to lick operations hosted in offscreen. Surfaces cron task + webhook CRUD plus a `getTrayWebhookUrl` resolver so the side-panel `webhook` command can build per-webhook URLs from the active leader tray session.
 - `src/sprinkle-proxy.ts` — sprinkle relay between offscreen and panel
 - `src/tab-group.ts` — persistent Chrome tab group handling
 - `src/tray-socket-proxy.ts` — worker/tray WebSocket proxying
