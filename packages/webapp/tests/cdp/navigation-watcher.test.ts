@@ -192,6 +192,23 @@ describe('NavigationWatcher', () => {
         openerId: 'tab-parent',
       },
     });
+    transport.emit('Target.targetCreated', {
+      targetInfo: {
+        targetId: 'iframe-1',
+        type: 'iframe',
+        attached: false,
+        openerId: 'tab-parent',
+        url: 'https://ex.com/embed',
+      },
+    });
+    transport.emit('Target.targetCreated', {
+      targetInfo: {
+        targetId: 'worker-1',
+        type: 'worker',
+        attached: false,
+        openerId: 'tab-parent',
+      },
+    });
     await new Promise((r) => setTimeout(r, 0));
 
     const attachCalls = transport.sentCommands.filter((c) => c.method === 'Target.attachToTarget');
