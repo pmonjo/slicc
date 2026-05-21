@@ -953,14 +953,17 @@ export class Layout {
     // Long, explanatory tooltip — the action is non-obvious enough that
     // a 1-word label would mislead users into thinking it's a destructive
     // "clear" button. All three gestures are documented so power users
-    // can discover the impatient double-click without reading docs.
+    // can discover the impatient double-click without reading docs. The
+    // tooltip uses embedded newlines so each gesture lands on its own
+    // line; the aria-label is flattened to ". "-separated sentences
+    // since screen readers don't render \n.
     clearChatBtn.setAttribute(
       'tooltip',
-      'New session for faster responses — history and memories will be kept. Double-click for fastest reset — memories extract in the background. Long press to discard this session without saving memory.'
+      'Click — new session, keep memory\nDouble-click — fastest reset, memory extracts in background\nLong press — discard without saving'
     );
     clearChatBtn.setAttribute(
       'label',
-      'New session — keeps memory and history. Double-click for fastest reset (memories extract in the background). Hold to discard without saving memory.'
+      'New session. Click to start a new session and keep memory. Double-click for fastest reset — memory extracts in background. Long press to discard without saving.'
     );
     this.newSessionBtn = clearChatBtn;
     // "Compose new" — square with a pencil, matches the universal
