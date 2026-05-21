@@ -709,4 +709,211 @@ describe('enrichPendingSession', () => {
     expect(index[0].pendingEnrichment).toBe(true);
     expect(index[0].filename).toBe(pendingFilename);
   });
+
+  it('warns (not infos) and stays pending when archive read fails with a non-ENOENT error', async () => {
+    // ENOENT means "already renamed" → info. Any other error is a real
+    // failure (permission, IO, etc.) and must surface as warn so it
+    // doesn't get hidden behind the misleading "already enriched" line.
+    const vfs = makeFakeVfs();
+    const { pendingFilename, frozenAt } = await seedPending(vfs);
+
+    const archivePath = `/sessions/${pendingFilename}`;
+    const originalRead = vfs.readFile.bind(vfs);
+    vfs.readFile = async (path: string) => {
+      if (path === archivePath) {
+        const err = new Error('EACCES: permission denied') as Error & { code: string };
+        err.code = 'EACCES';
+        throw err;
+      }
+      return originalRead(path);
+    };
+
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const infoSpy = vi.spyOn(console, 'info').mockImplementation(() => {});
+
+    const result = await enrichPendingSession(
+      vfs as unknown as Parameters<typeof enrichPendingSession>[0],
+      {
+        filename: pendingFilename,
+        title: 'heuristic',
+        frozenAt,
+        messageCount: 4,
+        pendingEnrichment: true,
+      },
+      { model: fakeModel!, apiKey: 'k' }
+    );
+
+    expect(result).toBeNull();
+    // The warn must mention the actual failure, not "already enriched".
+    // The logger forwards the data object as a trailing arg, so serialize
+    // each arg explicitly rather than relying on default toString.
+    const stringifyArgs = (args: unknown[]): string =>
+      args
+        .map((a) => {
+          if (typeof a === 'string') return a;
+          try {
+            return JSON.stringify(a);
+          } catch {
+            return String(a);
+          }
+        })
+        .join(' ');
+    const warnCalls = warnSpy.mock.calls.map((c) => stringifyArgs(c));
+    expect(warnCalls.some((s) => s.includes('Failed to read pending archive'))).toBe(true);
+    expect(warnCalls.some((s) => s.includes('EACCES'))).toBe(true);
+    const infoCalls = infoSpy.mock.calls.map((c) => stringifyArgs(c));
+    expect(infoCalls.some((s) => s.includes('already enriched'))).toBe(false);
+
+    warnSpy.mockRestore();
+    infoSpy.mockRestore();
+    expect(mockRunOneOffCompactionCall).not.toHaveBeenCalled();
+  });
+
+  it('does not duplicate the canonical row when it already exists in the index', async () => {
+    // Regression for PR #718 review: when `oldFilename` is missing from
+    // the index but a row with the same `replacement.filename` is
+    // already there, the old code prepended a second copy. The fix
+    // dedupes by filename before prepending.
+    const vfs = makeFakeVfs();
+    const { pendingFilename, frozenAt } = await seedPending(vfs);
+
+    mockRunOneOffCompactionCall
+      .mockResolvedValueOnce('NONE')
+      .mockResolvedValueOnce('Canonical title');
+
+    const canonicalFilename = `${frozenAt.replace(/[:.]/g, '-')}-canonical-title.md`;
+
+    // Replace the index with one whose `pendingFilename` row is missing
+    // (so `findIndex` returns -1 inside `replaceIndexEntry`) but the
+    // canonical row already exists. Pre-seed an extra unrelated row so
+    // we can verify only the canonical duplicate is collapsed.
+    vfs.files.set(
+      '/sessions/index.json',
+      JSON.stringify([
+        {
+          filename: canonicalFilename,
+          title: 'Stale canonical',
+          frozenAt,
+          messageCount: 4,
+        },
+        {
+          filename: 'unrelated.md',
+          title: 'Unrelated',
+          frozenAt: '2020-01-01T00:00:00.000Z',
+          messageCount: 2,
+        },
+      ])
+    );
+
+    const updated = await enrichPendingSession(
+      vfs as unknown as Parameters<typeof enrichPendingSession>[0],
+      {
+        filename: pendingFilename,
+        title: 'heuristic',
+        frozenAt,
+        messageCount: 4,
+        pendingEnrichment: true,
+      },
+      { model: fakeModel!, apiKey: 'k' }
+    );
+
+    expect(updated).not.toBeNull();
+    expect(updated!.filename).toBe(canonicalFilename);
+
+    const index = await readSessionsIndex(
+      vfs as unknown as Parameters<typeof readSessionsIndex>[0]
+    );
+    // Exactly one canonical row + the unrelated row — no duplicate.
+    const canonicalRows = index.filter((e) => e.filename === canonicalFilename);
+    expect(canonicalRows).toHaveLength(1);
+    expect(canonicalRows[0].title).toBe('Canonical title');
+    expect(index.some((e) => e.filename === 'unrelated.md')).toBe(true);
+  });
+
+  it('serializes concurrent enrichments so both replacements land in the index', async () => {
+    // Without the in-module promise-chain mutex, two parallel
+    // read-modify-write updates to /sessions/index.json would race and
+    // one of the new entries would be lost.
+    const vfs = makeFakeVfs();
+
+    // Seed two distinct pending entries with different frozenAt times
+    // so the renamed filenames don't collide.
+    const seedOne = async (utcSecond: number): Promise<{ filename: string; frozenAt: string }> => {
+      const fixedNow = Date.UTC(2026, 4, 13, 19, 0, utcSecond);
+      const dateSpy = vi.spyOn(Date, 'now').mockReturnValue(fixedNow);
+      try {
+        const store = makeFakeStore({
+          id: `session-${utcSecond}`,
+          messages: [
+            userMessage(`q ${utcSecond}`),
+            assistantMessage(`a ${utcSecond}`),
+            userMessage(`r ${utcSecond}`),
+            assistantMessage(`b ${utcSecond}`),
+          ],
+          createdAt: 0,
+          updatedAt: 1,
+        });
+        const r = await freezeConeSession({
+          sessionStore: store,
+          vfs: vfs as unknown as Parameters<typeof freezeConeSession>[0]['vfs'],
+          model: fakeModel,
+          apiKey: 'k',
+          mode: 'quick',
+        });
+        return { filename: r!.filename, frozenAt: r!.frozenAt };
+      } finally {
+        dateSpy.mockRestore();
+      }
+    };
+
+    const a = await seedOne(10);
+    const b = await seedOne(20);
+
+    // Both enrichments produce the same title (slug `t`) but different
+    // canonical filenames thanks to distinct frozenAt prefixes.
+    mockRunOneOffCompactionCall.mockImplementation(
+      async (opts: { instruction: string }): Promise<string> => {
+        if (opts.instruction === 'MEMORY') return 'NONE';
+        if (opts.instruction === 'TITLE') return 'T';
+        return '';
+      }
+    );
+
+    const [resA, resB] = await Promise.all([
+      enrichPendingSession(
+        vfs as unknown as Parameters<typeof enrichPendingSession>[0],
+        {
+          filename: a.filename,
+          title: 'h',
+          frozenAt: a.frozenAt,
+          messageCount: 4,
+          pendingEnrichment: true,
+        },
+        { model: fakeModel!, apiKey: 'k' }
+      ),
+      enrichPendingSession(
+        vfs as unknown as Parameters<typeof enrichPendingSession>[0],
+        {
+          filename: b.filename,
+          title: 'h',
+          frozenAt: b.frozenAt,
+          messageCount: 4,
+          pendingEnrichment: true,
+        },
+        { model: fakeModel!, apiKey: 'k' }
+      ),
+    ]);
+
+    expect(resA).not.toBeNull();
+    expect(resB).not.toBeNull();
+
+    const index = await readSessionsIndex(
+      vfs as unknown as Parameters<typeof readSessionsIndex>[0]
+    );
+    const filenames = index.map((e) => e.filename);
+    // Both renamed entries must be present — neither was clobbered by the
+    // other's read-modify-write.
+    expect(filenames).toContain(resA!.filename);
+    expect(filenames).toContain(resB!.filename);
+  });
 });

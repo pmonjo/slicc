@@ -467,15 +467,26 @@ export async function enrichPendingSession(
   }
 
   // 2. Load the archive. Missing file → already renamed (or wiped) → no-op.
+  //    Any other read failure (permission, IO, etc.) is a real error: log it
+  //    as a warn so it shows up in the console, but still return null and
+  //    leave the entry pending so the next boot retries.
   const oldPath = frozenSessionPath(entry);
   let archiveContent = '';
   try {
     const raw = await vfs.readFile(oldPath, { encoding: 'utf-8' });
     archiveContent = typeof raw === 'string' ? raw : new TextDecoder().decode(raw);
-  } catch {
-    log.info('Pending archive missing — treating as already enriched', {
-      filename: entry.filename,
-    });
+  } catch (err) {
+    const code = (err as { code?: unknown } | null)?.code;
+    if (code === 'ENOENT') {
+      log.info('Pending archive missing — treating as already enriched', {
+        filename: entry.filename,
+      });
+    } else {
+      log.warn('Failed to read pending archive (entry stays pending)', {
+        filename: entry.filename,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
     return null;
   }
 
@@ -632,8 +643,12 @@ export async function enrichPendingSession(
 /**
  * Replace the `title:` value in the frontmatter (and the leading `# title`
  * heading in the body) of a freezer-shaped archive markdown string with
- * the LLM-derived title. Falls back to a string concat if the frontmatter
- * regex doesn't match — the worst case is a stale heading, never data loss.
+ * the LLM-derived title. When the frontmatter regex doesn't match, the
+ * original content is returned unchanged — callers are expected to hand
+ * in archive-shaped content (well-formed `---\n…\n---\n…` frontmatter)
+ * produced by `formatArchiveAsMarkdown`. A silent rewrite of malformed
+ * archives could corrupt user data, so the no-match path intentionally
+ * does nothing rather than appending a synthesized header.
  */
 function rewriteArchiveTitle(content: string, newTitle: string): string {
   const fmMatch = content.match(/^---\n([\s\S]*?)\n---\n([\s\S]*)$/);
@@ -645,34 +660,65 @@ function rewriteArchiveTitle(content: string, newTitle: string): string {
 }
 
 /**
+ * Promise-chain mutex serializing every `replaceIndexEntry` call within
+ * this module. The sessions index is a single shared JSON file with a
+ * read-modify-write update; two concurrent callers (e.g. the boot-time
+ * background enrichment scanner racing a freshly-quick-frozen entry)
+ * would otherwise read the same stale snapshot and clobber one of the
+ * writes. Cross-tab concurrency is out of scope — the app runs in a
+ * single context.
+ */
+let indexWriteChain: Promise<void> = Promise.resolve();
+
+/**
  * Swap one entry in the sessions index by filename. Used by the
  * enrichment pass to flip a `pending-…` entry over to its renamed
- * canonical form. No-op when the entry isn't found.
+ * canonical form. Always dedupes by `replacement.filename` so a row
+ * with the same target name is never duplicated when `oldFilename`
+ * isn't found in the index. Writes are serialized via {@link indexWriteChain}.
  */
 async function replaceIndexEntry(
   vfs: VirtualFS,
   oldFilename: string,
   replacement: FrozenSessionIndexEntry
 ): Promise<void> {
-  let existing: FrozenSessionIndexEntry[] = [];
-  try {
-    const raw = await vfs.readFile(SESSIONS_INDEX_PATH, { encoding: 'utf-8' });
-    const text = typeof raw === 'string' ? raw : new TextDecoder().decode(raw);
-    const parsed = JSON.parse(text);
-    if (Array.isArray(parsed)) existing = parsed as FrozenSessionIndexEntry[];
-  } catch {
-    // No index — nothing to replace; write the entry as the only row so
-    // the rename is still visible to the panel on next reload.
-  }
-  const idx = existing.findIndex((e) => e.filename === oldFilename);
-  let updated: FrozenSessionIndexEntry[];
-  if (idx === -1) {
-    updated = [replacement, ...existing];
-  } else {
-    updated = existing.slice();
-    updated[idx] = replacement;
-  }
-  await vfs.writeFile(SESSIONS_INDEX_PATH, JSON.stringify(updated, null, 2));
+  const run = async (): Promise<void> => {
+    let existing: FrozenSessionIndexEntry[] = [];
+    try {
+      const raw = await vfs.readFile(SESSIONS_INDEX_PATH, { encoding: 'utf-8' });
+      const text = typeof raw === 'string' ? raw : new TextDecoder().decode(raw);
+      const parsed = JSON.parse(text);
+      if (Array.isArray(parsed)) existing = parsed as FrozenSessionIndexEntry[];
+    } catch {
+      // No index — nothing to replace; write the entry as the only row so
+      // the rename is still visible to the panel on next reload.
+    }
+    const idx = existing.findIndex((e) => e.filename === oldFilename);
+    let updated: FrozenSessionIndexEntry[];
+    if (idx === -1) {
+      // Old entry not in the index — prepend the replacement, but strip
+      // any pre-existing row already pointing at `replacement.filename`
+      // so concurrent rename-then-replace flows don't leave duplicates.
+      updated = [replacement, ...existing.filter((e) => e.filename !== replacement.filename)];
+    } else {
+      updated = existing.slice();
+      updated[idx] = replacement;
+      // Drop any other row sharing the replacement's filename (e.g. the
+      // canonical row already exists alongside the stale pending one).
+      updated = updated.filter((e, i) => i === idx || e.filename !== replacement.filename);
+    }
+    await vfs.writeFile(SESSIONS_INDEX_PATH, JSON.stringify(updated, null, 2));
+  };
+  // Append to the shared chain so writers run strictly in arrival order.
+  // `.catch(() => {})` keeps a failed write from poisoning the chain for
+  // subsequent callers; each call still surfaces its own error via the
+  // returned `next` promise below.
+  const next = indexWriteChain.then(run, run);
+  indexWriteChain = next.then(
+    () => undefined,
+    () => undefined
+  );
+  return next;
 }
 
 /**

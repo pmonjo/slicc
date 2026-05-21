@@ -61,7 +61,16 @@ export class SliccPressButton extends HTMLElement {
   private pendingShortEvent: MouseEvent | null = null;
 
   connectedCallback(): void {
-    if (!this.initialized) this.initialize();
+    if (!this.initialized) {
+      this.initialize();
+    } else if (this.handle === null) {
+      // Re-attached to the DOM after a previous disconnect — the inner
+      // button + press layer are still alive (light DOM survives the
+      // move) but disconnectedCallback destroyed the gesture handle, so
+      // re-arm it here. Without this, a detached-then-reattached host
+      // would silently lose click handling.
+      this.attachGesture();
+    }
     this.syncAttributes();
   }
 

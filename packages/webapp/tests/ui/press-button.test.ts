@@ -133,6 +133,28 @@ describe('<slicc-press-button>', () => {
     expect(lp).toHaveBeenCalledTimes(1);
   });
 
+  it('re-attaches gesture handling after disconnect → reconnect', () => {
+    // disconnectedCallback destroys the gesture handle but leaves the
+    // element marked initialized. Without the re-attach guard in
+    // connectedCallback, a host removed and re-inserted into the DOM
+    // would lose all click handling — regression for PR #718.
+    const el = mkBtn({ disableDouble: true });
+    const sc = vi.fn();
+    el.addEventListener('short-click', sc);
+
+    // Sanity-check the gesture is wired before we detach.
+    el.click();
+    expect(sc).toHaveBeenCalledTimes(1);
+
+    // Detach + re-attach to the DOM.
+    el.remove();
+    document.body.appendChild(el);
+
+    // Click after re-attach must still fire short-click.
+    el.click();
+    expect(sc).toHaveBeenCalledTimes(2);
+  });
+
   it('paints a ripple inside the press layer with the long-press transition duration', () => {
     vi.useFakeTimers();
     const el = mkBtn();
