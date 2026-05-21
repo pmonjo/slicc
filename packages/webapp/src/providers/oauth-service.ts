@@ -9,8 +9,9 @@
  *   Extension: chrome.identity.launchWebAuthFlow via service worker
  */
 
-import type { OAuthLauncher } from './types.js';
+import type { InterceptingOAuthLauncher, OAuthLauncher } from './types.js';
 import { getPanelRpcClient } from '../kernel/panel-rpc.js';
+import { createInterceptingOAuthLauncher } from './intercepted-oauth.js';
 
 const isExtension = typeof chrome !== 'undefined' && !!(chrome as any)?.runtime?.id;
 
@@ -21,6 +22,35 @@ export function createOAuthLauncher(): OAuthLauncher {
   // through the panel-RPC bridge so the page can open the real window.
   if (typeof window === 'undefined') return launchOAuthViaPanel;
   return launchOAuthCli;
+}
+
+/**
+ * Resolve the active CDP transport and build an
+ * {@link InterceptingOAuthLauncher} bound to it. Returns null when no
+ * transport is available in the current runtime (e.g. plain webapp with no
+ * controlled browser attached), so the caller can fall back gracefully.
+ *
+ * Intentionally async + lazy: the transport-lookup paths differ by mode
+ * (DebuggerClient in extension mode, CDPClient in CLI/node-server mode) and
+ * we don't want to import them eagerly.
+ */
+export async function createInterceptingOAuthLauncherForCurrentRuntime(): Promise<InterceptingOAuthLauncher | null> {
+  const transport = await resolveActiveCdpTransport();
+  if (!transport) return null;
+  return createInterceptingOAuthLauncher(transport);
+}
+
+async function resolveActiveCdpTransport() {
+  try {
+    const { getActiveCdpTransport } = await import('../cdp/active-transport.js');
+    return await getActiveCdpTransport();
+  } catch (err) {
+    console.warn(
+      '[oauth-service] could not resolve active CDP transport:',
+      err instanceof Error ? err.message : String(err)
+    );
+    return null;
+  }
 }
 
 /**

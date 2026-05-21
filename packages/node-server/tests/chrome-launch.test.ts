@@ -107,6 +107,7 @@ describe('chrome-launch', () => {
       '--no-default-browser-check',
       '--disable-crash-reporter',
       '--disable-background-tracing',
+      '--disable-blink-features=AutomationControlled',
       '--user-data-dir=/repo/.qa/chrome/extension',
       '--disable-extensions-except=/repo/dist/extension',
       '--load-extension=/repo/dist/extension',
