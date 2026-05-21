@@ -32,6 +32,16 @@ const log = createLogger('mcp-provider');
 /** Prefix used for MCP provider ids. */
 export const MCP_PROVIDER_PREFIX = 'mcp:';
 
+/**
+ * Guard for environments without IndexedDB (Node-based tests, SSR). The MCP
+ * store lives in IDB via LightningFS, so any read attempt schedules a deferred
+ * `_activate` that rejects asynchronously with `ReferenceError: indexedDB is
+ * not defined` and surfaces as an unhandled rejection in Vitest 4.
+ */
+function hasIndexedDB(): boolean {
+  return typeof globalThis !== 'undefined' && typeof (globalThis as any).indexedDB !== 'undefined';
+}
+
 /** Public id formatter — `name` -> `mcp:<name>`. */
 export function mcpProviderId(name: string): string {
   return `${MCP_PROVIDER_PREFIX}${name}`;
@@ -217,6 +227,7 @@ export function registerMcpProvider(opts: RegisterMcpProviderOptions): void {
 export async function ensureMcpProviderRegistered(name: string): Promise<boolean> {
   const id = mcpProviderId(name);
   if (registeredInSession.has(id) && getRegisteredProviderConfig(id)) return true;
+  if (!hasIndexedDB()) return false;
   const entry = await readMcpAuthEntry(name);
   if (!entry) return false;
   registerMcpProvider({ name, serverUrl: entry.serverUrl, auth: entry.auth });
@@ -225,6 +236,7 @@ export async function ensureMcpProviderRegistered(name: string): Promise<boolean
 
 /** Bulk variant — registers every server with an `auth` block. */
 export async function ensureAllMcpProvidersRegistered(): Promise<string[]> {
+  if (!hasIndexedDB()) return [];
   const { readMcpAuthEntries } = await import('./provider-store-access.js');
   const entries = await readMcpAuthEntries();
   const registered: string[] = [];

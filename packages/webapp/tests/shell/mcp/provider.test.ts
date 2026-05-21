@@ -54,17 +54,32 @@ const SERVERS_JSON = JSON.stringify({
 });
 
 describe('ensureMcpProviderRegistered', () => {
+  let hadIndexedDB = false;
+  let originalIndexedDB: unknown;
+
   beforeEach(() => {
     _testOnly_resetMcpProviderState();
     _testOnly_resetStoreCache();
     // Drop any registry entry left over from a previous test run.
     unregisterProviderConfig(mcpProviderId('weather'));
+    // The guard in `ensureMcpProviderRegistered` short-circuits when
+    // `globalThis.indexedDB` is missing. These tests stub the FS module
+    // directly, so we mark IDB as "present" with a sentinel to take the
+    // FS-reading path.
+    hadIndexedDB = 'indexedDB' in globalThis;
+    originalIndexedDB = (globalThis as any).indexedDB;
+    (globalThis as any).indexedDB = {};
   });
 
   afterEach(() => {
     _testOnly_setFsModule(null);
     _testOnly_resetMcpProviderState();
     unregisterProviderConfig(mcpProviderId('weather'));
+    if (hadIndexedDB) {
+      (globalThis as any).indexedDB = originalIndexedDB;
+    } else {
+      delete (globalThis as any).indexedDB;
+    }
   });
 
   it('registers the provider on first call and is a no-op on subsequent calls', async () => {
