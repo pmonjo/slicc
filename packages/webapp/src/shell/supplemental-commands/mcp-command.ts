@@ -6,6 +6,7 @@
  *   list                       Table of registered servers.
  *   delete <name>              Drop server config, alias, sprinkles, OAuth.
  *   invoke <name> [tool] …     Run a tool through the persisted server.
+ *   search <query>             Find cached tools by name/description match.
  *   refresh <name>             Re-fetch tools/apps + AS discovery.
  *
  * Library modules in `../mcp/` do the heavy lifting; this file only orchestrates
@@ -74,12 +75,14 @@ Commands:
   list                       List configured MCP servers.
   delete <name>              Remove a server, its alias, sprinkles, and OAuth.
   invoke <name> [tool] …     Call a tool through a configured server.
+  search <query>             Find cached tools by name/description match.
   refresh <name>             Re-fetch tools/apps and AS metadata.
 
 Examples:
   mcp add https://mcp.example.com/sse weather
   mcp list
   mcp invoke weather get-forecast --lat 51.5 --lon -0.12
+  mcp search forecast
   mcp delete weather
 `;
 }
@@ -103,6 +106,8 @@ export function createMcpCommand(deps: McpCommandDeps = {}): Command {
           return await cmdDelete(rest, deps);
         case 'invoke':
           return await cmdInvoke(rest, deps);
+        case 'search':
+          return await cmdSearch(rest, deps);
         case 'refresh':
           return await cmdRefresh(rest, deps);
         default:
@@ -305,6 +310,72 @@ function formatTable(rows: string[][]): string {
       )
       .join('\n') + '\n'
   );
+}
+
+// ── search ──────────────────────────────────────────────────────────
+
+async function cmdSearch(args: string[], deps: McpCommandDeps): Promise<ExecResult> {
+  if (args[0] === '--help' || args[0] === '-h') {
+    return ok(`usage: mcp search <query>
+
+Case-insensitive substring search across the cached tools of every
+registered MCP server. Matches tool name OR description and prints a
+table of (server, tool, description, match-field) rows.
+`);
+  }
+  if (args.length === 0) {
+    return err('mcp search: expected <query>');
+  }
+  const query = args[0];
+  const needle = query.toLowerCase();
+
+  const { ensureAllMcpProvidersRegistered } = await import('../mcp/provider.js');
+  await ensureAllMcpProvidersRegistered();
+  const { listServers } = await import('../mcp/store.js');
+  const servers = await listServers(deps.fs);
+  const names = Object.keys(servers).sort();
+  if (names.length === 0) {
+    return ok('No MCP servers configured. Use `mcp add <url> <name>`.\n');
+  }
+
+  interface Hit {
+    server: string;
+    tool: string;
+    description: string;
+    match: string;
+  }
+  const hits: Hit[] = [];
+  for (const n of names) {
+    const tools = servers[n].tools ?? [];
+    for (const t of tools) {
+      const desc = t.description ?? '';
+      const nameHit = t.name.toLowerCase().includes(needle);
+      const descHit = desc.toLowerCase().includes(needle);
+      if (!nameHit && !descHit) continue;
+      const match = nameHit && descHit ? 'name+description' : nameHit ? 'name' : 'description';
+      hits.push({ server: n, tool: t.name, description: desc, match });
+    }
+  }
+
+  if (hits.length === 0) {
+    return ok(`No tools matched "${query}".\n`);
+  }
+  hits.sort((a, b) =>
+    a.server === b.server ? a.tool.localeCompare(b.tool) : a.server.localeCompare(b.server)
+  );
+
+  const rows = [['SERVER', 'TOOL', 'DESCRIPTION', 'MATCH']];
+  for (const h of hits) {
+    rows.push([h.server, h.tool, truncateDescription(h.description), h.match]);
+  }
+  return ok(formatTable(rows));
+}
+
+function truncateDescription(desc: string): string {
+  if (!desc) return '';
+  const single = desc.replace(/\s+/g, ' ').trim();
+  if (single.length <= 60) return single;
+  return single.slice(0, 59) + '…';
 }
 
 // ── delete ──────────────────────────────────────────────────────────

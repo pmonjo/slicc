@@ -1017,3 +1017,132 @@ describe('mcp add/delete: shared fs + scriptCatalog invalidation', () => {
     expect(aliasWrite).toBeDefined();
   });
 });
+
+describe('mcp search', () => {
+  beforeEach(async () => {
+    _testOnly_resetStoreCache();
+    _testOnly_resetMcpProviderState();
+    unregisterProviderConfig(mcpProviderId('alpha'));
+    unregisterProviderConfig(mcpProviderId('beta'));
+    await wipeGlobalFs();
+    localStorage.clear();
+    mockGetOAuthPageOrigin.mockReset();
+    mockGetOAuthPageOrigin.mockResolvedValue({
+      origin: window.location.origin,
+      href: window.location.href,
+    });
+  });
+
+  afterEach(async () => {
+    _testOnly_resetMcpProviderState();
+    unregisterProviderConfig(mcpProviderId('alpha'));
+    unregisterProviderConfig(mcpProviderId('beta'));
+    await new Promise((r) => setTimeout(r, 600));
+    _testOnly_resetStoreCache();
+  });
+
+  it('search with no arg → stderr, exit 1', async () => {
+    const r = await runCmd(['search']);
+    expect(r.exitCode).toBe(1);
+    expect(r.stderr).toContain('mcp search: expected <query>');
+  });
+
+  it('search --help → stdout, exit 0', async () => {
+    const r = await runCmd(['search', '--help']);
+    expect(r.exitCode).toBe(0);
+    expect(r.stdout).toContain('usage: mcp search');
+  });
+
+  it('search with no servers configured → "No MCP servers configured."', async () => {
+    const r = await runCmd(['search', 'anything']);
+    expect(r.exitCode).toBe(0);
+    expect(r.stdout).toContain('No MCP servers configured');
+  });
+
+  it('search with servers but no match → "No tools matched"', async () => {
+    await setServer('alpha', {
+      url: 'https://a.test/sse',
+      tools: [{ name: 'echo', description: 'Echo a string' }],
+    });
+    const r = await runCmd(['search', 'foo']);
+    expect(r.exitCode).toBe(0);
+    expect(r.stdout).toBe('No tools matched "foo".\n');
+  });
+
+  it('search returns table with correct MATCH column values, sorted by server then tool', async () => {
+    await setServer('beta', {
+      url: 'https://b.test/sse',
+      tools: [
+        // Description-only hit ("bar" in the description).
+        { name: 'unrelated', description: 'mentions bar somewhere' },
+      ],
+    });
+    await setServer('alpha', {
+      url: 'https://a.test/sse',
+      tools: [
+        // Name-only hit ("bar" in name).
+        { name: 'bar_tool', description: 'Does things' },
+        // Name+description hit.
+        { name: 'open_bar', description: 'opens the bar' },
+        // No-match — must NOT appear.
+        { name: 'zzz', description: 'noise' },
+      ],
+    });
+
+    const r = await runCmd(['search', 'bar']);
+    expect(r.exitCode).toBe(0);
+    const lines = r.stdout.split('\n').filter((l) => l.length > 0);
+    // Header + 3 rows
+    expect(lines).toHaveLength(4);
+    expect(lines[0]).toMatch(/^SERVER\s+TOOL\s+DESCRIPTION\s+MATCH$/);
+    // Sorted: alpha first (alphabetical), then by tool name within alpha;
+    // beta's row last.
+    expect(lines[1]).toContain('alpha');
+    expect(lines[1]).toContain('bar_tool');
+    expect(lines[1]).toMatch(/\sname$/);
+    expect(lines[2]).toContain('alpha');
+    expect(lines[2]).toContain('open_bar');
+    expect(lines[2]).toContain('name+description');
+    expect(lines[3]).toContain('beta');
+    expect(lines[3]).toContain('unrelated');
+    expect(lines[3]).toMatch(/\sdescription$/);
+    expect(r.stdout).not.toContain('zzz');
+  });
+
+  it('search is case-insensitive', async () => {
+    await setServer('alpha', {
+      url: 'https://a.test/sse',
+      tools: [{ name: 'list_secrets', description: 'Enumerates the vault' }],
+    });
+    const r = await runCmd(['search', 'SECRET']);
+    expect(r.exitCode).toBe(0);
+    expect(r.stdout).toContain('list_secrets');
+    expect(r.stdout).toContain('alpha');
+  });
+
+  it('search truncates long descriptions to ~60 chars with an ellipsis suffix', async () => {
+    const longDesc = 'banana '.repeat(40).trim(); // well over 60 chars
+    await setServer('alpha', {
+      url: 'https://a.test/sse',
+      tools: [{ name: 'fruit', description: longDesc }],
+    });
+    const r = await runCmd(['search', 'banana']);
+    expect(r.exitCode).toBe(0);
+    expect(r.stdout).toContain('…');
+    // The truncated description ends with the ellipsis and the full
+    // description (which is far longer than 60 chars) is NOT present.
+    expect(r.stdout).toContain('…');
+    expect(r.stdout).not.toContain(longDesc);
+  });
+
+  it('search handles tools with no description (empty DESCRIPTION cell)', async () => {
+    await setServer('alpha', {
+      url: 'https://a.test/sse',
+      tools: [{ name: 'plain_tool' }],
+    });
+    const r = await runCmd(['search', 'plain']);
+    expect(r.exitCode).toBe(0);
+    expect(r.stdout).toContain('plain_tool');
+    expect(r.stdout).toMatch(/plain_tool\s+name/);
+  });
+});
