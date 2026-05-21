@@ -488,7 +488,7 @@ export class SprinkleRenderer {
     getState: function() { return _state; },
     close: function() { parent.postMessage({ type: 'sprinkle-close' }, '*'); },
     stopCone: function() { parent.postMessage({ type: 'sprinkle-stop-cone' }, '*'); },
-    attachImage: function(base64, name, mimeType) { parent.postMessage({ type: 'sprinkle-attach-image', base64: base64, name: name || 'screenshot.jpg', mimeType: mimeType || 'image/jpeg' }, '*'); },
+    attachImage: function(base64, name, mimeType) { parent.postMessage({ type: 'sprinkle-attach-image', base64: base64, name: name, mimeType: mimeType }, '*'); },
     name: ''
   };
   window.slicc = api;

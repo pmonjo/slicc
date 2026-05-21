@@ -230,7 +230,7 @@ window.slicc = {
     parent.postMessage({ type: 'sprinkle-stop-cone' }, '*');
   },
   attachImage: function(base64, name, mimeType) {
-    parent.postMessage({ type: 'sprinkle-attach-image', base64: base64, name: name || 'screenshot.jpg', mimeType: mimeType || 'image/jpeg' }, '*');
+    parent.postMessage({ type: 'sprinkle-attach-image', base64: base64, name: name, mimeType: mimeType }, '*');
   },
 };
 window.bridge = window.slicc;
@@ -334,7 +334,7 @@ function buildNestedBridgeScript(savedState, savedStorage, name, isLight) {
       'open: function(path, opts) { parent.postMessage({ type: "sprinkle-open", path: path, projectRoot: opts && opts.projectRoot || null }, "*"); },' +
       'close: function() { parent.postMessage({ type: "sprinkle-close" }, "*"); },' +
       'stopCone: function() { parent.postMessage({ type: "sprinkle-stop-cone" }, "*"); },' +
-      'attachImage: function(base64, name, mimeType) { parent.postMessage({ type: "sprinkle-attach-image", base64: base64, name: name || "screenshot.jpg", mimeType: mimeType || "image/jpeg" }, "*"); }' +
+      'attachImage: function(base64, name, mimeType) { parent.postMessage({ type: "sprinkle-attach-image", base64: base64, name: name, mimeType: mimeType }, "*"); }' +
     '};' +
     'window.bridge = window.slicc;' +
     'addEventListener("message", function(e) {' +
