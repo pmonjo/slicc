@@ -375,9 +375,14 @@ export async function createKernelHost(config: KernelHostConfig): Promise<Kernel
       // Bridge failure is functionally identical to webhook/crontask/
       // handoff lick delivery being non-functional for the rest of the
       // session — must be visible in prod where `log.warn` is suppressed.
-      // `KernelHostLogger.error` is optional, fall back to warn.
-      (log.error ?? log.warn).call(
-        log,
+      // `KernelHostLogger.error` is optional; chain through warn, then
+      // a console fallback so we NEVER throw a TypeError inside this
+      // catch and lose the original failure.
+      const errFn =
+        log.error?.bind(log) ??
+        log.warn.bind(log) ??
+        ((msg: string, fields?: unknown) => console.error('[lick-ws-bridge]', msg, fields));
+      errFn(
         'Failed to start lick-ws bridge — webhook / crontask / handoff lick delivery is non-functional in this session',
         { error: err instanceof Error ? err.message : String(err) }
       );

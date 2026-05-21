@@ -38,8 +38,12 @@ interface WebhookInfo {
   scoop?: string;
 }
 
-/** Sentinel rendered in the URL column when no leader-tray URL is available
- * (extension follower mode, no tray attached, leader still connecting). */
+/**
+ * Sentinel rendered by `webhook list` in extension mode when no
+ * leader-tray URL is available. `webhook create` short-circuits with a
+ * stderr message earlier, so this string is only ever visible in the
+ * list view.
+ */
 const URL_UNAVAILABLE = '(URL unavailable — connect a leader tray)';
 
 const isExtension = typeof chrome !== 'undefined' && !!chrome?.runtime?.id;
@@ -108,10 +112,14 @@ function buildWebhookUrl(webhookId: string, trayUrlBase: string | null): string 
 /**
  * Return the configured manager surface. In standalone the kernel-host
  * singleton is the source of truth; in extension we fall back to the
- * BroadcastChannel proxy. Returns null in standalone if the host hasn't
- * booted yet — callers must surface a clear error rather than letting
- * the proxy timeout (which never delivers) eat 5 seconds and report
- * itself as "operation timed out."
+ * BroadcastChannel proxy.
+ *
+ * Returns null only in standalone if the kernel host hasn't booted yet
+ * — callers surface a clear "kernel host has not booted" error rather
+ * than letting the (irrelevant in standalone) proxy timeout eat 5s.
+ * Extension callers always get a proxy-backed surface; the offscreen
+ * document may still be booting / unloaded, and that case manifests as
+ * the proxy's 5s timeout (named per-op via the proxy's error message).
  */
 async function getLickManagerSurface(): Promise<{
   createWebhook: (
@@ -244,7 +252,18 @@ export function createWebhookCommand(): Command {
             return { stdout: 'No active webhooks\n', stderr: '', exitCode: 0 };
           }
 
-          const trayUrlBase = await resolveWebhookUrlBase();
+          // URL-base resolution can throw (proxy timeout, dynamic-
+          // import failure) — fall back to `null` so the entries still
+          // render with the `URL_UNAVAILABLE` sentinel rather than the
+          // user seeing a list error and assuming webhooks are broken.
+          let trayUrlBase: string | null;
+          let urlResolutionError: string | null = null;
+          try {
+            trayUrlBase = await resolveWebhookUrlBase();
+          } catch (err) {
+            trayUrlBase = null;
+            urlResolutionError = err instanceof Error ? err.message : String(err);
+          }
           const webhooks: WebhookInfo[] = entries.map((wh) => ({
             id: wh.id,
             name: wh.name,
@@ -261,9 +280,11 @@ export function createWebhookCommand(): Command {
             if (wh.filter) output += `  [filtered]`;
             output += '\n';
           }
-          // In extension mode without a leader tray, mention what to do
-          // about the URL_UNAVAILABLE rows so the user isn't guessing.
-          if (isExtension && !trayUrlBase) {
+          if (urlResolutionError) {
+            output += `\nNote: webhook URL resolution failed (${urlResolutionError}). Try again once the tray is connected.\n`;
+          } else if (isExtension && !trayUrlBase) {
+            // Extension mode without a leader tray: explain the
+            // URL_UNAVAILABLE rows so the user isn't guessing.
             output += `\nNote: webhook URLs require a leader tray. Configure one in Settings to expose POST endpoints.\n`;
           }
           return { stdout: output, stderr: '', exitCode: 0 };

@@ -1,20 +1,24 @@
 /**
  * `/licks-ws` bridge — connects the kernel-host (standalone mode only)
- * to the node-server's lick WebSocket so the existing `/api/webhooks`,
- * `/api/crontasks`, `/api/tray-status`, and inbound webhook/handoff
- * delivery paths work.
+ * to the node-server's lick WebSocket.
+ *
+ * Wire surface (matches `packages/node-server/src/index.ts`
+ * `sendLickRequest` / `broadcastLickEvent`):
+ *
+ *   - Request/response (each carries a `requestId`):
+ *     `list_webhooks`, `create_webhook`, `delete_webhook`,
+ *     `list_crontasks`, `create_crontask`, `delete_crontask`,
+ *     `tray_status`. Reply envelope: `{ type: 'response',
+ *     requestId, data?, error? }`.
+ *   - Push events (no `requestId`, no reply): `webhook_event` →
+ *     `LickManager.handleWebhookEvent`; `navigate_event` →
+ *     `lickManager.emitEvent({ type: 'navigate', ... })`.
  *
  * Standalone-only: the extension offscreen kernel-host gates this out
  * because there is no node-server in extension mode (webhooks land at
  * the cloudflare tray worker instead, and the extension shell command
  * talks to `LickManager` through a BroadcastChannel proxy — see
  * `packages/chrome-extension/src/lick-manager-proxy.ts`).
- *
- * Wire shape (must match `packages/node-server/src/index.ts`
- * `sendLickRequest` / `broadcastLickEvent`):
- *
- *   inbound  → `{ type, requestId?, ...payload }`
- *   outbound → `{ type: 'response', requestId, data?, error? }`
  *
  * Reconnect policy: exponential backoff capped at 60s, escalating log
  * level after a few attempts, and an unrecoverable signal emitted to
@@ -37,24 +41,27 @@ const RECONNECT_GIVEUP_AT = 20;
 
 /**
  * Minimal WebSocket-shaped object the bridge uses. Narrower than the
- * full DOM `WebSocket` so the test factory doesn't need to lie via
- * `as unknown as WebSocket`. The DOM `WebSocket` satisfies this shape
- * structurally.
+ * full DOM `WebSocket` so the test factory can stub it directly with a
+ * plain class. The DOM `WebSocket` satisfies this shape structurally
+ * (the bridge uses no constructor-only members and only ever assigns
+ * `null`/callback to the `on*` slots).
  */
 export interface MinimalWebSocket {
   send(data: string): void;
   close(): void;
   readyState: number;
-  // Match the DOM `WebSocket` signature shape so callers don't need
-  // `as unknown as WebSocket` to widen back to MDN's type.
   onopen: ((ev: Event) => unknown) | null;
   onmessage: ((ev: MessageEvent) => unknown) | null;
   onclose: ((ev: CloseEvent) => unknown) | null;
   onerror: ((ev: Event) => unknown) | null;
 }
 
-/** Mirror of `WebSocket.OPEN` so the bridge doesn't depend on the global. */
+// Mirror of the DOM `WebSocket.readyState` enum so the bridge doesn't
+// depend on the global at evaluation time (the worker entry might be
+// transformed before `WebSocket` is defined).
 const WS_OPEN = 1;
+const WS_CLOSING = 2;
+const WS_CLOSED = 3;
 
 export interface LickWsBridgeOptions {
   /**
@@ -114,8 +121,9 @@ export function startLickWsBridge(
     );
   }
 
-  const wsFactory =
-    options.webSocketFactory ?? ((url) => new WebSocket(url) as unknown as MinimalWebSocket);
+  // DOM `WebSocket` satisfies `MinimalWebSocket` structurally — no
+  // cast needed.
+  const wsFactory = options.webSocketFactory ?? ((url) => new WebSocket(url));
   const baseDelay = options.reconnectDelayMs ?? DEFAULT_RECONNECT_DELAY_MS;
   const setTimer = options.setTimeoutFn ?? setTimeout;
   const clearTimer = options.clearTimeoutFn ?? clearTimeout;
@@ -164,10 +172,13 @@ export function startLickWsBridge(
       });
     };
 
-    ws.onclose = () => {
+    ws.onclose = (event: CloseEvent) => {
       if (socket === ws) socket = null;
       if (stopped) return;
-      onFailure('disconnected');
+      // `CloseEvent.code` (per RFC 6455) and `CloseEvent.reason` are
+      // the diagnostic gold; `onerror` doesn't see them.
+      const reasonSegment = event.reason ? ` reason=${JSON.stringify(event.reason)}` : '';
+      onFailure(`disconnected code=${event.code}${reasonSegment}`);
     };
 
     ws.onerror = (event: Event) => {
@@ -181,10 +192,22 @@ export function startLickWsBridge(
   };
 
   /**
-   * Record a failure, log appropriately, emit a cone signal at the
-   * give-up threshold, and schedule the next reconnect with backoff.
+   * The session-reload signal is emitted exactly once per failure
+   * streak; `consecutiveFailures === RECONNECT_GIVEUP_AT` (not `>=`)
+   * ensures we don't re-emit on every subsequent failure. A successful
+   * `onopen` resets both counters so a fresh streak can re-arm the
+   * signal.
    */
   const onFailure = (cause: string): void => {
+    // If a reconnect is already queued, a fresh failure event (e.g.
+    // `onclose` racing with `onerror`) shouldn't increment the counter
+    // — the in-flight timer keeps the previously-computed delay, so
+    // incrementing here would print a backoff delay in logs that
+    // doesn't match the actual timer.
+    if (reconnectHandle != null) {
+      log.debug('Lick WS failure during pending reconnect — keeping existing timer', { cause });
+      return;
+    }
     consecutiveFailures++;
     const delay = Math.min(baseDelay * 2 ** (consecutiveFailures - 1), MAX_RECONNECT_DELAY_MS);
     const fields = { url: wsUrl, attempt: consecutiveFailures, cause, retryInMs: delay };
@@ -264,16 +287,26 @@ export function startLickWsBridge(
         data.headers && typeof data.headers === 'object'
           ? (data.headers as Record<string, string>)
           : {};
-      lickManager.handleWebhookEvent(webhookId, headers, data.body);
+      try {
+        lickManager.handleWebhookEvent(webhookId, headers, data.body);
+      } catch (err) {
+        // Filter compile errors, IndexedDB write errors, scoop-dispatch
+        // failures all manifest here. Surface them with the diagnostic
+        // context that lets the user figure out which webhook lost an
+        // event.
+        log.error('Webhook event dispatch failed', {
+          webhookId,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
       return;
     }
 
     if (data.type === 'navigate_event') {
       // Payload mirrors `packages/node-server/src/index.ts` POST
-      // /api/handoff, which broadcasts `{ verb, target, instruction?,
-      // url, title?, branch?, path? }` (RFC 8288 Link shape). The
-      // pre-removal `sliccHeader` shape was deleted in commit
-      // 085ac59e — readers MUST use the new fields.
+      // /api/handoff — `{ verb, target, instruction?, url, title?,
+      // branch?, path? }` (RFC 8288 Link shape). The older `sliccHeader`
+      // envelope is no longer emitted.
       const verb = typeof data.verb === 'string' ? data.verb : null;
       const target = typeof data.target === 'string' ? data.target : null;
       const navUrl = typeof data.url === 'string' && data.url.length > 0 ? data.url : null;
@@ -408,9 +441,11 @@ export function startLickWsBridge(
           s.close();
         } catch (err) {
           // Closing an already-closed socket is benign; anything else
-          // is noteworthy.
-          if (s.readyState !== 3 /* CLOSED */ && s.readyState !== 2 /* CLOSING */) {
-            log.warn('Lick socket close() threw on a still-open socket', {
+          // is noteworthy (CONNECTING/OPEN sockets shouldn't reject
+          // `close()`).
+          if (s.readyState !== WS_CLOSED && s.readyState !== WS_CLOSING) {
+            log.warn('Lick socket close() threw before terminal state', {
+              readyState: s.readyState,
               error: err instanceof Error ? err.message : String(err),
             });
           }

@@ -125,6 +125,13 @@ function request(op: string, args: unknown[] = []): Promise<unknown> {
     try {
       ch.postMessage({ type: 'lick-op', id, op, args });
     } catch (err) {
+      // Defense-in-depth: `BroadcastChannel.postMessage` only throws on
+      // `DataCloneError` (non-structured-cloneable args). Today the
+      // arg lists are all primitives so this is unreachable, but
+      // catching here means a future arg-shape change (e.g. accepting
+      // a Function for a filter) surfaces a distinct error instead of
+      // hanging until the 5s timeout. Realistic offscreen-document-
+      // dead failure mode still routes through the timeout path.
       clearTimeout(timer);
       ch.close();
       reject(

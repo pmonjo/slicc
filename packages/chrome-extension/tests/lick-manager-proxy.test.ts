@@ -22,11 +22,14 @@ import type {
 // Compile-time assertion that the chrome-extension's duplicated
 // `WebhookEntry` / `CronTaskEntry` stay structurally equal to the
 // canonical definitions in `packages/webapp/src/scoops/lick-manager.ts`.
-// If either side drifts, the runtime no-op test below fails to type.
+// If either side drifts, `AssertEqual<…>` resolves to `false`, which
+// fails the `T extends true` constraint and `tsc --noEmit` errors.
+// The helper survives bundling as an empty function called twice at
+// module load — harmless in tests, doesn't ship to production.
 type AssertEqual<T, U> =
   (<G>() => G extends T ? 1 : 2) extends <G>() => G extends U ? 1 : 2 ? true : false;
 function assertTrue<T extends true>(_: T): void {
-  /* erased — compile-time guard only */
+  /* empty body — exists so TS evaluates the type parameter */
 }
 assertTrue<AssertEqual<ExtWebhookEntry, WebWebhookEntry>>(true);
 assertTrue<AssertEqual<ExtCronTaskEntry, WebCronTaskEntry>>(true);
@@ -781,6 +784,72 @@ describe('LickManager Proxy', () => {
       await vi.advanceTimersToNextTimerAsync();
 
       await expect(promise).rejects.toThrow('Invalid filter');
+    });
+
+    it('deleteWebhook rejects through the BroadcastChannel when host throws', async () => {
+      const { createLickManagerProxy, startLickManagerHost } =
+        await import('../src/lick-manager-proxy.js');
+
+      const mockLickManager = {
+        createCronTask: vi.fn(),
+        listCronTasks: vi.fn(),
+        deleteCronTask: vi.fn(),
+        createWebhook: vi.fn(),
+        listWebhooks: vi.fn(),
+        deleteWebhook: vi.fn().mockRejectedValue(new Error('IndexedDB locked')),
+      };
+
+      startLickManagerHost(mockLickManager as any);
+      const proxy = createLickManagerProxy();
+
+      const promise = proxy.deleteWebhook('wh-1');
+      promise.catch(() => {});
+      await vi.advanceTimersToNextTimerAsync();
+      await vi.advanceTimersToNextTimerAsync();
+
+      await expect(promise).rejects.toThrow('IndexedDB locked');
+    });
+
+    it('getTrayWebhookUrlAsync coerces undefined resolver return to null', async () => {
+      const { getTrayWebhookUrlAsync, startLickManagerHost } =
+        await import('../src/lick-manager-proxy.js');
+
+      const mockLickManager = {
+        createCronTask: vi.fn(),
+        listCronTasks: vi.fn(),
+        deleteCronTask: vi.fn(),
+        createWebhook: vi.fn(),
+        listWebhooks: vi.fn(),
+        deleteWebhook: vi.fn(),
+      };
+
+      // Production wires `session?.webhookUrl ?? null` so it never
+      // returns undefined, but a defensive `?? null` in the host
+      // means undefined coerces to null. Pin that contract.
+      startLickManagerHost(mockLickManager as any, {
+        getTrayWebhookUrl: () => undefined as unknown as string,
+      });
+
+      const promise = getTrayWebhookUrlAsync();
+      await vi.advanceTimersToNextTimerAsync();
+      const result = await promise;
+
+      expect(result).toBeNull();
+    });
+
+    it('timeout error names the exact 5000ms value', async () => {
+      const { createLickManagerProxy } = await import('../src/lick-manager-proxy.js');
+      const proxy = createLickManagerProxy();
+
+      const promise = proxy.createWebhook('any', 'scoop');
+      promise.catch(() => {});
+
+      // 4999ms — not timed out yet
+      vi.advanceTimersByTime(4999);
+      // Cross the boundary
+      vi.advanceTimersByTime(2);
+
+      await expect(promise).rejects.toThrow(/'createWebhook' timed out after 5000ms/);
     });
   });
 });

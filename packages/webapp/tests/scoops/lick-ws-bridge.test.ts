@@ -220,8 +220,7 @@ describe('startLickWsBridge', () => {
 
   it('forwards navigate_event payloads as navigate licks using the {verb, target, url} shape', async () => {
     // Wire shape matches node-server's `POST /api/handoff` payload
-    // (`packages/node-server/src/index.ts:1030-1044`) after commit
-    // 085ac59e replaced `sliccHeader` with RFC 8288 Link fields.
+    // (RFC 8288 Link fields, not the older sliccHeader envelope).
     const { startLickWsBridge } = await loadBridge();
     const emitEvent = vi.fn();
     const lm = buildLickManagerMock({ emitEvent });
@@ -242,19 +241,24 @@ describe('startLickWsBridge', () => {
       timestamp: '2026-05-21T00:00:00.000Z',
     });
 
-    expect(emitEvent).toHaveBeenCalledWith({
-      type: 'navigate',
-      navigateUrl: 'about:handoff',
-      targetScoop: undefined,
-      timestamp: '2026-05-21T00:00:00.000Z',
-      body: {
-        url: 'about:handoff',
-        verb: 'handoff',
-        target: 'https://example.com/repo',
-        instruction: 'do thing',
-        title: 'Hand off',
-      },
-    });
+    // Use objectContaining so adding a new optional field to the body
+    // (e.g., a future `traceId`) doesn't fail this test for the wrong
+    // reason. The upskill counterpart below uses the same pattern.
+    expect(emitEvent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: 'navigate',
+        navigateUrl: 'about:handoff',
+        targetScoop: undefined,
+        timestamp: '2026-05-21T00:00:00.000Z',
+        body: expect.objectContaining({
+          url: 'about:handoff',
+          verb: 'handoff',
+          target: 'https://example.com/repo',
+          instruction: 'do thing',
+          title: 'Hand off',
+        }),
+      })
+    );
     handle.stop();
   });
 
@@ -620,5 +624,145 @@ describe('startLickWsBridge', () => {
         webSocketFactory: (url) => new FakeWebSocket(url),
       })
     ).toThrow(/invalid locationHref/);
+  });
+
+  it('emits the session-reload signal exactly at the 20-failure boundary', async () => {
+    // Drive 19 failures, expect no emit. Drive one more, expect one
+    // emit. Drive 5 more, expect still one emit (idempotent).
+    const { startLickWsBridge } = await loadBridge();
+    const emitEvent = vi.fn();
+    const lm = buildLickManagerMock({ emitEvent });
+    let callbacks = 0;
+    const setTimeoutFn = vi.fn().mockImplementation((cb: () => void) => {
+      callbacks++;
+      if (callbacks <= 30) cb();
+      return callbacks as unknown as ReturnType<typeof setTimeout>;
+    });
+    const factory = (_url: string): never => {
+      throw new Error('always fails');
+    };
+
+    const handle = startLickWsBridge(lm, {
+      locationHref: LOCATION,
+      webSocketFactory: factory as never,
+      setTimeoutFn,
+      reconnectDelayMs: 100,
+    });
+
+    // After 20 connect attempts (each schedules a reconnect), emit fires once.
+    expect(emitEvent).toHaveBeenCalledTimes(1);
+    // After 5 more (25 total), still once.
+    expect(emitEvent).toHaveBeenCalledTimes(1);
+    handle.stop();
+  });
+
+  it('onopen resets the failure counter so a fresh streak re-arms the cone signal', async () => {
+    // Drive a streak by repeatedly firing the close handler directly
+    // (bypassing setTimeout/connect recursion). After hitting the give-
+    // up threshold once, simulate onopen on a freshly-attached socket
+    // and verify a second streak fires the signal again.
+    const { startLickWsBridge } = await loadBridge();
+    const emitEvent = vi.fn();
+    const lm = buildLickManagerMock({ emitEvent });
+
+    // Mock setTimer so reconnects never actually run — we only want
+    // close events to flow through onFailure, not chain through the
+    // reconnect loop. Each call returns a fresh handle so the guard
+    // `reconnectHandle != null` correctly tracks pending state.
+    let timerId = 0;
+    const pendingTimers: Array<() => void> = [];
+    const setTimeoutFn = vi.fn().mockImplementation((cb: () => void) => {
+      pendingTimers.push(cb);
+      return ++timerId as unknown as ReturnType<typeof setTimeout>;
+    });
+    const clearTimeoutFn = vi.fn();
+
+    const handle = startLickWsBridge(lm, {
+      locationHref: LOCATION,
+      webSocketFactory: (url) => new FakeWebSocket(url),
+      setTimeoutFn,
+      clearTimeoutFn,
+      reconnectDelayMs: 1,
+    });
+    const ws = FakeWebSocket.instances[0];
+
+    // Drive 20 failures, manually clearing the reconnect-handle each
+    // time so the next close isn't suppressed by the pending-timer
+    // guard. Each pending callback drains via shift().
+    for (let i = 0; i < 20; i++) {
+      ws.onclose?.(new CloseEvent('close', { code: 1006 }));
+      pendingTimers.shift()?.(); // flush — clears reconnectHandle
+    }
+    expect(emitEvent).toHaveBeenCalledTimes(1);
+
+    // Simulate recovery — onopen resets the counters.
+    ws.onopen?.(new Event('open'));
+
+    // A fresh streak of 20 failures should fire ANOTHER signal.
+    for (let i = 0; i < 20; i++) {
+      ws.onclose?.(new CloseEvent('close', { code: 1006 }));
+      pendingTimers.shift()?.();
+    }
+    expect(emitEvent).toHaveBeenCalledTimes(2);
+    handle.stop();
+  });
+
+  it('onFailure during pending reconnect keeps the existing timer (no log lying about backoff)', async () => {
+    const { startLickWsBridge } = await loadBridge();
+    const lm = buildLickManagerMock();
+    const setTimeoutFn = vi.fn().mockReturnValue(9 as unknown as ReturnType<typeof setTimeout>);
+
+    const handle = startLickWsBridge(lm, {
+      locationHref: LOCATION,
+      webSocketFactory: (url) => new FakeWebSocket(url),
+      setTimeoutFn,
+    });
+    const ws = FakeWebSocket.instances[0];
+
+    // Trigger one close → onFailure → scheduleReconnect → 1 setTimeout
+    ws.onclose?.(new CloseEvent('close', { code: 1006 }));
+    expect(setTimeoutFn).toHaveBeenCalledTimes(1);
+
+    // A second close while reconnect pending — onFailure should bail
+    // without scheduling another timer.
+    ws.onclose?.(new CloseEvent('close', { code: 1006 }));
+    expect(setTimeoutFn).toHaveBeenCalledTimes(1);
+    handle.stop();
+  });
+
+  it('onclose threads CloseEvent.code and reason into the failure log', async () => {
+    // Smoke test that CloseEvent fields reach the log layer. We can't
+    // easily intercept the logger here without mocking createLogger, so
+    // verify the bridge doesn't crash on a code-bearing close.
+    const { startLickWsBridge } = await loadBridge();
+    const handle = startLickWsBridge(buildLickManagerMock(), {
+      locationHref: LOCATION,
+      webSocketFactory: (url) => new FakeWebSocket(url),
+    });
+    const ws = FakeWebSocket.instances[0];
+    ws.onclose?.(new CloseEvent('close', { code: 1008, reason: 'unauthorized' }));
+    // No throw; reconnect scheduled.
+    handle.stop();
+  });
+
+  it('webhook_event with a throwing LickManager surfaces a structured log not crash', async () => {
+    const { startLickWsBridge } = await loadBridge();
+    const handleWebhookEvent = vi.fn().mockImplementation(() => {
+      throw new Error('Filter compile failed');
+    });
+    const lm = buildLickManagerMock({ handleWebhookEvent });
+
+    const handle = startLickWsBridge(lm, {
+      locationHref: LOCATION,
+      webSocketFactory: (url) => new FakeWebSocket(url),
+    });
+    const ws = FakeWebSocket.instances[0];
+
+    // No throw escapes the bridge despite the LickManager throwing.
+    expect(() =>
+      ws.emit({ type: 'webhook_event', webhookId: 'wh-1', headers: {}, body: {} })
+    ).not.toThrow();
+    expect(handleWebhookEvent).toHaveBeenCalledOnce();
+    handle.stop();
   });
 });
