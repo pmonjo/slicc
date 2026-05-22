@@ -631,27 +631,70 @@ export class Layout {
   /**
    * Render the Tray block of the avatar popover.
    *
-   * Three shapes:
-   *   - Leader with `state === 'leader'` and a session: a primary "Copy
-   *     tray join URL" item plus a small status caption.
-   *   - Leader connecting / reconnecting / error: a disabled item showing
-   *     why no URL is available yet.
-   *   - Follower with state !== 'inactive': a status caption showing the
-   *     follower connection state.
-   *
-   * Returns nothing when this runtime is neither a leader nor a follower —
-   * keeps the popover compact for users that don't use trays.
+   * Four shapes:
+   *   - `leader-offer` (state inactive, both leader and follower): a
+   *     primary "Enable multi-browser sync" button that re-triggers
+   *     leader start via `leaveTray({ workerBaseUrl: <default> })` —
+   *     same helper the leader-restart path in `host leave --leader`
+   *     uses. Symmetric counterpart to "Stop multi-browser sync".
+   *   - `leader-copy` (state leader, joinUrl ready): a primary "Enable
+   *     multi-browser sync" button that copies the URL + opens the
+   *     share dialog, plus a "Stop multi-browser sync" leave button.
+   *   - `leader-pending` (state connecting/reconnecting/error): a
+   *     disabled item showing why no URL is available yet, plus the
+   *     leave button.
+   *   - `follower` (follower !== 'inactive'): a status caption showing
+   *     the follower connection state, plus a "Disconnect from leader"
+   *     button.
    */
   private appendTrayMenu(popover: HTMLElement): void {
     const model = computeTrayMenuModel(
       getLeaderTrayRuntimeStatus(),
       getFollowerTrayRuntimeStatus()
     );
-    if (model.kind === 'hidden') return;
 
     const sep = document.createElement('div');
     sep.className = 'avatar-popover__separator';
     popover.appendChild(sep);
+
+    if (model.kind === 'leader-offer') {
+      const enableBtn = document.createElement('button');
+      enableBtn.className = 'avatar-popover__item';
+      enableBtn.textContent = model.label;
+      enableBtn.addEventListener('click', async () => {
+        popover.remove();
+        try {
+          const [
+            { leaveTray },
+            { DEFAULT_PRODUCTION_TRAY_WORKER_BASE_URL, DEFAULT_STAGING_TRAY_WORKER_BASE_URL },
+          ] = await Promise.all([
+            import('../scoops/tray-leave.js'),
+            import('../scoops/tray-runtime-config.js'),
+          ]);
+          // `leaveTray({ workerBaseUrl })` covers the inactive →
+          // leader transition via the existing `kind: 'switched'`
+          // branch in `performTrayLeave`. No symmetric "enableTray"
+          // helper needed; the multi-transport selection in
+          // `resolveAmbientLeaveTrayTransport` already handles
+          // extension panel / standalone page / offscreen hook.
+          const workerBaseUrl = __DEV__
+            ? DEFAULT_STAGING_TRAY_WORKER_BASE_URL
+            : DEFAULT_PRODUCTION_TRAY_WORKER_BASE_URL;
+          await leaveTray({ workerBaseUrl });
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          layoutLog.error('enable-tray failed', { error: message });
+          showTrayActionErrorToast('enable', message);
+        }
+      });
+      popover.appendChild(enableBtn);
+      const caption = document.createElement('div');
+      caption.className = 'avatar-popover__caption';
+      caption.textContent = model.caption;
+      popover.appendChild(caption);
+      // No leave button in offer state — nothing to leave from.
+      return;
+    }
 
     if (model.kind === 'leader-copy') {
       const enableBtn = document.createElement('button');
@@ -719,7 +762,7 @@ export class Layout {
         // succeeded.
         const message = err instanceof Error ? err.message : String(err);
         layoutLog.error('leave-tray failed', { error: message });
-        showTrayLeaveErrorToast(message);
+        showTrayActionErrorToast('leave', message);
       }
     });
     popover.appendChild(leaveBtn);
@@ -1398,11 +1441,16 @@ export class Layout {
 
 /**
  * Briefly show a transient error banner at the top of the viewport.
- * Used by the avatar popover's "Leave" button to surface a tray-leave
+ * Used by the avatar popover's "Enable" / "Stop" buttons to surface a
  * failure after the popover has already been dismissed. Uses inline
  * styles so it works without project CSS being loaded (tests, popout).
+ *
+ * `action` controls the verb in the banner — `'leave'` reads as
+ * "couldn’t leave", `'enable'` reads as "couldn’t enable". Keep the
+ * two cases in this single helper so future verbs (e.g. role-switch)
+ * land in one place.
  */
-function showTrayLeaveErrorToast(message: string): void {
+function showTrayActionErrorToast(action: 'leave' | 'enable', message: string): void {
   const toast = document.createElement('div');
   toast.setAttribute('role', 'alert');
   toast.style.cssText =
@@ -1410,7 +1458,8 @@ function showTrayLeaveErrorToast(message: string): void {
     ' max-width: 520px; padding: 10px 14px; background: var(--slicc-cone, #c63b2c);' +
     ' color: white; font-size: 13px; border-radius: 6px; z-index: 99999;' +
     ' box-shadow: 0 4px 12px rgba(0,0,0,0.25); cursor: pointer;';
-  toast.textContent = `Multi-browser sync: couldn’t leave (${message}). Click to dismiss.`;
+  const verb = action === 'leave' ? 'leave' : 'enable';
+  toast.textContent = `Multi-browser sync: couldn’t ${verb} (${message}). Click to dismiss.`;
   toast.addEventListener('click', () => toast.remove());
   document.body.appendChild(toast);
   setTimeout(() => toast.remove(), 8000);
