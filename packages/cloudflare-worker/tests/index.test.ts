@@ -4,6 +4,8 @@ import {
   FOLLOWER_ATTACH_RETRY_AFTER_MS,
   wantsJSON,
   TRAY_RECLAIM_TTL_MS,
+  HOSTED_TRAY_RECLAIM_TTL_MS,
+  type CreateTrayRequest,
   type DurableObjectIdLike,
   type DurableObjectStateLike,
   type TrayRecord,
@@ -1852,5 +1854,45 @@ describe('X-Robots-Tag header', () => {
     expect(wsResponse.status).toBe(101);
     expect(wsResponse.headers.has('x-robots-tag')).toBe(false);
     expect((wsResponse as unknown as { webSocket: unknown }).webSocket).toBeDefined();
+  });
+});
+
+describe('shared types — hosted tray', () => {
+  it('HOSTED_TRAY_RECLAIM_TTL_MS is 30 days', () => {
+    expect(HOSTED_TRAY_RECLAIM_TTL_MS).toBe(30 * 24 * 60 * 60 * 1000);
+  });
+
+  it('TRAY_RECLAIM_TTL_MS unchanged at 1 hour', () => {
+    expect(TRAY_RECLAIM_TTL_MS).toBe(60 * 60 * 1000);
+  });
+
+  it('CreateTrayRequest.kind is an optional string-literal union', () => {
+    const desktop: CreateTrayRequest = {
+      trayId: 't',
+      createdAt: 'now',
+      joinToken: 'j',
+      controllerToken: 'c',
+      webhookToken: 'w',
+    };
+    const hosted: CreateTrayRequest = { ...desktop, kind: 'hosted' };
+    const explicit: CreateTrayRequest = { ...desktop, kind: 'desktop' };
+    expect(desktop.kind).toBeUndefined();
+    expect(hosted.kind).toBe('hosted');
+    expect(explicit.kind).toBe('desktop');
+  });
+
+  it('TrayRecord.kind is part of the persisted shape', () => {
+    const rec = {
+      trayId: 't',
+      createdAt: 'now',
+      joinToken: 'j',
+      controllerToken: 'c',
+      webhookToken: 'w',
+      controllers: {},
+      bootstraps: {},
+      leader: null,
+      kind: 'hosted',
+    } as TrayRecord;
+    expect(rec.kind).toBe('hosted');
   });
 });
