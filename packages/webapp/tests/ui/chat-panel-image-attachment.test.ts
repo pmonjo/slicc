@@ -131,6 +131,12 @@ describe('ChatPanel.addImageAttachment', () => {
     expect(container.querySelector('.chat__attachments--visible')).toBeNull();
   });
 
+  it('rejects data URL with empty payload', async () => {
+    await panel.addImageAttachment('data:image/png;base64,');
+
+    expect(container.querySelector('.chat__attachments--visible')).toBeNull();
+  });
+
   it('rejects oversized images (>10MB decoded)', async () => {
     // ~14MB of base64 data (decodes to ~10.5MB)
     const huge = 'A'.repeat(14 * 1024 * 1024);

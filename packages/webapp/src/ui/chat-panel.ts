@@ -787,6 +787,7 @@ export class ChatPanel {
         if (commaIdx !== -1) data = base64.slice(commaIdx + 1);
       }
     }
+    if (!data) return;
 
     // Validate against the app's supported image format allowlist (rejects SVG etc.)
     if (!isSupportedImageFormat(mime)) mime = 'image/jpeg';
