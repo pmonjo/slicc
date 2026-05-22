@@ -60,6 +60,7 @@ import { SessionStore as AgentSessionStore } from '../core/session.js';
 import type { RegisteredScoop, ChannelMessage } from '../scoops/types.js';
 import type { LickEvent } from '../scoops/lick-manager.js';
 import {
+  IndexedDbLeaderTraySessionStore,
   LeaderTrayManager,
   createTrayFetch,
   getLeaderTrayRuntimeStatus,
@@ -2668,6 +2669,17 @@ async function mainStandaloneWorker(app: HTMLElement, runtimeMode: UiRuntimeMode
       // /tmp/slicc-join.json would never appear, surfacing in the start poll
       // timeout. If a regression slips, the live harness catches it.
       window.localStorage.removeItem(TRAY_JOIN_STORAGE_KEY);
+
+      // ALSO clear the persisted leader session from IndexedDB. After a
+      // pause/resume + leader-restart kick, Chrome's Page.reload re-runs
+      // main.ts, but IndexedDB survives. Without this clear, LeaderTrayManager
+      // would reuse the stale session, the on-worker tray would be gone
+      // (or its leaderKey expired), and either we'd silently sit on dead
+      // credentials or attachWithRecovery would create a new tray but the
+      // refresh path is fragile. Forcing a fresh tray on every hosted-leader
+      // boot guarantees onLeaderReady fires with new credentials → POST
+      // /api/cloud-status → laptop sees a fresh updatedAt and unblocks resume.
+      await new IndexedDbLeaderTraySessionStore().clear();
 
       // resolveTrayRuntimeConfig already ran earlier in mainStandaloneWorker
       // (~main.ts:1708) — by the time we reach the tray block, it has fetched
