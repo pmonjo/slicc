@@ -48,6 +48,15 @@ The worker provides tray session coordination, capability-token routing, TURN cr
 - `session-tray.ts` caches ICE servers and refreshes them before TTL expiry.
 - `wrangler.jsonc` defines the key ID; the API token is stored as a Wrangler secret.
 
+### Tray kind (desktop / hosted)
+
+`TrayRecord.kind` is `'desktop' | 'hosted'`, defaulting to `'desktop'` when absent.
+`POST /tray` reads an optional `kind` from the request body (no body = desktop;
+malformed body = 400). The reclaim TTL is `HOSTED_TRAY_RECLAIM_TTL_MS = 30 days`
+for hosted trays, `TRAY_RECLAIM_TTL_MS = 1 hour` for desktop trays — branched
+through the pure helper `reclaimMsForTray(tray)` in `shared.ts`. Hosted trays
+support laptop-orchestrated sandboxes that pause for days at a time.
+
 ### Static Asset Serving
 
 - The worker serves the built webapp (`dist/ui/`) via Cloudflare Workers Static Assets.
