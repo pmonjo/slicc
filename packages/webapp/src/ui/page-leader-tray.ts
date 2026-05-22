@@ -62,6 +62,11 @@ export interface StartPageLeaderTrayOptions {
   runtime?: string;
   /** Tray kind. Default omitted (desktop). */
   kind?: 'desktop' | 'hosted';
+  /**
+   * Invoked once the leader tray is ready and the join URL is minted.
+   * Used by hosted-leader mode to POST `/api/cloud-status`.
+   */
+  onLeaderReady?: (session: LeaderTraySession) => void;
 
   // --- LeaderSyncManager dependencies (flat callbacks) ---
   getMessages: LeaderSyncManagerOptions['getMessages'];
@@ -194,6 +199,7 @@ export function startPageLeaderTray(options: StartPageLeaderTrayOptions): PageLe
     workerBaseUrl: options.workerBaseUrl,
     runtime: options.runtime ?? 'slicc-standalone',
     ...(options.kind ? { kind: options.kind } : {}),
+    ...(options.onLeaderReady ? { onLeaderReady: options.onLeaderReady } : {}),
     fetchImpl,
     ...(options._storeOverride ? { store: options._storeOverride } : {}),
     ...(options._webSocketFactory ? { webSocketFactory: options._webSocketFactory } : {}),

@@ -2655,7 +2655,48 @@ async function mainStandaloneWorker(app: HTMLElement, runtimeMode: UiRuntimeMode
   {
     const storedJoinUrl = window.localStorage.getItem(TRAY_JOIN_STORAGE_KEY);
     const storedWorkerBaseUrl = window.localStorage.getItem(TRAY_WORKER_STORAGE_KEY);
-    if (storedJoinUrl) {
+    if (runtimeMode === 'hosted-leader') {
+      // A persisted /data/profile (which survives e2b pause/resume) could carry
+      // a stale TRAY_JOIN_STORAGE_KEY from a prior follower role. For hosted-leader
+      // we ALWAYS start as leader; clear the join key so the existing branch
+      // below cannot route us into the follower path on this or any subsequent boot.
+      window.localStorage.removeItem(TRAY_JOIN_STORAGE_KEY);
+
+      // resolveTrayRuntimeConfig already ran earlier in mainStandaloneWorker
+      // (~main.ts:1708) — by the time we reach the tray block, it has fetched
+      // /api/runtime-config (which node-server's --hosted mode populates from
+      // SLICC_TRAY_WORKER_BASE_URL) and seeded TRAY_WORKER_STORAGE_KEY in
+      // localStorage. Reuse that value rather than re-fetching.
+      const workerBaseUrl = window.localStorage.getItem(TRAY_WORKER_STORAGE_KEY);
+      if (!workerBaseUrl) {
+        throw new Error(
+          'hosted-leader: TRAY_WORKER_STORAGE_KEY not seeded — runtime-config resolution failed'
+        );
+      }
+
+      pageLeaderTray = startPageLeaderTray({
+        ...buildLeaderTrayOptions(workerBaseUrl),
+        runtime: 'slicc-hosted-leader',
+        kind: 'hosted',
+        onLeaderReady: (session) => {
+          void fetch('/api/cloud-status', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({
+              joinUrl: session.joinUrl,
+              trayId: session.trayId,
+              controllerUrl: session.controllerUrl,
+              webhookUrl: session.webhookUrl,
+              runtime: session.runtime,
+              sliccVersion: __SLICC_VERSION__,
+            }),
+          }).catch((err) => {
+            log.error('failed to POST /api/cloud-status', { error: String(err) });
+          });
+        },
+      });
+      wireLeaderHooks(pageLeaderTray);
+    } else if (storedJoinUrl) {
       pageFollowerTray = startPageFollowerTray({
         joinUrl: storedJoinUrl,
         onSnapshot: (messages) => layout.panels.chat.loadMessages(messages),
