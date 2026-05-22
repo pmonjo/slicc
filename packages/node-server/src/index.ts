@@ -515,6 +515,11 @@ async function main() {
       join: RUNTIME_FLAGS.join,
       joinUrl: RUNTIME_FLAGS.joinUrl,
     });
+    // Append runtime parameter for hosted mode
+    if (RUNTIME_FLAGS.hosted) {
+      const sep = browserLaunchUrl.includes('?') ? '&' : '?';
+      browserLaunchUrl += `${sep}runtime=hosted-leader`;
+    }
     // Append optional prompt parameter
     if (RUNTIME_FLAGS.prompt) {
       const sep = browserLaunchUrl.includes('?') ? '&' : '?';
@@ -528,12 +533,17 @@ async function main() {
 
     const chromeProfile = (() => {
       try {
-        return resolveChromeLaunchProfile({
+        const resolved = resolveChromeLaunchProfile({
           projectRoot: PROJECT_ROOT,
           tmpDir: process.env['TMPDIR'] ?? '/tmp',
           profile: RUNTIME_FLAGS.profile,
           servePort: SERVE_PORT,
         });
+        // Override user data dir in hosted mode to use persistent profile
+        if (RUNTIME_FLAGS.hosted) {
+          resolved.userDataDir = process.env['CHROME_USER_DATA_DIR'] ?? '/data/profile';
+        }
+        return resolved;
       } catch (error: unknown) {
         console.error(error instanceof Error ? error.message : String(error));
         process.exit(1);
@@ -572,6 +582,7 @@ async function main() {
       cdpPort: REQUESTED_CDP_PORT,
       launchUrl: browserLaunchUrl,
       profile: chromeProfile,
+      hosted: RUNTIME_FLAGS.hosted,
     });
 
     // Profile directories are reused across runs (both the dev
@@ -813,6 +824,8 @@ async function main() {
   app.get('/api/runtime-config', (_req, res) => {
     res.json({
       trayWorkerBaseUrl:
+        // Hosted mode source: env var injected at sandbox-create time.
+        (RUNTIME_FLAGS.hosted ? process.env['SLICC_TRAY_WORKER_BASE_URL']?.trim() : null) ??
         RUNTIME_FLAGS.leadWorkerBaseUrl ??
         (process.env['WORKER_BASE_URL']?.trim() || null) ??
         (DEV_MODE
@@ -1486,7 +1499,7 @@ async function main() {
   // Create the HTTP server BEFORE Vite so we can register our upgrade handler first
   const server = createServer(app);
 
-  if (DEV_MODE) {
+  if (DEV_MODE && !RUNTIME_FLAGS.hosted) {
     // Dev mode: use Vite's dev server as middleware for HMR
     const { createServer: createViteServer } = await import('vite');
     const webappIndexHtml = resolve(process.cwd(), 'packages/webapp/index.html');
