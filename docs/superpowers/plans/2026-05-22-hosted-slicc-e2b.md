@@ -158,24 +158,32 @@ describe('POST /tray — kind plumbing', () => {
     // so this test pins the public contract: empty body returns 200.
   });
 
-  it('accepts kind=hosted in a JSON body and forwards it to the DO', async () => {
-    const env = makeTestEnv();
-    const response = await handleWorkerRequest(
-      new Request('https://www.sliccy.ai/tray', {
+  it('accepts kind=hosted in a JSON body and persists it on the DO', async () => {
+    // The DO has no public introspection route today (only /internal/create
+    // is exercised by tests). Drive the DO directly with a FakeDurableObjectState
+    // and assert against the persisted record — mirrors the existing test
+    // pattern at the top of this file.
+    const state = new FakeDurableObjectState();
+    const tray = new SessionTrayDurableObject(state, makeTestEnv());
+
+    const initResp = await tray.fetch(
+      new Request('https://internal/internal/create', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ kind: 'hosted' }),
-      }),
-      env
+        body: JSON.stringify({
+          trayId: 't1',
+          createdAt: new Date().toISOString(),
+          joinToken: 'j',
+          controllerToken: 'c',
+          webhookToken: 'w',
+          kind: 'hosted',
+        }),
+      })
     );
-    expect(response.status).toBe(200);
-    const body = await response.json();
-    const trayId = new URL(body.joinUrl).pathname.split('/').pop();
-    const stub = await env.TRAY_HUB.get(env.TRAY_HUB.idFromName(trayId)).fetch(
-      new Request(`https://internal/internal/state?json=true`, { method: 'GET' })
-    );
-    const state = await stub.json();
-    expect(state.kind).toBe('hosted');
+    expect(initResp.status).toBe(200);
+
+    const stored = (await state.storage.get('tray')) as TrayRecord;
+    expect(stored.kind).toBe('hosted');
   });
 
   it('rejects malformed JSON with 400', async () => {
@@ -276,59 +284,67 @@ git commit -m "feat(worker): POST /tray accepts optional kind in JSON body"
 - Modify: `packages/cloudflare-worker/src/session-tray.ts` (the `SessionTrayDurableObject`)
 - Modify: `packages/cloudflare-worker/tests/index.test.ts`
 
-- [ ] **Step 1: Write the failing test**
+- [ ] **Step 1: Write the failing test (pure helper + persistence)**
+
+The cleanest way to test the branching logic is via a pure helper. Both reclaim sites (the disconnect-grace branch at ~line 1106, and `leaderSummary().reconnectDeadline` at ~line 698) will use this helper. The helper is trivially testable without route mocking.
 
 Add to `packages/cloudflare-worker/tests/index.test.ts`:
 
 ```typescript
-describe('SessionTrayDurableObject — hosted reclaim TTL', () => {
-  it('hosted tray reconnectDeadline is 30 days after disconnect', async () => {
-    const state = new FakeDurableObjectState();
-    const env = makeTestEnv();
-    const tray = new SessionTrayDurableObject(state, env);
+import {
+  HOSTED_TRAY_RECLAIM_TTL_MS,
+  TRAY_RECLAIM_TTL_MS,
+  reclaimMsForTray,
+  type TrayRecord,
+} from '../src/shared.js';
 
-    const created = await tray.fetch(
+describe('reclaimMsForTray', () => {
+  it('returns 30 days for kind=hosted', () => {
+    expect(reclaimMsForTray({ kind: 'hosted' } as TrayRecord)).toBe(HOSTED_TRAY_RECLAIM_TTL_MS);
+  });
+
+  it('returns 1 hour for kind=desktop', () => {
+    expect(reclaimMsForTray({ kind: 'desktop' } as TrayRecord)).toBe(TRAY_RECLAIM_TTL_MS);
+  });
+
+  it('returns 1 hour for absent kind (back-compat)', () => {
+    expect(reclaimMsForTray({} as TrayRecord)).toBe(TRAY_RECLAIM_TTL_MS);
+  });
+
+  it('returns 1 hour for null/undefined (defensive)', () => {
+    expect(reclaimMsForTray(null)).toBe(TRAY_RECLAIM_TTL_MS);
+    expect(reclaimMsForTray(undefined)).toBe(TRAY_RECLAIM_TTL_MS);
+  });
+});
+
+describe('SessionTrayDurableObject — kind persistence', () => {
+  it('persists kind=hosted on the tray record after /internal/create', async () => {
+    const state = new FakeDurableObjectState();
+    const tray = new SessionTrayDurableObject(state, makeTestEnv());
+
+    await tray.fetch(
       new Request('https://internal/internal/create', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({
           trayId: 't1',
           createdAt: new Date().toISOString(),
-          joinToken: 'j1',
-          controllerToken: 'c1',
-          webhookToken: 'w1',
+          joinToken: 'j',
+          controllerToken: 'c',
+          webhookToken: 'w',
           kind: 'hosted',
         }),
       })
     );
-    expect(created.status).toBe(200);
 
-    // Simulate a leader having attached and then disconnected.
-    const disconnectedAt = new Date().toISOString();
     const stored = (await state.storage.get('tray')) as TrayRecord;
-    stored.leader = {
-      controllerId: 'c1',
-      runtime: 'slicc-hosted-leader',
-      connected: false,
-      disconnectedAt,
-      attachedAt: disconnectedAt,
-      leaderKey: 'lk',
-    };
-    await state.storage.put('tray', stored);
-
-    // Fetch the public status (or whichever route returns leaderSummary).
-    const status = await tray.fetch(
-      new Request('https://internal/status?json=true', { method: 'GET' })
-    );
-    const body = (await status.json()) as { leader: { reconnectDeadline: string } };
-    const expected = Date.parse(disconnectedAt) + HOSTED_TRAY_RECLAIM_TTL_MS;
-    expect(Date.parse(body.leader.reconnectDeadline)).toBe(expected);
+    expect(stored.kind).toBe('hosted');
+    expect(reclaimMsForTray(stored)).toBe(HOSTED_TRAY_RECLAIM_TTL_MS);
   });
 
-  it('desktop tray reconnectDeadline is 1h after disconnect (unchanged)', async () => {
+  it('defaults to kind=desktop when /internal/create payload omits it', async () => {
     const state = new FakeDurableObjectState();
-    const env = makeTestEnv();
-    const tray = new SessionTrayDurableObject(state, env);
+    const tray = new SessionTrayDurableObject(state, makeTestEnv());
 
     await tray.fetch(
       new Request('https://internal/internal/create', {
@@ -340,34 +356,18 @@ describe('SessionTrayDurableObject — hosted reclaim TTL', () => {
           joinToken: 'j2',
           controllerToken: 'c2',
           webhookToken: 'w2',
-          // no kind → desktop default
         }),
       })
     );
 
-    const disconnectedAt = new Date().toISOString();
     const stored = (await state.storage.get('tray')) as TrayRecord;
-    stored.leader = {
-      controllerId: 'c2',
-      runtime: 'slicc-standalone',
-      connected: false,
-      disconnectedAt,
-      attachedAt: disconnectedAt,
-      leaderKey: 'lk',
-    };
-    await state.storage.put('tray', stored);
-
-    const status = await tray.fetch(
-      new Request('https://internal/status?json=true', { method: 'GET' })
-    );
-    const body = (await status.json()) as { leader: { reconnectDeadline: string } };
-    const expected = Date.parse(disconnectedAt) + TRAY_RECLAIM_TTL_MS;
-    expect(Date.parse(body.leader.reconnectDeadline)).toBe(expected);
+    expect(stored.kind ?? 'desktop').toBe('desktop');
+    expect(reclaimMsForTray(stored)).toBe(TRAY_RECLAIM_TTL_MS);
   });
 });
 ```
 
-(Adjust `https://internal/status?json=true` to whichever route the DO actually serves the public status on. Check existing tests for the right URL.)
+Note on `LeaderRecord` shape: the real type at `shared.ts:40-47` is `{controllerId, leaderKey, claimedAt, lastSeenAt, connected, disconnectedAt?}` — there is **no** `runtime` field (that lives on `ControllerRecord`) and **no** `attachedAt` field. The pure-helper test sidesteps `LeaderRecord` construction entirely; the persistence test only inspects `tray.kind`.
 
 - [ ] **Step 2: Run test to verify it fails**
 
@@ -377,14 +377,26 @@ cd packages/cloudflare-worker && npx vitest run tests/index.test.ts -t "hosted r
 
 Expected: FAIL — hosted tray still computes 1h.
 
-- [ ] **Step 3: Implement the DO change**
+- [ ] **Step 3: Add the pure helper to shared.ts**
+
+Edit `packages/cloudflare-worker/src/shared.ts`:
+
+```typescript
+export function reclaimMsForTray(tray: TrayRecord | null | undefined): number {
+  return tray?.kind === 'hosted' ? HOSTED_TRAY_RECLAIM_TTL_MS : TRAY_RECLAIM_TTL_MS;
+}
+```
+
+- [ ] **Step 4: Wire the helper through the DO**
 
 Edit `packages/cloudflare-worker/src/session-tray.ts`:
 
-1. In the internal create handler, persist `kind` from the payload onto the `TrayRecord`:
+1. Import `reclaimMsForTray` from `./shared.js`.
+
+2. In the internal create handler, persist `kind` from the payload:
 
 ```typescript
-// Inside the handler that processes /internal/create
+// Inside the /internal/create handler:
 const payload = (await request.json()) as CreateTrayRequest;
 const record: TrayRecord = {
   trayId: payload.trayId,
@@ -400,37 +412,27 @@ const record: TrayRecord = {
 await this.state.storage.put('tray', record);
 ```
 
-2. Add a private helper:
-
-```typescript
-private reclaimMs(): number {
-  return this.tray?.kind === 'hosted' ? HOSTED_TRAY_RECLAIM_TTL_MS : TRAY_RECLAIM_TTL_MS;
-}
-```
-
-3. Replace both call sites of `TRAY_RECLAIM_TTL_MS` with `this.reclaimMs()`:
+3. Replace both `TRAY_RECLAIM_TTL_MS` call sites with `reclaimMsForTray(this.tray)`:
 
 ```typescript
 // At ~line 698 (inside leaderSummary):
 reconnectDeadline: leader.disconnectedAt
-  ? new Date(Date.parse(leader.disconnectedAt) + this.reclaimMs()).toISOString()
+  ? new Date(Date.parse(leader.disconnectedAt) + reclaimMsForTray(this.tray)).toISOString()
   : null,
 
 // At ~line 1106 (disconnect-grace branch):
-const expiresAt = Date.parse(tray.leader.disconnectedAt) + this.reclaimMs();
+const expiresAt = Date.parse(tray.leader.disconnectedAt) + reclaimMsForTray(tray);
 ```
 
-4. Make sure `HOSTED_TRAY_RECLAIM_TTL_MS` is imported from `./shared.js`.
-
-- [ ] **Step 4: Run test to verify it passes**
+- [ ] **Step 5: Run test to verify it passes**
 
 ```
-cd packages/cloudflare-worker && npx vitest run tests/index.test.ts -t "hosted reclaim TTL"
+cd packages/cloudflare-worker && npx vitest run tests/index.test.ts -t "reclaimMsForTray|kind persistence"
 ```
 
-Expected: PASS for both hosted and desktop cases.
+Expected: PASS for all helper + persistence cases.
 
-- [ ] **Step 5: Run the full worker test suite to catch regressions**
+- [ ] **Step 6: Run the full worker test suite to catch regressions**
 
 ```
 cd packages/cloudflare-worker && npx vitest run
@@ -438,11 +440,13 @@ cd packages/cloudflare-worker && npx vitest run
 
 Expected: all pre-existing tests still pass.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 7: Commit**
 
 ```bash
-git add packages/cloudflare-worker/src/session-tray.ts packages/cloudflare-worker/tests/index.test.ts
-git commit -m "feat(worker): persist tray kind and branch reclaim TTL (30d for hosted)"
+git add packages/cloudflare-worker/src/shared.ts \
+        packages/cloudflare-worker/src/session-tray.ts \
+        packages/cloudflare-worker/tests/index.test.ts
+git commit -m "feat(worker): persist tray kind and branch reclaim TTL via reclaimMsForTray helper"
 ```
 
 ---
@@ -535,6 +539,8 @@ git commit -m "docs(worker): document tray kind branch in CLAUDE.md"
 ## Phase 2 — Webapp hosted-leader boot path
 
 The cloud Chromium loads `localhost:5710/?runtime=hosted-leader`. Make the webapp boot as a leader unconditionally in that mode, fire `onLeaderReady` on initial create, include `kind: 'hosted'` in `POST /tray`.
+
+**Verification scope.** Phase 2 ships unit-test coverage only. The full browser/e2b smoke (loading `?runtime=hosted-leader` and observing a hosted tray minted on the deployed worker) requires Phase 3 because the webapp's `onLeaderReady` posts to `/api/cloud-status`, which doesn't exist until Phase 3 lands. End-to-end dogfood happens in Phase 4.
 
 ### Task 2.1: Add `'hosted-leader'` to `UiRuntimeMode`
 
@@ -1048,12 +1054,16 @@ if (runtimeMode === 'hosted-leader') {
   // boot.
   window.localStorage.removeItem(TRAY_JOIN_STORAGE_KEY);
 
-  // Resolve workerBaseUrl from /api/runtime-config (which node-server's
-  // --hosted mode populates from SLICC_TRAY_WORKER_BASE_URL).
-  const runtimeConfig = await fetch('/api/runtime-config').then((r) => r.json());
-  const workerBaseUrl = runtimeConfig.trayWorkerBaseUrl;
-  if (typeof workerBaseUrl !== 'string' || !workerBaseUrl) {
-    throw new Error('hosted-leader: /api/runtime-config returned no trayWorkerBaseUrl');
+  // `resolveTrayRuntimeConfig` already ran earlier in `mainStandaloneWorker`
+  // (~main.ts:1706) — by the time we reach the tray block, it has fetched
+  // /api/runtime-config (which node-server's --hosted mode populates from
+  // SLICC_TRAY_WORKER_BASE_URL) and seeded TRAY_WORKER_STORAGE_KEY in
+  // localStorage. Reuse that value rather than re-fetching.
+  const workerBaseUrl = window.localStorage.getItem(TRAY_WORKER_STORAGE_KEY);
+  if (!workerBaseUrl) {
+    throw new Error(
+      'hosted-leader: TRAY_WORKER_STORAGE_KEY not seeded — runtime-config resolution failed'
+    );
   }
 
   pageLeaderTray = startPageLeaderTray({
@@ -1431,6 +1441,13 @@ describe('POST /api/cloud-status', () => {
     registerCloudStatusEndpoint(app, { joinFilePath: tmpFile });
     // ... send a POST with {trayId: 't'} (no joinUrl) — expect 400
   });
+
+  it('rejects requests from a non-loopback remoteAddress with 403', async () => {
+    // Construct an Express request whose req.socket.remoteAddress is '10.0.0.5'
+    // or similar (use a supertest forge or a fake socket harness). Expect 403.
+    // The test forces the loopback guard to fire; the JSON body should be
+    // { error: 'localhost only' }.
+  });
 });
 ```
 
@@ -1444,23 +1461,39 @@ cd packages/node-server && npx vitest run tests/cloud-status.test.ts
 
 Expected: FAIL — module doesn't exist.
 
-- [ ] **Step 3: Implement `/api/cloud-status`**
+- [ ] **Step 3: Implement `/api/cloud-status` (localhost-only)**
 
 Create `packages/node-server/src/cloud-status.ts`:
 
 ```typescript
-import express, { type Express } from 'express';
+import express, { type Express, type Request, type Response, type NextFunction } from 'express';
 import { promises as fs } from 'node:fs';
 
 export interface CloudStatusEndpointOptions {
   joinFilePath: string;
 }
 
+/**
+ * Reject non-loopback requests. The sandbox is a private execution boundary,
+ * but defense in depth: someone might wire a port-forward and we want this
+ * endpoint to be unreachable from the outside.
+ */
+export function requireLoopback(req: Request, res: Response, next: NextFunction): void {
+  const addr = req.socket.remoteAddress ?? '';
+  const isLoopback =
+    addr === '127.0.0.1' || addr === '::1' || addr === '::ffff:127.0.0.1' || addr === 'localhost';
+  if (!isLoopback) {
+    res.status(403).json({ error: 'localhost only' });
+    return;
+  }
+  next();
+}
+
 export function registerCloudStatusEndpoint(
   app: Express,
   options: CloudStatusEndpointOptions
 ): void {
-  app.post('/api/cloud-status', express.json(), async (req, res) => {
+  app.post('/api/cloud-status', requireLoopback, express.json(), async (req, res) => {
     const body = req.body as Partial<{
       joinUrl: string;
       trayId: string;
@@ -1682,11 +1715,13 @@ export async function restartLeader(cdp: CdpLike, localUrlPrefix: string): Promi
   }
 }
 
+import { requireLoopback } from './cloud-status.js';
+
 export function registerLeaderRestartEndpoint(
   app: Express,
   options: { cdp: CdpLike; localUrlPrefix: string }
 ): void {
-  app.post('/api/leader-restart', async (_req, res) => {
+  app.post('/api/leader-restart', requireLoopback, async (_req, res) => {
     const result = await restartLeader(options.cdp, options.localUrlPrefix);
     if (result.ok) {
       res.json({ ok: true });
@@ -1698,14 +1733,50 @@ export function registerLeaderRestartEndpoint(
 }
 ```
 
-In `packages/node-server/src/index.ts`, register only when `--hosted`:
+**CDP wiring guidance.** node-server does not expose a reusable `cdpClient`; it talks to CDP via HTTP at `http://127.0.0.1:${cdpPort}/json` (see `findPageTarget` at `packages/node-server/src/index.ts:232` and `attachConsoleForwarder` at `~line 251` for the existing patterns). Implement `CdpLike` as a small wrapper inside `leader-restart.ts`:
 
 ```typescript
-import { registerLeaderRestartEndpoint } from './leader-restart.js';
+export function createHttpCdp(cdpPort: number): CdpLike {
+  return {
+    async send(method, _params, _sessionId) {
+      if (method === 'Target.getTargets') {
+        const res = await fetch(`http://127.0.0.1:${cdpPort}/json`);
+        const list = (await res.json()) as Array<{
+          id: string;
+          type: string;
+          url: string;
+          webSocketDebuggerUrl?: string;
+        }>;
+        return {
+          targetInfos: list.map((t) => ({
+            id: t.id,
+            type: t.type,
+            url: t.url,
+            attached: Boolean(t.webSocketDebuggerUrl),
+          })),
+        };
+      }
+      // Target.attachToTarget + Page.reload need a CDP WebSocket session.
+      // Reuse the ws pattern from attachConsoleForwarder (~index.ts:251):
+      // open ws to the target's webSocketDebuggerUrl, send the protocol
+      // message with a request id, await the matching response.
+      throw new Error(`createHttpCdp: ${method} not yet implemented`);
+    },
+  };
+}
+```
+
+The full `Target.attachToTarget` + `Page.reload` over WebSocket is verbose but mechanical. Use the `ws` package (already a node-server dependency) and follow `attachConsoleForwarder`'s pattern. Keep the implementation in `leader-restart.ts` so `restartLeader`'s testability via the abstract `CdpLike` is preserved.
+
+In `packages/node-server/src/index.ts`, register only when `--hosted`, after CDP is up:
+
+```typescript
+import { createHttpCdp, registerLeaderRestartEndpoint } from './leader-restart.js';
 
 if (RUNTIME_FLAGS.hosted) {
+  await waitForCDP(CDP_PORT, 40, 500);
   registerLeaderRestartEndpoint(app, {
-    cdp: cdpClient, // whichever CDP client node-server already exposes
+    cdp: createHttpCdp(CDP_PORT),
     localUrlPrefix: `http://localhost:${SERVE_PORT}/`,
   });
 }
@@ -1758,6 +1829,13 @@ RUN apt-get update && apt-get install -y \
     chromium fonts-liberation libnss3 libatk-bridge2.0-0 \
     libgtk-3-0 libxss1 libasound2 \
  && rm -rf /var/lib/apt/lists/*
+# NOTE: The Chromium apt package name varies by base image. On Debian-derived
+# images it is usually `chromium`; on Ubuntu it has historically been
+# `chromium-browser`. If `apt-get install chromium` fails at template build
+# time, swap to `chromium-browser` (and add `apt list --installed | grep -i
+# chrom` to verify the binary path is at `/usr/bin/chromium` or
+# `/usr/bin/chromium-browser`, then update start.sh and chrome-launch.ts
+# accordingly).
 
 COPY dist/node-server  /opt/slicc/node-server
 COPY dist/ui           /opt/slicc/ui
@@ -3165,7 +3243,7 @@ describe('slicc --cloud resume', () => {
           })
         );
       }
-      return { stdout: '', stderr: '', exitCode: 0 };
+      return { stdout: '200', stderr: '', exitCode: 0 };
     });
 
     const result = await runResume({
@@ -3217,7 +3295,7 @@ describe('slicc --cloud resume', () => {
           updatedAt: '2026-05-22T01:00:00Z',
         })
       );
-      return { stdout: '', stderr: '', exitCode: 0 };
+      return { stdout: '200', stderr: '', exitCode: 0 };
     });
 
     const result = await runResume({
@@ -3266,7 +3344,7 @@ describe('slicc --cloud resume', () => {
           updatedAt: '2026-05-22T01:00:00Z',
         })
       );
-      return { stdout: '', stderr: '', exitCode: 0 };
+      return { stdout: '200', stderr: '', exitCode: 0 };
     });
 
     const result = await runResume({
@@ -3314,8 +3392,12 @@ export interface ResumeResult {
   versionMismatch?: { running: string; local: string };
 }
 
+// curl writes its body to /dev/null and prints the HTTP status code on stdout.
+// We DO want curl to return non-zero on connection errors (so the retry loop
+// can distinguish "node-server not up yet" from "200/503 response received").
+// Therefore: no `|| true`; we parse status from stdout AND check exitCode.
 const KICK_CMD =
-  'curl -fsS -X POST http://localhost:5710/api/leader-restart -o /dev/null -w "%{http_code}\\n" || true';
+  'curl -sS -X POST http://localhost:5710/api/leader-restart -o /dev/null -w "%{http_code}"';
 
 export async function runResume(opts: RunResumeOpts): Promise<ResumeResult> {
   const reg = new CloudSessionRegistry(opts.registryPath);
@@ -3327,10 +3409,25 @@ export async function runResume(opts: RunResumeOpts): Promise<ResumeResult> {
 
   // Kick the leader to recover from a possible onReconnectGaveUp state.
   // 5×1s retry covers the CDP-cold-start race after a long pause.
+  // Success = curl exited 0 AND status is 200. 503 means the SLICC page
+  // target isn't ready yet — retry. Any other status is a hard error.
+  let kicked = false;
   for (let i = 0; i < 5; i++) {
     const result = await handle.run(KICK_CMD);
-    if (result.exitCode === 0) break;
+    if (result.exitCode === 0) {
+      const status = result.stdout.trim();
+      if (status === '200') {
+        kicked = true;
+        break;
+      }
+      if (status !== '503') {
+        throw new Error(`/api/leader-restart returned unexpected status ${status}`);
+      }
+    }
     await new Promise((r) => setTimeout(r, 1000));
+  }
+  if (!kicked) {
+    throw new Error('Failed to kick leader after 5 retries (sandbox may not be healthy)');
   }
 
   const refreshed = await pollForRefreshedStatus(handle, oldStatus.updatedAt, {
@@ -3690,7 +3787,9 @@ Expected: PASS.
 
 - [ ] **Step 5: Wire dispatcher into `index.ts`**
 
-Edit `packages/node-server/src/index.ts` near the top of the boot flow, before any server boot:
+Edit `packages/node-server/src/index.ts` near the top of the boot flow, before any server boot (Chrome launch, port resolution, CDP wait, Express app boot — all of these must NOT run for `--cloud` invocations).
+
+The dispatch block uses top-level `await`. Verify before merging: `packages/node-server/package.json` has `"type": "module"` (confirmed — yes), and the compiled `dist/node-server/index.js` is consumed as an ES module so top-level `await` is valid. Also ensure the runtime-flag parser already used at the top of `index.ts` does NOT consume `--cloud` or its subargs — `parseCloudArgs` looks for `--cloud` directly in `process.argv.slice(2)` and is independent of the existing flag parser. If `parseRuntimeFlags` (or whichever helper is used at boot) errors on unknown flags, exclude `--cloud …` args from it before parsing.
 
 ```typescript
 import { parseCloudArgs } from './cloud/dispatch.js';
@@ -4018,6 +4117,8 @@ git commit -m "docs: hosted-leader float documentation"
 
 ### Task 5.4: Full repo verification + branch readiness
 
+**Cross-phase deployment ordering.** Phase 1 (the worker `kind` + 30-day TTL) must be **deployed to production** before Phase 4's pause-for-days dogfooding works against `www.sliccy.ai`. CI auto-deploys the worker from `main`, so merging this branch deploys Phase 1 as part of the same merge — but a partial-rollback that reverts the worker change while leaving the CLI alone would silently degrade hosted-tray reclaim back to 1h. Note this in the PR description (test-plan checkbox) so reviewers see the dependency.
+
 - [ ] **Step 1: Run all CI gates**
 
 ```
@@ -4069,7 +4170,9 @@ gh pr create --title "feat: hosted-leader float (slicc --cloud, e2b)" --body "$(
 - [ ] `npm run typecheck` and `npm run build` pass
 - [ ] `npx prettier --check .` passes
 - [ ] `SLICC_TEST_E2B_API_KEY=… npm run test:live:cloud -w @slicc/node-server` (manual)
-- [ ] Manual smoke: `slicc --cloud start --name test1`, attach iOS follower, `slicc --cloud pause`, `slicc --cloud resume`, `slicc --cloud kill`
+- [ ] Worker deployed to production (Phase 1 `kind` + 30-day TTL must land before pause-for-days dogfooding works)
+- [ ] e2b template built and published (`packages/dev-tools/e2b-template/scripts/build-template.sh`)
+- [ ] Manual smoke: `slicc --cloud start --name test1`, attach iOS follower, send a turn, `slicc --cloud pause`, `slicc --cloud resume`, verify follower reattaches, `slicc --cloud kill`
 
 🤖 Generated with [Claude Code](https://claude.com/claude-code)
 EOF
