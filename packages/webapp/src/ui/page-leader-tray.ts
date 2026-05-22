@@ -58,6 +58,11 @@ export interface StartPageLeaderTrayOptions {
   /** Cloudflare tray worker base URL (from `tray-worker-base-url` localStorage). */
   workerBaseUrl: string;
 
+  /** Tray attach runtime string. Default 'slicc-standalone'. */
+  runtime?: string;
+  /** Tray kind. Default omitted (desktop). */
+  kind?: 'desktop' | 'hosted';
+
   // --- LeaderSyncManager dependencies (flat callbacks) ---
   getMessages: LeaderSyncManagerOptions['getMessages'];
   getMessagesForScoop?: LeaderSyncManagerOptions['getMessagesForScoop'];
@@ -187,7 +192,8 @@ export function startPageLeaderTray(options: StartPageLeaderTrayOptions): PageLe
   // everything else is signaling for the peer manager.
   leader = new LeaderTrayManager({
     workerBaseUrl: options.workerBaseUrl,
-    runtime: 'slicc-standalone',
+    runtime: options.runtime ?? 'slicc-standalone',
+    ...(options.kind ? { kind: options.kind } : {}),
     fetchImpl,
     ...(options._storeOverride ? { store: options._storeOverride } : {}),
     ...(options._webSocketFactory ? { webSocketFactory: options._webSocketFactory } : {}),
