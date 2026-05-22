@@ -97,6 +97,7 @@ import {
   isElectronOverlaySetTabMessage,
   resolveUiRuntimeMode,
   shouldUseRuntimeModeTrayDefaults,
+  type UiRuntimeMode,
 } from './runtime-mode.js';
 import {
   setConnectedFollowersGetter,
@@ -1680,7 +1681,8 @@ async function mainExtension(app: HTMLElement, options?: { detached?: boolean })
 // path can't accidentally regress the inline path that ships today.
 // ---------------------------------------------------------------------------
 
-async function mainStandaloneWorker(app: HTMLElement, isElectronOverlay: boolean): Promise<void> {
+async function mainStandaloneWorker(app: HTMLElement, runtimeMode: UiRuntimeMode): Promise<void> {
+  const isElectronOverlay = runtimeMode === 'electron-overlay';
   log.info('starting standalone with kernel worker');
 
   const { spawnKernelWorker } = await import('../kernel/spawn.js');
@@ -3187,7 +3189,7 @@ async function main(): Promise<void> {
   // model). If we ever need to roll back, restore the pre-removal
   // commit (see git log for "remove legacy inline-orchestrator
   // path").
-  return mainStandaloneWorker(app, runtimeMode === 'electron-overlay');
+  return mainStandaloneWorker(app, runtimeMode);
 }
 
 main().catch((err) => {
