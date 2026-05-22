@@ -29,13 +29,12 @@ export function createE2bSubstrate(cfg: SubstrateConfig): SandboxSubstrate {
       return wrap(sbx);
     },
     async list(): Promise<SandboxSummary[]> {
-      // The paginator provides nextItems() to fetch pages.
+      // The e2b SDK paginator throws on nextItems() past the end — guard
+      // with hasNext (the documented pattern in the SDK examples).
       const paginator = Sandbox.list();
       const items: SandboxSummary[] = [];
-
-      // Fetch all pages.
-      let page = await paginator.nextItems();
-      while (page.length > 0) {
+      while (paginator.hasNext) {
+        const page = await paginator.nextItems();
         for (const info of page) {
           // Filter to sandboxes whose template ID is 'slicc'.
           if (info.templateId === 'slicc') {
@@ -47,9 +46,7 @@ export function createE2bSubstrate(cfg: SubstrateConfig): SandboxSubstrate {
             });
           }
         }
-        page = await paginator.nextItems();
       }
-
       return items;
     },
   };
