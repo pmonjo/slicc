@@ -197,6 +197,15 @@ describe('POST /tray — kind plumbing', () => {
     );
     expect(response.status).toBe(400);
   });
+
+  it('treats explicit empty-string body the same as no body (back-compat)', async () => {
+    // Some clients send an empty body string instead of omitting the body.
+    const response = await handleWorkerRequest(
+      new Request('https://www.sliccy.ai/tray', { method: 'POST', body: '' }),
+      makeTestEnv()
+    );
+    expect(response.status).toBe(200);
+  });
 });
 ```
 
@@ -219,10 +228,13 @@ Edit `packages/cloudflare-worker/src/index.ts` at `createTray` (around line 287)
 ```typescript
 async function createTray(request: Request, env: WorkerEnv): Promise<Response> {
   let kind: 'desktop' | 'hosted' = 'desktop';
-  const contentLength = request.headers.get('content-length');
-  if (contentLength && contentLength !== '0') {
+  // Tolerate three back-compat shapes: no content-length header at all
+  // (legacy clients), content-length: 0, and an empty-string body. Only
+  // attempt JSON parse when there's actually a body to parse.
+  const rawBody = await request.text();
+  if (rawBody.trim() !== '') {
     try {
-      const body = (await request.json()) as { kind?: unknown };
+      const body = JSON.parse(rawBody) as { kind?: unknown };
       if (body.kind === 'hosted' || body.kind === 'desktop') {
         kind = body.kind;
       } else if (body.kind !== undefined) {
@@ -3505,6 +3517,42 @@ describe('slicc --cloud pause', () => {
       runPause({ substrate: new FakeSubstrate(), registryPath, query: 'nope' })
     ).rejects.toThrow(/not found/i);
   });
+
+  it('preserves trayId and lastJoinUpdatedAt across pause (resume baseline)', async () => {
+    // runResume relies on these two fields surviving pause. If runPause
+    // accidentally overwrites them (e.g., by passing a wholesale
+    // CloudSessionEntry to reg.update instead of a patch), runResume's
+    // baseline comparison breaks and the kick can return success against
+    // a stale pre-kick file. Lock this in.
+    const sub = new FakeSubstrate();
+    const h = await sub.create({
+      template: 'slicc',
+      envVars: {},
+      metadata: {},
+      autoPauseOnCap: true,
+      name: 'task-1',
+    });
+    const reg = new CloudSessionRegistry(registryPath);
+    const before = {
+      substrate: 'e2b' as const,
+      sandboxId: h.sandboxId,
+      name: 'task-1',
+      createdAt: '2026-05-22T00:00:00Z',
+      joinUrl: 'https://w/j',
+      lastSeen: '2026-05-22T00:00:00Z',
+      state: 'running' as const,
+      trayId: 'tray-original',
+      lastJoinUpdatedAt: '2026-05-22T00:00:01Z',
+    };
+    await reg.append(before);
+
+    await runPause({ substrate: sub, registryPath, query: 'task-1' });
+
+    const after = (await reg.list())[0];
+    expect(after.state).toBe('paused');
+    expect(after.trayId).toBe('tray-original');
+    expect(after.lastJoinUpdatedAt).toBe('2026-05-22T00:00:01Z');
+  });
 });
 ```
 
@@ -3768,6 +3816,50 @@ describe('slicc --cloud resume', () => {
       pollTimeoutMs: 1000,
     });
     expect(result.versionMismatch).toEqual({ running: '3.2.0', local: '3.2.2' });
+  });
+
+  it('times out if the kick returns 200 but updatedAt never advances', async () => {
+    // Critical regression guard. If runResume's poll accepts ANY readable
+    // /tmp/slicc-join.json (instead of strictly-newer updatedAt), the kick
+    // can return 200 against a webapp whose onLeaderReady never re-fired
+    // (e.g., Page.reload happened but boot is stuck) and resume falsely
+    // declares success against the stale pre-kick file.
+    const sub = new FakeSubstrate();
+    const h = await sub.create({
+      template: 'slicc',
+      envVars: {},
+      metadata: { sliccVersion: '3.2.2' },
+      autoPauseOnCap: true,
+    });
+    sub.seedFile(h.sandboxId, '/tmp/slicc-join.json', oldJoin);
+
+    const reg = new CloudSessionRegistry(registryPath);
+    await reg.append({
+      substrate: 'e2b',
+      sandboxId: h.sandboxId,
+      name: 'task-1',
+      createdAt: '2026-05-22T00:00:00Z',
+      joinUrl: 'https://w/join/old',
+      lastSeen: '2026-05-22T00:00:00Z',
+      state: 'paused',
+      trayId: 'tray-old',
+      lastJoinUpdatedAt: '2026-05-22T00:00:00Z',
+    });
+
+    // Kick returns 200 but does NOT refresh the file. The poll must time
+    // out rather than accept the stale baseline read.
+    sub.queueRun(h.sandboxId, () => ({ stdout: '200', stderr: '', exitCode: 0 }));
+
+    await expect(
+      runResume({
+        substrate: sub,
+        registryPath,
+        query: 'task-1',
+        localSliccVersion: '3.2.2',
+        pollIntervalMs: 5,
+        pollTimeoutMs: 100,
+      })
+    ).rejects.toThrow(/cloud-status did not refresh/);
   });
 });
 ```
@@ -4632,7 +4724,7 @@ Mapping each spec section to tasks:
 - **Hosted leader boot contract** → Tasks 2.1, 2.2, 2.3, 2.4, 2.5, 2.6
 - **CLI surface** → Tasks 4.1–4.9 (substrate + each subcommand + dispatch)
 - **node-server `--hosted` mode** → Tasks 3.2, 3.3, 3.4
-- **`/api/leader-restart` page-target identification + retry** → Task 3.4
+- **`/api/leader-restart` page-target identification + retry** → Task 3.4 (CdpLike fake), Task 3.4b (real `ws` transport + roundtrip test)
 - **e2b template** → Tasks 3.5, 3.6
 - **Pause/resume flow** → Tasks 4.6, 4.7
 - **`kind` plumbing + 30-day TTL** → Tasks 1.1, 1.2, 1.3, 1.4

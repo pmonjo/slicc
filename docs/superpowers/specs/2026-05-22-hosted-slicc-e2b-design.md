@@ -292,8 +292,8 @@ slicc --cloud resume <sandboxId|name>
     hosted-leader boot path runs again and posts a fresh
     /api/cloud-status.
   • Polls /tmp/slicc-join.json for a monotonic-newer updatedAt than the
-    last-seen value in ~/.slicc/cloud-sessions.json (mtime is unreliable
-    across container restore).
+    registry entry's `lastJoinUpdatedAt` field. (Container mtime is
+    unreliable across restore; the JSON's `updatedAt` is authoritative.)
   • If the webapp had to recreate the tray (shouldRecreateTray path —
     a different failure mode than reclaim, distinguished by the
     payload's trayId differing from the stored one), CLI updates the
@@ -322,11 +322,15 @@ slicc --cloud kill <sandboxId|name>
       "createdAt": "2026-05-22T12:00:00Z",
       "joinUrl": "https://www.sliccy.ai/join/<token>",
       "lastSeen": "2026-05-22T14:30:00Z",
-      "state": "running"
+      "state": "running",
+      "trayId": "f4e8...",
+      "lastJoinUpdatedAt": "2026-05-22T12:00:01Z"
     }
   ]
 }
 ```
+
+`trayId` and `lastJoinUpdatedAt` are the resume baseline: `runStart` writes them from the initial `/tmp/slicc-join.json` read; `runPause` preserves them across pause; `runResume` requires a strictly-newer `updatedAt` than `lastJoinUpdatedAt` and detects tray rebuilds via `trayId` mismatch.
 
 **Auth source resolution.** `E2B_API_KEY` from `process.env` wins; falls back to the same key parsed out of `~/.slicc/secrets.env` (with the existing `_DOMAINS=e2b.dev` annotation, required by `EnvSecretStore`). If neither source has a key, CLI errors with a friendly setup hint.
 
@@ -477,7 +481,7 @@ RESUME
    window. With the hosted-tray TTL bump (below), this works up to 30 days.
 6. LeaderTrayManager's onReconnected fires → onLeaderReady → POST
    /api/cloud-status → /tmp/slicc-join.json refreshed.
-7. CLI's resume command polls for the file's `updatedAt` to advance past the last-seen value, then prints
+7. CLI's resume command polls for the file's `updatedAt` to advance past the registry's `lastJoinUpdatedAt`, then prints
    the joinUrl (which is the same URL as before — the controller token
    didn't change).
 ```
