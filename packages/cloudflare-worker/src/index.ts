@@ -285,6 +285,36 @@ async function handleDmgDownload(): Promise<Response> {
 }
 
 async function createTray(request: Request, env: WorkerEnv): Promise<Response> {
+  let kind: 'desktop' | 'hosted' = 'desktop';
+  // Tolerate three back-compat shapes: no content-length header at all
+  // (legacy clients), content-length: 0, and an empty-string body. Only
+  // attempt JSON parse when there's actually a body to parse.
+  const rawBody = await request.text();
+  if (rawBody.trim() !== '') {
+    try {
+      const body = JSON.parse(rawBody) as { kind?: unknown };
+      if (body.kind === 'hosted' || body.kind === 'desktop') {
+        kind = body.kind;
+      } else if (body.kind !== undefined) {
+        return jsonResponse(
+          {
+            error: 'kind must be "desktop" or "hosted"',
+            code: 'INVALID_KIND',
+          },
+          400
+        );
+      }
+    } catch {
+      return jsonResponse(
+        {
+          error: 'request body must be valid JSON',
+          code: 'INVALID_BODY',
+        },
+        400
+      );
+    }
+  }
+
   const url = new URL(request.url);
   const trayId = crypto.randomUUID();
   const payload: CreateTrayRequest = {
@@ -293,6 +323,7 @@ async function createTray(request: Request, env: WorkerEnv): Promise<Response> {
     joinToken: createCapabilityToken(trayId),
     controllerToken: createCapabilityToken(trayId),
     webhookToken: createCapabilityToken(trayId),
+    kind,
   };
 
   const stub = env.TRAY_HUB.get(env.TRAY_HUB.idFromName(trayId));

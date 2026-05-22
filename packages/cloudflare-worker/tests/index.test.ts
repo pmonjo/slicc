@@ -1896,3 +1896,38 @@ describe('shared types — hosted tray', () => {
     expect(rec.kind).toBe('hosted');
   });
 });
+
+describe('POST /tray — kind plumbing', () => {
+  it('accepts an empty body and defaults kind to desktop', async () => {
+    const { env } = createTestHarness();
+    const response = await handleWorkerRequest(
+      new Request('https://www.sliccy.ai/tray', { method: 'POST' }),
+      env
+    );
+    expect(response.status).toBe(201);
+    const body = await response.json();
+    expect(body).toHaveProperty('trayId');
+  });
+
+  it('rejects malformed JSON with 400', async () => {
+    const { env } = createTestHarness();
+    const response = await handleWorkerRequest(
+      new Request('https://www.sliccy.ai/tray', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: '{not json',
+      }),
+      env
+    );
+    expect(response.status).toBe(400);
+  });
+
+  it('treats explicit empty-string body the same as no body (back-compat)', async () => {
+    const { env } = createTestHarness();
+    const response = await handleWorkerRequest(
+      new Request('https://www.sliccy.ai/tray', { method: 'POST', body: '' }),
+      env
+    );
+    expect(response.status).toBe(201);
+  });
+});
