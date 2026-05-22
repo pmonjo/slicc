@@ -2682,36 +2682,6 @@ async function mainStandaloneWorker(app: HTMLElement, runtimeMode: UiRuntimeMode
       // /api/cloud-status → laptop sees a fresh updatedAt and unblocks resume.
       await new IndexedDbLeaderTraySessionStore().clear();
 
-      // Inject pre-acquired provider credentials from secrets.env if present.
-      // The hosted sandbox can't complete OAuth flows (no human, no popup),
-      // so the laptop pastes a fresh IMS token into ~/.slicc/secrets.env and
-      // node-server exposes it via the loopback-only /api/hosted-bootstrap.
-      // Best-effort: a failure here leaves the provider unauthenticated and
-      // the user can still configure manually via the follower UI.
-      try {
-        const res = await fetch('/api/hosted-bootstrap');
-        if (res.ok) {
-          const bootstrap = (await res.json()) as { adobeImsToken?: string };
-          if (bootstrap.adobeImsToken) {
-            await saveOAuthAccount({
-              providerId: 'adobe',
-              accessToken: bootstrap.adobeImsToken,
-              // IMS tokens are typically 1-24h. We don't ship an exact expiry
-              // because the secrets.env mechanism wants a value+_DOMAINS pair
-              // per entry; defaulting to 1h is good enough for MVP (user
-              // pause/resumes with a fresh token if it ever bites them).
-              tokenExpiresAt: Date.now() + 60 * 60 * 1000,
-              userName: 'cloud-injected',
-            });
-            log.info('hosted-leader: Adobe IMS token injected from secrets.env');
-          }
-        }
-      } catch (err) {
-        log.warn('hosted-leader: bootstrap fetch failed; provider needs manual login', {
-          error: err instanceof Error ? err.message : String(err),
-        });
-      }
-
       // resolveTrayRuntimeConfig already ran earlier in mainStandaloneWorker
       // (~main.ts:1708) — by the time we reach the tray block, it has fetched
       // /api/runtime-config (which node-server's --hosted mode populates from
@@ -2748,6 +2718,36 @@ async function mainStandaloneWorker(app: HTMLElement, runtimeMode: UiRuntimeMode
         },
       });
       wireLeaderHooks(pageLeaderTray);
+
+      // Inject pre-acquired provider credentials AFTER the tray AND the first
+      // follower has had time to establish WebRTC. Writing to localStorage
+      // propagates to the kernel-worker's shim, which triggers a re-init that
+      // breaks any in-flight WebRTC peer setup → followers stuck at
+      // LEADER_CONNECTED.
+      //
+      // 5s after page boot covers the worst-case extension cold start; the
+      // user can't realistically type a message in that window, so the agent
+      // sees the Adobe account by its first lazy init.
+      void (async () => {
+        await new Promise((r) => setTimeout(r, 5000));
+        try {
+          const res = await fetch('/api/hosted-bootstrap');
+          if (!res.ok) return;
+          const bootstrap = (await res.json()) as { adobeImsToken?: string };
+          if (!bootstrap.adobeImsToken) return;
+          await saveOAuthAccount({
+            providerId: 'adobe',
+            accessToken: bootstrap.adobeImsToken,
+            tokenExpiresAt: Date.now() + 60 * 60 * 1000,
+            userName: 'cloud-injected',
+          });
+          log.info('hosted-leader: Adobe IMS token injected from secrets.env');
+        } catch (err) {
+          log.warn('hosted-leader: bootstrap fetch failed; provider needs manual login', {
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
+      })();
     } else if (storedJoinUrl) {
       pageFollowerTray = startPageFollowerTray({
         joinUrl: storedJoinUrl,
