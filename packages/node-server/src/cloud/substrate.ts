@@ -56,3 +56,11 @@ export interface SandboxSubstrate {
 export interface SubstrateFactory {
   (id: SubstrateId, cfg: SubstrateConfig): SandboxSubstrate;
 }
+
+import { createE2bSubstrate } from './substrates/e2b.js';
+
+export const createSubstrate: SubstrateFactory = (id, cfg) => {
+  if (id === 'e2b') return createE2bSubstrate(cfg);
+  // SubstrateId is currently the literal 'e2b'; this branch is unreachable today.
+  throw new Error(`unknown substrate: ${id}`);
+};
