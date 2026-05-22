@@ -152,6 +152,12 @@ export interface LeaderTrayManagerOptions {
   onReconnected?: (session: LeaderTraySession) => void;
   /** Called when reconnection fails permanently (max attempts exhausted). */
   onReconnectGaveUp?: (lastError: string, attempts: number) => void;
+  /**
+   * Called after the leader successfully connects to the tray, both on initial
+   * start() AND on every successful reconnect. Does NOT fire when start() is
+   * called on an already-active session (no transition from disconnected to connected).
+   */
+  onLeaderReady?: (session: LeaderTraySession) => void;
 }
 
 export class IndexedDbLeaderTraySessionStore implements LeaderTraySessionStore {
@@ -260,6 +266,13 @@ export class LeaderTrayManager {
         controllerId: session.controllerId,
         runtime: session.runtime,
       });
+      try {
+        this.options.onLeaderReady?.(session);
+      } catch (error) {
+        log.warn('onLeaderReady callback threw', {
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
       return session;
     } catch (error) {
       setLeaderTrayRuntimeStatus({
@@ -379,6 +392,13 @@ export class LeaderTrayManager {
         this.reconnecting = false;
         log.info('Leader reconnect successful', { attempt, trayId: session.trayId });
         this.options.onReconnected?.(session);
+        try {
+          this.options.onLeaderReady?.(session);
+        } catch (error) {
+          log.warn('onLeaderReady callback threw', {
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
         return;
       } catch (error) {
         lastError = error instanceof Error ? error.message : String(error);
