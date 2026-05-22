@@ -784,8 +784,8 @@ export class ChatPanel {
       }
     }
 
-    // Validate mime is an image type
-    if (!/^image\/[a-z0-9.+\-]+$/i.test(mime)) mime = 'image/jpeg';
+    // Validate against the app's supported image format allowlist (rejects SVG etc.)
+    if (!isSupportedImageFormat(mime)) mime = 'image/jpeg';
 
     // Sanitize name: strip control chars, cap at 200 chars
     let fileName = name || (mime === 'image/png' ? 'screenshot.png' : 'screenshot.jpg');

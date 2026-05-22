@@ -163,6 +163,18 @@ describe('ChatPanel.addImageAttachment', () => {
     expect(attachments[0].mimeType).toBe('image/jpeg');
   });
 
+  it('rejects image/svg+xml and falls back to image/jpeg', () => {
+    panel.addImageAttachment('abc123', 'icon.svg', 'image/svg+xml');
+
+    const textarea = container.querySelector('textarea')!;
+    textarea.value = 'go';
+    textarea.dispatchEvent(new Event('input'));
+    (container.querySelector('.chat__send-btn') as HTMLButtonElement).click();
+
+    const [, , attachments] = sendMessage.mock.calls[0];
+    expect(attachments[0].mimeType).toBe('image/jpeg');
+  });
+
   it('accepts valid image mime types', () => {
     panel.addImageAttachment('abc123', 'test.webp', 'image/webp');
 
