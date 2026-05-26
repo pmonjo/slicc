@@ -10,14 +10,14 @@ import type {
 import type { SandboxSummary } from '../types.js';
 
 export function createE2bSubstrate(cfg: SubstrateConfig): SandboxSubstrate {
-  // The e2b SDK reads E2B_API_KEY from env by default; set it explicitly so the
-  // CLI can run from a process with no other env mutation.
-  process.env['E2B_API_KEY'] = cfg.apiKey;
+  // Capture apiKey locally to pass explicitly to every SDK call (worker-safe).
+  const apiKey = cfg.apiKey;
 
   return {
     id: 'e2b',
     async create(opts: CreateOpts): Promise<SandboxHandle> {
       const sbx = await Sandbox.create(opts.template, {
+        apiKey,
         envs: opts.envVars,
         metadata: opts.metadata,
         ...(opts.autoPauseOnCap ? { lifecycle: { onTimeout: 'pause' } } : {}),
@@ -25,13 +25,13 @@ export function createE2bSubstrate(cfg: SubstrateConfig): SandboxSubstrate {
       return wrap(sbx);
     },
     async connect(sandboxId: string): Promise<SandboxHandle> {
-      const sbx = await Sandbox.connect(sandboxId);
+      const sbx = await Sandbox.connect(sandboxId, { apiKey });
       return wrap(sbx);
     },
     async list(): Promise<SandboxSummary[]> {
       // The e2b SDK paginator throws on nextItems() past the end — guard
       // with hasNext (the documented pattern in the SDK examples).
-      const paginator = Sandbox.list();
+      const paginator = Sandbox.list({ apiKey });
       const items: SandboxSummary[] = [];
       while (paginator.hasNext) {
         const page = await paginator.nextItems();
