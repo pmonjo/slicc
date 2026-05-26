@@ -58,7 +58,7 @@ export class CloudSessionsDurableObject {
 
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
-    return this.state.blockConcurrencyWhile(() => this.dispatch(url.pathname, request));
+    return this.dispatch(url.pathname, request);
   }
 
   private substrate(): SandboxSubstrate {
@@ -96,103 +96,154 @@ export class CloudSessionsDurableObject {
   private async startConeOp(body: StartConeBody): Promise<Response> {
     const substrate = this.substrate();
     const registry = this.registry();
-    const reconciled = await listCones(
-      { substrate, registry },
-      { metadata: { userId: body.userId } }
-    );
-    const requestedName = body.name?.trim();
-    if (requestedName && reconciled.some((c) => c.state !== 'dead' && c.name === requestedName)) {
-      return errorResponse(
-        409,
-        'NAME_TAKEN',
-        `cloud session name already exists: ${requestedName}`
+
+    // Atomic phase: reconcile, cap check, name conflict check.
+    // Fast (<1s) — fits comfortably under blockConcurrencyWhile.
+    //
+    // RACE NOTE: between this check and substrate.create() below, two concurrent
+    // /start-cone calls could both pass. With CAP_RUNNING=1 that briefly yields
+    // 2 running cones. v1 acceptable since the worker shards per-userId and a
+    // single user rarely issues two simultaneous starts; tighter reservation
+    // (pending-slot append + atomic finalize) is a future enhancement.
+    const reservation = await this.state.blockConcurrencyWhile(async () => {
+      const reconciled = await listCones(
+        { substrate, registry },
+        { metadata: { userId: body.userId } }
       );
-    }
-
-    const cap = checkCapsForRun(reconciled, this.env);
-    if (!cap.ok) {
-      return errorResponse(403, 'CAP_EXCEEDED', `at ${cap.reason} cap`, {
-        running: cap.running,
-        paused: cap.paused,
-        cap: { running: cap.runningCap, paused: cap.pausedCap },
-      });
-    }
-
-    const result = await startCone(
-      { substrate, registry },
-      {
-        envContents: [
-          `ADOBE_IMS_TOKEN=${body.bearer}`,
-          `ADOBE_IMS_TOKEN_DOMAINS=${ADOBE_TOKEN_DOMAINS}`,
-        ].join('\n'),
-        envs: {
-          ADOBE_IMS_TOKEN: body.bearer,
-          ADOBE_IMS_TOKEN_DOMAINS: ADOBE_TOKEN_DOMAINS,
-        },
-        workerBaseUrl: body.workerOrigin,
-        sliccVersion: 'web-' + new Date().toISOString().slice(0, 10),
-        name: requestedName,
-        metadata: { userId: body.userId, email: body.email },
+      const requestedName = body.name?.trim();
+      if (requestedName && reconciled.some((c) => c.state !== 'dead' && c.name === requestedName)) {
+        return {
+          error: errorResponse(
+            409,
+            'NAME_TAKEN',
+            `cloud session name already exists: ${requestedName}`
+          ),
+        };
       }
-    );
-    return okResponse({
-      sandboxId: result.sandboxId,
-      name: result.name,
-      joinUrl: result.joinUrl,
+
+      const cap = checkCapsForRun(reconciled, this.env);
+      if (!cap.ok) {
+        return {
+          error: errorResponse(403, 'CAP_EXCEEDED', `at ${cap.reason} cap`, {
+            running: cap.running,
+            paused: cap.paused,
+            cap: { running: cap.runningCap, paused: cap.pausedCap },
+          }),
+        };
+      }
+      return { error: null };
     });
+
+    if (reservation.error) return reservation.error;
+
+    // Slow phase: NOT under lock. ~15-25s.
+    try {
+      const result = await startCone(
+        { substrate, registry },
+        {
+          envContents: [
+            `ADOBE_IMS_TOKEN=${body.bearer}`,
+            `ADOBE_IMS_TOKEN_DOMAINS=${ADOBE_TOKEN_DOMAINS}`,
+          ].join('\n'),
+          envs: {
+            ADOBE_IMS_TOKEN: body.bearer,
+            ADOBE_IMS_TOKEN_DOMAINS: ADOBE_TOKEN_DOMAINS,
+          },
+          workerBaseUrl: body.workerOrigin,
+          sliccVersion: 'web-' + new Date().toISOString().slice(0, 10),
+          name: body.name?.trim(),
+          metadata: { userId: body.userId, email: body.email },
+        }
+      );
+      return okResponse({
+        sandboxId: result.sandboxId,
+        name: result.name,
+        joinUrl: result.joinUrl,
+      });
+    } catch (err) {
+      if (isCloudError(err)) {
+        return errorResponse(errCodeToStatus(err.code), err.code, err.message, err.details);
+      }
+      return errorResponse(500, 'INTERNAL', err instanceof Error ? err.message : String(err));
+    }
   }
 
   private async resumeConeOp(body: ResumeConeBody): Promise<Response> {
-    const substrate = this.substrate();
-    const registry = this.registry();
-    const all = await listCones({ substrate, registry }, { metadata: { userId: body.userId } });
-    const others = all.filter((c) => c.sandboxId !== body.sandboxId);
-    const cap = checkCapsForRun(others, this.env);
-    if (!cap.ok) {
-      return errorResponse(403, 'CAP_EXCEEDED', 'resuming would exceed running cap', {
-        running: cap.running,
-        cap: { running: cap.runningCap, paused: cap.pausedCap },
-      });
-    }
-    const result = await resumeCone(
-      { substrate, registry },
-      {
-        query: body.sandboxId,
-        localSliccVersion: body.localSliccVersion,
-        refreshSecretsContents: [
-          `ADOBE_IMS_TOKEN=${body.bearer}`,
-          `ADOBE_IMS_TOKEN_DOMAINS=${ADOBE_TOKEN_DOMAINS}`,
-        ].join('\n'),
+    return this.state.blockConcurrencyWhile(async () => {
+      const substrate = this.substrate();
+      const registry = this.registry();
+      const all = await listCones({ substrate, registry }, { metadata: { userId: body.userId } });
+      const others = all.filter((c) => c.sandboxId !== body.sandboxId);
+      const cap = checkCapsForRun(others, this.env);
+      if (!cap.ok) {
+        return errorResponse(403, 'CAP_EXCEEDED', 'resuming would exceed running cap', {
+          running: cap.running,
+          cap: { running: cap.runningCap, paused: cap.pausedCap },
+        });
       }
-    );
-    return okResponse({
-      sandboxId: result.sandboxId,
-      joinUrl: result.joinUrl,
-      trayRebuilt: result.trayRebuilt,
+      const result = await resumeCone(
+        { substrate, registry },
+        {
+          query: body.sandboxId,
+          localSliccVersion: body.localSliccVersion,
+          refreshSecretsContents: [
+            `ADOBE_IMS_TOKEN=${body.bearer}`,
+            `ADOBE_IMS_TOKEN_DOMAINS=${ADOBE_TOKEN_DOMAINS}`,
+          ].join('\n'),
+        }
+      );
+      return okResponse({
+        sandboxId: result.sandboxId,
+        joinUrl: result.joinUrl,
+        trayRebuilt: result.trayRebuilt,
+      });
     });
   }
 
   private async pauseConeOp(body: SimpleSandboxBody): Promise<Response> {
-    await pauseCone({ substrate: this.substrate(), registry: this.registry() }, body.sandboxId);
-    return okResponse();
+    return this.state.blockConcurrencyWhile(async () => {
+      try {
+        await pauseCone({ substrate: this.substrate(), registry: this.registry() }, body.sandboxId);
+        return okResponse();
+      } catch (err) {
+        if (isCloudError(err)) {
+          return errorResponse(errCodeToStatus(err.code), err.code, err.message, err.details);
+        }
+        return errorResponse(500, 'INTERNAL', err instanceof Error ? err.message : String(err));
+      }
+    });
   }
 
   private async killConeOp(body: SimpleSandboxBody): Promise<Response> {
-    try {
-      await killCone({ substrate: this.substrate(), registry: this.registry() }, body.sandboxId);
-    } catch (err) {
-      if (isCloudError(err) && err.code === 'NOT_FOUND') return okResponse();
-      throw err;
-    }
-    return okResponse();
+    return this.state.blockConcurrencyWhile(async () => {
+      try {
+        await killCone({ substrate: this.substrate(), registry: this.registry() }, body.sandboxId);
+        return okResponse();
+      } catch (err) {
+        if (isCloudError(err) && err.code === 'NOT_FOUND') return okResponse();
+        if (isCloudError(err)) {
+          return errorResponse(errCodeToStatus(err.code), err.code, err.message, err.details);
+        }
+        return errorResponse(500, 'INTERNAL', err instanceof Error ? err.message : String(err));
+      }
+    });
   }
 
   private async listConesOp(body: ListConesBody): Promise<Response> {
-    const cones = await listCones(
-      { substrate: this.substrate(), registry: this.registry() },
-      { metadata: { userId: body.userId } }
-    );
-    return okResponse({ cones });
+    return this.state.blockConcurrencyWhile(async () => {
+      try {
+        const cones = await listCones(
+          { substrate: this.substrate(), registry: this.registry() },
+          { metadata: { userId: body.userId } }
+        );
+        return okResponse({ cones });
+      } catch (err) {
+        if (isCloudError(err)) {
+          return errorResponse(errCodeToStatus(err.code), err.code, err.message, err.details);
+        }
+        return errorResponse(500, 'INTERNAL', err instanceof Error ? err.message : String(err));
+      }
+    });
   }
 }
 

@@ -69,16 +69,37 @@ export async function listCones(
   // Pass 2: any substrate entries not in registry → recover.
   for (const summary of liveById.values()) {
     const now = new Date().toISOString();
+
+    // Try to read the real joinUrl from the sandbox. Orphans created before this
+    // fix won't have it in metadata, but we can read /tmp/slicc-join.json directly.
+    let joinUrl = summary.metadata?.['joinUrl'] ?? '';
+    let trayId = summary.metadata?.['trayId'];
+    let lastJoinUpdatedAt = summary.metadata?.['lastJoinUpdatedAt'];
+
+    if (!joinUrl) {
+      try {
+        const handle = await deps.substrate.connect(summary.sandboxId);
+        const joinData = await handle.readFile('/tmp/slicc-join.json');
+        const parsed = JSON.parse(joinData);
+        joinUrl = parsed.joinUrl ?? '';
+        trayId = trayId ?? parsed.trayId;
+        lastJoinUpdatedAt = lastJoinUpdatedAt ?? parsed.updatedAt;
+      } catch (err) {
+        // File not readable (sandbox paused/dead, or file doesn't exist).
+        // Leave joinUrl empty — UI will handle gracefully.
+      }
+    }
+
     const recovered: ConeEntry = {
       sandboxId: summary.sandboxId,
       substrate: 'e2b',
       name: summary.metadata?.['name'] ?? summary.name,
       createdAt: summary.metadata?.['createdAt'] ?? now,
-      joinUrl: summary.metadata?.['joinUrl'] ?? `https://w/join/${summary.sandboxId}`,
+      joinUrl,
       lastSeen: now,
       state: summary.state,
-      trayId: summary.metadata?.['trayId'],
-      lastJoinUpdatedAt: summary.metadata?.['lastJoinUpdatedAt'],
+      trayId,
+      lastJoinUpdatedAt,
     };
     await deps.registry.append(recovered);
     reconciled.push(recovered);

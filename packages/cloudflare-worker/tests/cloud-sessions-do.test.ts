@@ -247,4 +247,30 @@ describe('CloudSessionsDurableObject — lifecycle endpoints', () => {
     const res = await call(do_, '/kill-cone', { sandboxId: 'never-existed' });
     expect(res.status).toBe(200);
   });
+
+  it('start-cone does not timeout even when substrate.create is slow', async () => {
+    const substrate = new FakeSubstrate();
+    // Override create to simulate slow substrate.create (but not so slow it actually times out the test).
+    const originalCreate = substrate.create.bind(substrate);
+    substrate.create = async (opts: CreateOpts) => {
+      await new Promise((r) => setTimeout(r, 150)); // Simulate ~150ms delay
+      return originalCreate(opts);
+    };
+
+    const { state } = makeFakeState();
+    const do_ = new CloudSessionsDurableObject(state as any, makeDoEnv(substrate));
+
+    const res = await call(do_, '/start-cone', {
+      bearer: 'b',
+      userId: 'u1',
+      email: 'k@adobe.com',
+      workerOrigin: 'https://w',
+      name: 'slow-start',
+    });
+
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { sandboxId: string; joinUrl: string };
+    expect(body.sandboxId).toMatch(/^sbx-/);
+    expect(body.joinUrl).toMatch(/^https:\/\//);
+  });
 });

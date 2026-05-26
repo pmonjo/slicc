@@ -134,4 +134,65 @@ describe('listCones', () => {
     expect(recovered?.trayId).toBe('tray-123');
     expect(recovered?.lastJoinUpdatedAt).toBe('2026-01-02T00:00:00Z');
   });
+
+  it('falls back to reading /tmp/slicc-join.json when metadata lacks joinUrl', async () => {
+    const registry = new MemRegistry();
+    const substrate = makeFakeSubstrate({
+      listResult: [
+        {
+          sandboxId: 's-orphan-no-metadata',
+          state: 'running',
+          metadata: { name: 'orphan-fallback' },
+        },
+      ],
+      // The default handle will return joinUrl from /tmp/slicc-join.json
+      handle: {
+        sandboxId: 's-orphan-no-metadata',
+        substrate: 'e2b' as const,
+        pause: async () => {},
+        kill: async () => {},
+        getInfo: async () => ({
+          sandboxId: 's-orphan-no-metadata',
+          state: 'running' as const,
+          metadata: {},
+          createdAt: new Date().toISOString(),
+        }),
+        writeFile: async () => {},
+        readFile: async (path: string) => {
+          if (path === '/tmp/slicc-join.json') {
+            return JSON.stringify({
+              joinUrl: 'https://recovered/join/url',
+              trayId: 'tray-recovered',
+              updatedAt: '2026-05-27T00:00:00Z',
+            });
+          }
+          throw new Error(`ENOENT ${path}`);
+        },
+        run: async () => ({ stdout: '', stderr: '', exitCode: 0 }),
+      },
+    });
+    const result = await listCones({ substrate, registry });
+    const recovered = result.find((c) => c.sandboxId === 's-orphan-no-metadata');
+    expect(recovered?.joinUrl).toBe('https://recovered/join/url');
+    expect(recovered?.trayId).toBe('tray-recovered');
+    expect(recovered?.lastJoinUpdatedAt).toBe('2026-05-27T00:00:00Z');
+  });
+
+  it('gracefully handles orphans where /tmp/slicc-join.json is unreadable', async () => {
+    const registry = new MemRegistry();
+    const substrate = makeFakeSubstrate({
+      listResult: [
+        {
+          sandboxId: 's-orphan-unreadable',
+          state: 'paused',
+          metadata: { name: 'paused-orphan' },
+        },
+      ],
+      connectError: new Error('sandbox paused, cannot connect'),
+    });
+    const result = await listCones({ substrate, registry });
+    const recovered = result.find((c) => c.sandboxId === 's-orphan-unreadable');
+    expect(recovered?.joinUrl).toBe('');
+    expect(recovered?.state).toBe('paused');
+  });
 });
