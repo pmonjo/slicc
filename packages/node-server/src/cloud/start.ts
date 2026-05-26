@@ -1,6 +1,6 @@
 import { promises as fs } from 'node:fs';
 import type { ConeEntry, StartResult, CloudStatus } from '@slicc/cloud-core';
-import { CloudError, filterSecretsEnv } from '@slicc/cloud-core';
+import { CloudError, filterSecretsEnv, pollCloudStatus } from '@slicc/cloud-core';
 import { CloudSessionRegistry } from './registry.js';
 import type { SandboxHandle, SandboxSubstrate } from './substrate.js';
 
@@ -33,31 +33,6 @@ async function tailStderr(handle: SandboxHandle, n: number): Promise<string> {
     }
     return `(failed to read /tmp/slicc-stderr.log: ${msg})`;
   }
-}
-
-async function pollCloudStatus(
-  handle: SandboxHandle,
-  opts: { timeoutMs: number; intervalMs: number }
-): Promise<CloudStatus> {
-  const start = Date.now();
-  let lastError: unknown = null;
-  while (Date.now() - start < opts.timeoutMs) {
-    try {
-      const raw = await handle.readFile('/tmp/slicc-join.json');
-      const parsed = JSON.parse(raw) as CloudStatus;
-      if (parsed.joinUrl) return parsed;
-    } catch (err) {
-      lastError = err;
-    }
-    await new Promise((r) => setTimeout(r, opts.intervalMs));
-  }
-  const errSuffix = lastError
-    ? ` (last error: ${lastError instanceof Error ? lastError.message : String(lastError)})`
-    : ' (file never appeared)';
-  throw new CloudError(
-    'SANDBOX_NOT_READY',
-    `cloud-status did not appear within ${opts.timeoutMs}ms; sandbox may have failed to boot${errSuffix}`
-  );
 }
 
 export async function runStart(opts: RunStartOpts): Promise<StartResult> {
