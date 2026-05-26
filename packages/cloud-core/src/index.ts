@@ -13,3 +13,5 @@ export { startCone } from './operations/start.js';
 export type { StartConeOpts, StartConeDeps } from './operations/start.js';
 export { listCones } from './operations/list.js';
 export type { ListConesDeps, ListConesOpts } from './operations/list.js';
+export { pauseCone } from './operations/pause.js';
+export type { PauseConeDeps } from './operations/pause.js';
