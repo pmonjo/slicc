@@ -1,40 +1,10 @@
 import { describe, it, expect } from 'vitest';
 import { resumeCone } from '../src/operations/resume.js';
-import type {
-  ConeEntry,
-  Registry,
-  SandboxSubstrate,
-  SandboxHandle,
-  RunResult,
-  SubstrateId,
-  CreateOpts,
-} from '../src/index.js';
+import type { SubstrateId, SandboxHandle, RunResult } from '../src/index.js';
+import { MemRegistry, makeFakeHandle, makeFakeSubstrate } from './fixtures/index.js';
 
-class MemRegistry implements Registry {
-  entries: ConeEntry[] = [];
-  async list() {
-    return [...this.entries];
-  }
-  async findByNameOrId(q: string) {
-    return this.entries.find((e) => e.sandboxId === q || e.name === q) ?? null;
-  }
-  async append(e: ConeEntry) {
-    const i = this.entries.findIndex((x) => x.sandboxId === e.sandboxId);
-    if (i >= 0) this.entries[i] = { ...this.entries[i]!, ...e };
-    else this.entries.push(e);
-  }
-  async update(id: string, patch: Partial<ConeEntry>) {
-    const i = this.entries.findIndex((e) => e.sandboxId === id);
-    if (i < 0) throw new Error(`entry not found: ${id}`);
-    this.entries[i] = { ...this.entries[i]!, ...patch };
-  }
-  async remove(id: string) {
-    this.entries = this.entries.filter((e) => e.sandboxId !== id);
-  }
-}
-
-// Mocked handle that lets tests control behavior.
-function makeHandle(overrides: {
+// Specialized handle for resume tests: configurable joinJson and kick behavior.
+function makeResumeTestHandle(overrides: {
   joinJson?: string;
   kickStatus?: string;
   kickExitCode?: number;
@@ -46,7 +16,12 @@ function makeHandle(overrides: {
     substrate: 'e2b' as SubstrateId,
     pause: async () => {},
     kill: async () => {},
-    getInfo: async () => ({ sandboxId: 'sbx-1', state: 'running', metadata: {}, createdAt: '' }),
+    getInfo: async () => ({
+      sandboxId: 'sbx-1',
+      state: 'running' as const,
+      metadata: {},
+      createdAt: '',
+    }),
     writeFile: async (path: string, contents: string | Uint8Array) => {
       writes.push({ path, contents });
     },
@@ -72,21 +47,6 @@ function makeHandle(overrides: {
   };
 }
 
-function fakeSubstrate(handle: SandboxHandle): SandboxSubstrate {
-  return {
-    id: 'e2b',
-    async create(_opts: CreateOpts) {
-      throw new Error('not used');
-    },
-    async connect(_id: string) {
-      return handle;
-    },
-    async list() {
-      return [];
-    },
-  };
-}
-
 describe('resumeCone', () => {
   it('resumes a paused cone and updates registry with refreshed joinUrl', async () => {
     const registry = new MemRegistry();
@@ -100,7 +60,9 @@ describe('resumeCone', () => {
       trayId: 't-old',
       lastJoinUpdatedAt: '2026-05-01T00:00:00.000Z',
     });
-    const substrate = fakeSubstrate(makeHandle({}));
+    const substrate = makeFakeSubstrate({
+      handle: makeResumeTestHandle({}),
+    });
     const result = await resumeCone(
       { substrate, registry },
       {
@@ -117,7 +79,9 @@ describe('resumeCone', () => {
 
   it('throws NOT_FOUND when query does not match', async () => {
     const registry = new MemRegistry();
-    const substrate = fakeSubstrate(makeHandle({}));
+    const substrate = makeFakeSubstrate({
+      handle: makeResumeTestHandle({}),
+    });
     await expect(
       resumeCone({ substrate, registry }, { query: 'missing', localSliccVersion: 'test' })
     ).rejects.toMatchObject({ name: 'CloudError', code: 'NOT_FOUND' });
@@ -133,7 +97,9 @@ describe('resumeCone', () => {
       lastSeen: '',
       state: 'running',
     });
-    const substrate = fakeSubstrate(makeHandle({}));
+    const substrate = makeFakeSubstrate({
+      handle: makeResumeTestHandle({}),
+    });
     await expect(
       resumeCone({ substrate, registry }, { query: 'sbx-1', localSliccVersion: 'test' })
     ).rejects.toMatchObject({ name: 'CloudError', code: 'ALREADY_RUNNING' });
@@ -150,8 +116,8 @@ describe('resumeCone', () => {
       state: 'paused',
     });
     const writes: Array<{ path: string; contents: string | Uint8Array }> = [];
-    const handle = makeHandle({ writes });
-    const substrate = fakeSubstrate(handle);
+    const handle = makeResumeTestHandle({ writes });
+    const substrate = makeFakeSubstrate({ handle });
     await resumeCone(
       { substrate, registry },
       {
@@ -176,7 +142,9 @@ describe('resumeCone', () => {
       lastSeen: '',
       state: 'paused',
     });
-    const substrate = fakeSubstrate(makeHandle({ kickStatus: '418' }));
+    const substrate = makeFakeSubstrate({
+      handle: makeResumeTestHandle({ kickStatus: '418' }),
+    });
     await expect(
       resumeCone({ substrate, registry }, { query: 'sbx-1', localSliccVersion: 'test' })
     ).rejects.toMatchObject({ name: 'CloudError', code: 'LEADER_NOT_READY' });
@@ -193,16 +161,16 @@ describe('resumeCone', () => {
       state: 'paused',
       lastJoinUpdatedAt: '2026-05-01T00:00:00.000Z',
     });
-    const substrate = fakeSubstrate(
-      makeHandle({
+    const substrate = makeFakeSubstrate({
+      handle: makeResumeTestHandle({
         joinJson: JSON.stringify({
           joinUrl: 'https://w/join/new',
           trayId: 't-new',
           updatedAt: new Date().toISOString(),
           sliccVersion: 'v1.2.3',
         }),
-      })
-    );
+      }),
+    });
     const result = await resumeCone(
       { substrate, registry },
       {
@@ -225,7 +193,9 @@ describe('resumeCone', () => {
       lastJoinUpdatedAt: '2026-05-01T00:00:00.000Z',
       // No trayId in baseline
     });
-    const substrate = fakeSubstrate(makeHandle({}));
+    const substrate = makeFakeSubstrate({
+      handle: makeResumeTestHandle({}),
+    });
     const result = await resumeCone(
       { substrate, registry },
       {

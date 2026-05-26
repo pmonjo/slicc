@@ -1,63 +1,10 @@
 import { describe, it, expect } from 'vitest';
 import { pauseCone, CloudError } from '../src/index.js';
-import type {
-  ConeEntry,
-  Registry,
-  SandboxSubstrate,
-  SandboxHandle,
-  SubstrateId,
-  CreateOpts,
-  SandboxInfo,
-  RunResult,
-} from '../src/index.js';
+import type { SubstrateId, SandboxInfo, RunResult, SandboxHandle } from '../src/index.js';
+import { MemRegistry, makeFakeHandle, makeFakeSubstrate } from './fixtures/index.js';
 
-class MemRegistry implements Registry {
-  entries: ConeEntry[] = [];
-
-  async list(): Promise<ConeEntry[]> {
-    return [...this.entries];
-  }
-
-  async findByNameOrId(q: string): Promise<ConeEntry | null> {
-    return this.entries.find((e) => e.sandboxId === q || e.name === q) ?? null;
-  }
-
-  async append(e: ConeEntry): Promise<void> {
-    const i = this.entries.findIndex((x) => x.sandboxId === e.sandboxId);
-    if (i >= 0) {
-      this.entries[i] = { ...this.entries[i]!, ...e };
-    } else {
-      this.entries.push(e);
-    }
-  }
-
-  async update(id: string, patch: Partial<ConeEntry>): Promise<void> {
-    const i = this.entries.findIndex((e) => e.sandboxId === id);
-    if (i < 0) throw new Error(`entry not found: ${id}`);
-    this.entries[i] = { ...this.entries[i]!, ...patch };
-  }
-
-  async remove(id: string): Promise<void> {
-    this.entries = this.entries.filter((e) => e.sandboxId !== id);
-  }
-}
-
-function fakeSubstrateWith(handle: SandboxHandle): SandboxSubstrate {
-  return {
-    id: 'e2b',
-    async create(_opts: CreateOpts) {
-      throw new Error('not used in pause test');
-    },
-    async connect(_id: string) {
-      return handle;
-    },
-    async list() {
-      return [];
-    },
-  };
-}
-
-function makeHandle(id: string, paused = { value: false }): SandboxHandle {
+// Specialized handle for pause tests: tracks paused state separately and reflects in getInfo.
+function makePauseTestHandle(id: string, paused = { value: false }): SandboxHandle {
   return {
     sandboxId: id,
     substrate: 'e2b' as SubstrateId,
@@ -67,12 +14,15 @@ function makeHandle(id: string, paused = { value: false }): SandboxHandle {
     kill: async () => {
       // noop
     },
-    getInfo: async (): Promise<SandboxInfo> => ({
-      sandboxId: id,
-      state: paused.value ? 'paused' : 'running',
-      metadata: {},
-      createdAt: new Date().toISOString(),
-    }),
+    getInfo: async (): Promise<SandboxInfo> => {
+      const state: 'running' | 'paused' = paused.value ? 'paused' : 'running';
+      return {
+        sandboxId: id,
+        state,
+        metadata: {},
+        createdAt: new Date().toISOString(),
+      };
+    },
     writeFile: async () => {
       // noop
     },
@@ -98,7 +48,9 @@ describe('pauseCone', () => {
     });
 
     const pausedFlag = { value: false };
-    const substrate = fakeSubstrateWith(makeHandle('s-1', pausedFlag));
+    const substrate = makeFakeSubstrate({
+      handle: makePauseTestHandle('s-1', pausedFlag),
+    });
 
     await pauseCone({ substrate, registry }, 's-1');
 
@@ -110,7 +62,9 @@ describe('pauseCone', () => {
 
   it('throws NOT_FOUND when query does not match', async () => {
     const registry = new MemRegistry();
-    const substrate = fakeSubstrateWith(makeHandle('s-x'));
+    const substrate = makeFakeSubstrate({
+      handle: makePauseTestHandle('s-x'),
+    });
 
     await expect(pauseCone({ substrate, registry }, 'missing')).rejects.toThrow();
     let thrownErr: Error | undefined;
@@ -136,7 +90,9 @@ describe('pauseCone', () => {
       joinUrl: 'https://example.com/join',
     });
 
-    const substrate = fakeSubstrateWith(makeHandle('s-2'));
+    const substrate = makeFakeSubstrate({
+      handle: makePauseTestHandle('s-2'),
+    });
 
     let thrownErr: Error | undefined;
     try {
@@ -166,7 +122,9 @@ describe('pauseCone', () => {
       lastJoinUpdatedAt: originalLastJoinUpdatedAt,
     });
 
-    const substrate = fakeSubstrateWith(makeHandle('s-3'));
+    const substrate = makeFakeSubstrate({
+      handle: makePauseTestHandle('s-3'),
+    });
     await pauseCone({ substrate, registry }, 's-3');
 
     const entry = await registry.findByNameOrId('s-3');
@@ -187,7 +145,9 @@ describe('pauseCone', () => {
     });
 
     const pausedFlag = { value: false };
-    const substrate = fakeSubstrateWith(makeHandle('s-4', pausedFlag));
+    const substrate = makeFakeSubstrate({
+      handle: makePauseTestHandle('s-4', pausedFlag),
+    });
 
     await pauseCone({ substrate, registry }, 'my-session');
 

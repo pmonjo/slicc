@@ -1,42 +1,16 @@
 import { describe, it, expect } from 'vitest';
 import { startCone } from '../src/operations/start.js';
-import type { ConeEntry, Registry } from '../src/index.js';
 import type {
   CreateOpts,
   SandboxHandle,
   SandboxSubstrate,
   SubstrateId,
-  SandboxInfo,
-  RunResult,
   SandboxSummary,
 } from '../src/index.js';
+import { MemRegistry, makeFakeHandle } from './fixtures/index.js';
 
-// Minimal in-memory Registry for tests.
-class MemRegistry implements Registry {
-  private entries: ConeEntry[] = [];
-  async list() {
-    return [...this.entries];
-  }
-  async findByNameOrId(q: string) {
-    return this.entries.find((e) => e.sandboxId === q || e.name === q) ?? null;
-  }
-  async append(e: ConeEntry) {
-    const i = this.entries.findIndex((x) => x.sandboxId === e.sandboxId);
-    if (i >= 0) this.entries[i] = { ...this.entries[i]!, ...e };
-    else this.entries.push(e);
-  }
-  async update(id: string, patch: Partial<ConeEntry>) {
-    const i = this.entries.findIndex((e) => e.sandboxId === id);
-    if (i < 0) throw new Error(`entry not found: ${id}`);
-    this.entries[i] = { ...this.entries[i]!, ...patch };
-  }
-  async remove(id: string) {
-    this.entries = this.entries.filter((e) => e.sandboxId !== id);
-  }
-}
-
-// Minimal in-test substrate. (FakeSubstrate moves into cloud-core in A14.)
-function makeFakeSubstrate(opts: { joinJson: string }): SandboxSubstrate {
+// Specialized for startCone: handle stores files per-create, tracks kill state for list result.
+function makeStartTestSubstrate(opts: { joinJson: string }): SandboxSubstrate {
   const files = new Map<string, string>();
   let killed = false;
 
@@ -44,39 +18,25 @@ function makeFakeSubstrate(opts: { joinJson: string }): SandboxSubstrate {
     id: 'e2b' as SubstrateId,
     async create(_opts: CreateOpts): Promise<SandboxHandle> {
       const sandboxId = 'sbx-fake';
-      // Pre-seed the join.json for happy-path tests
       files.set('/tmp/slicc-join.json', opts.joinJson);
 
+      const handle = makeFakeHandle({ sandboxId });
       return {
-        sandboxId,
-        substrate: 'e2b' as SubstrateId,
-        pause: async () => {},
+        sandboxId: handle.sandboxId,
+        substrate: handle.substrate,
+        pause: handle.pause,
         kill: async () => {
           killed = true;
         },
-        getInfo: async (): Promise<SandboxInfo> => ({
-          sandboxId,
-          state: 'running',
-          metadata: {},
-          createdAt: new Date().toISOString(),
-        }),
-        writeFile: async (path: string, contents: string | Uint8Array) => {
-          files.set(
-            path,
-            typeof contents === 'string' ? contents : new TextDecoder().decode(contents)
-          );
-        },
+        getInfo: handle.getInfo,
+        writeFile: handle.writeFile,
         readFile: async (path: string) => {
           const content = files.get(path);
           if (!content) throw new Error(`ENOENT ${path}`);
           return content;
         },
-        run: async (_cmd: string): Promise<RunResult> => ({
-          stdout: '',
-          stderr: '',
-          exitCode: 0,
-        }),
-      };
+        run: handle.run,
+      } as SandboxHandle;
     },
     async connect() {
       throw new Error('not used in startCone tests');
@@ -96,7 +56,7 @@ function makeFakeSubstrate(opts: { joinJson: string }): SandboxSubstrate {
 
 describe('startCone', () => {
   it('creates a sandbox, polls join.json, appends to registry, returns StartResult', async () => {
-    const substrate = makeFakeSubstrate({
+    const substrate = makeStartTestSubstrate({
       joinJson: JSON.stringify({
         joinUrl: 'https://w/join/x',
         trayId: 't-1',
@@ -127,7 +87,7 @@ describe('startCone', () => {
   });
 
   it('throws SANDBOX_NOT_READY when pollCloudStatus times out', async () => {
-    const substrate = makeFakeSubstrate({ joinJson: '{}' }); // no joinUrl → poll never returns
+    const substrate = makeStartTestSubstrate({ joinJson: '{}' }); // no joinUrl → poll never returns
     const registry = new MemRegistry();
     await expect(
       startCone(
@@ -158,30 +118,21 @@ describe('startCone', () => {
     const substrate: SandboxSubstrate = {
       id: 'e2b' as SubstrateId,
       async create(_opts: CreateOpts): Promise<SandboxHandle> {
+        const handle = makeFakeHandle({ sandboxId: 'sbx-err' });
         return {
-          sandboxId: 'sbx-err',
-          substrate: 'e2b' as SubstrateId,
-          pause: async () => {},
-          kill: async () => {},
-          getInfo: async (): Promise<SandboxInfo> => ({
-            sandboxId: 'sbx-err',
-            state: 'running',
-            metadata: {},
-            createdAt: new Date().toISOString(),
-          }),
-          writeFile: async (path: string, contents: string | Uint8Array) => {
-            files.set(
-              path,
-              typeof contents === 'string' ? contents : new TextDecoder().decode(contents)
-            );
-          },
+          sandboxId: handle.sandboxId,
+          substrate: handle.substrate,
+          pause: handle.pause,
+          kill: handle.kill,
+          getInfo: handle.getInfo,
+          writeFile: handle.writeFile,
           readFile: async (path: string) => {
             const content = files.get(path);
             if (!content) throw new Error(`ENOENT ${path}`);
             return content;
           },
-          run: async (): Promise<RunResult> => ({ stdout: '', stderr: '', exitCode: 0 }),
-        };
+          run: handle.run,
+        } as SandboxHandle;
       },
       async connect() {
         throw new Error('not used');
