@@ -496,66 +496,80 @@ git commit -m "feat(cloud/resume): refresh /slicc/secrets.env on resume so pause
 
 ---
 
-### Task B7: Drop the CLI's redundant files.write on start
+### Task B7: Confirm and document the two-layer secrets bootstrap
 
 **Files:**
 
-- Modify: `packages/cloud-core/src/operations/start.ts`
+- Modify: `packages/cloud-core/src/operations/start.ts` — add comments only; do NOT remove the files.write
+- Modify: `packages/dev-tools/e2b-template/start.sh` — make the env-var-derived file an additive boot, not a replacement
 
-- [ ] **Step 1: Verify the new template is live**
+**Why the original B7 was wrong:** the laptop CLI's secrets.env contains MORE than just `ADOBE_IMS_TOKEN` — it carries the user's full set of secrets (S3 keys, GitHub PATs, OAuth-replica tokens, …). The env-var path only bootstraps `ADOBE_IMS_TOKEN` for race-free Adobe login; the agent still needs everything else. Dropping `handle.writeFile('/slicc/secrets.env', safeSecrets)` would silently regress CLI behavior — the agent inside the cone would lose access to every non-Adobe secret.
 
-Confirm the new template is in production (Task B2 already published it, but if you've been iterating in dev only, push again with the latest dist/):
+**The right shape (two layers, both contribute):**
 
-```bash
-e2b template list
-# expect: slicc, with a recent buildId
+1. **start.sh env-var bootstrap** (race-free): writes `/slicc/secrets.env` with `ADOBE_IMS_TOKEN` ONLY if the env is set. Runs before node-server boots; primarily benefits the worker (Plan D), which only has the IMS bearer to inject.
+
+2. **`handle.writeFile` after `Sandbox.create`** (full payload): CLI's `runStart` continues to upload the full filtered secrets.env via `handle.writeFile('/slicc/secrets.env', safeSecrets)`. This OVERWRITES the env-bootstrapped file, but does so before the 5s page-side bootstrap fetch, so the page sees the complete picture. Worker doesn't do this step — it doesn't have a full secrets.env to upload.
+
+- [ ] **Step 1: Update start.sh to not clobber a pre-existing file**
+
+Already done in Task B1 — the script writes only if the file doesn't exist:
+
+```sh
+if [ -n "$ADOBE_IMS_TOKEN" ] && [ ! -f /slicc/secrets.env ]; then
+  cat > /slicc/secrets.env <<EOF
+…
+EOF
+fi
 ```
 
-- [ ] **Step 2: Remove the redundant write in startCone**
+Confirm this is the current state. If the file is later overwritten by the CLI's `handle.writeFile`, that's correct: the full payload wins.
 
-In `packages/cloud-core/src/operations/start.ts`, remove the `handle.writeFile('/slicc/secrets.env', safeSecrets)` line that was kept as backwards-compat in Plan A. Add a comment explaining why:
+- [ ] **Step 2: Document the two-layer model in startCone**
+
+In `packages/cloud-core/src/operations/start.ts`, KEEP the `handle.writeFile('/slicc/secrets.env', safeSecrets)` line and add a comment:
 
 ```ts
-// Note: We used to also call handle.writeFile('/slicc/secrets.env', safeSecrets)
-// here as belt-and-suspenders, but with start.sh writing the file from
-// env vars BEFORE node-server boots (Plan B template change), the file
-// write was racy/redundant. envContents is still passed for callers that
-// want to filter/inspect it, and the user's full secrets.env continues
-// to be exposed inside the sandbox via /api/hosted-bootstrap reading from
-// the env-var-derived file.
+// Two-layer secrets bootstrap:
+//   1) start.sh writes secrets.env from ADOBE_IMS_TOKEN env var BEFORE node-server
+//      boots (eliminates the 5s page-side race for the Adobe login).
+//   2) AFTER Sandbox.create returns (sandbox booted + leader registered), we
+//      overwrite the file with the full filtered envContents — the CLI's user
+//      may have S3 keys, GitHub PATs, etc. that the agent needs. This second
+//      write lands before the agent's first LLM call, so the user-shell
+//      surface sees everything by the time it's used.
+// Worker (Plan D) only needs layer 1; it has nothing else to upload.
+await handle.writeFile('/slicc/secrets.env', safeSecrets);
 ```
 
-Update the comment near the call site of `extractAdobeBootstrap` in node-server's `runStart` to remove any "and we also upload as a file" claims.
+- [ ] **Step 3: Live test — verify both Adobe + non-Adobe secrets are present**
 
-- [ ] **Step 3: Verify**
+Manual smoke. Add a sentinel secret to `~/.slicc/secrets.env`:
 
-```bash
-npx vitest run
-npm run typecheck
+```
+SENTINEL_GITHUB_PAT=ghp_test_sentinel_value
+SENTINEL_GITHUB_PAT_DOMAINS=api.github.com
 ```
 
-- [ ] **Step 4: Live test**
-
-```bash
-SLICC_TEST_E2B_API_KEY="$E2B_API_KEY" \
-  npx vitest run --project node-server packages/node-server/tests/cloud-live.test.ts
-```
-
-Expected: 1 passed. The full cycle (create/pause/resume/kill) still works without the file upload.
-
-- [ ] **Step 5: Manual smoke**
+Then:
 
 ```bash
 node dist/node-server/index.js --cloud start --name smoke-B7
-# open the joinUrl, chat - Adobe should still be configured
+# get sandboxId from output, then inside:
+e2b sandbox connect <sandboxId>
+cat /slicc/secrets.env | grep -E 'ADOBE_IMS_TOKEN|SENTINEL_GITHUB_PAT' | wc -l
+# expect: 4 (each key + each _DOMAINS line)
+exit
 node dist/node-server/index.js --cloud kill smoke-B7
 ```
 
-- [ ] **Step 6: Commit**
+Both layers landed: `ADOBE_IMS_TOKEN` from env-bootstrap, `SENTINEL_GITHUB_PAT` from file-write.
+
+- [ ] **Step 4: Commit**
 
 ```bash
 git add -A
-git commit -m "refactor(cloud-core): drop redundant /slicc/secrets.env write — start.sh handles it"
+git commit -m "docs(cloud/start): two-layer secrets bootstrap — env-var for IMS + file-write for full payload"
 ```
 
 ---
@@ -564,7 +578,7 @@ git commit -m "refactor(cloud-core): drop redundant /slicc/secrets.env write —
 
 End state:
 
-- Template's start.sh writes /slicc/secrets.env from env vars before node-server boots — no more bootstrap race for the worker (Plan D) OR the CLI.
-- CLI's `runStart` extracts ADOBE_IMS_TOKEN from secrets.env and passes via `Sandbox.create({ envs })`.
+- Template's start.sh writes /slicc/secrets.env from env vars before node-server boots — fixes the IMS-token race for the worker (Plan D) AND the CLI.
+- CLI's `runStart` ALSO uploads the full filtered secrets.env after create — preserves non-Adobe secrets (GitHub PATs, S3 keys, etc.).
 - CLI's `runResume` writes a fresh secrets.env on resume so long-paused cones can pick up a refreshed IMS token without re-creating.
-- The redundant `files.write` after `Sandbox.create` is gone; only the env-var path remains.
+- Two-layer model is documented inline so future readers understand why both writes exist.

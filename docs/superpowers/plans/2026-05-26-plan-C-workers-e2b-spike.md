@@ -12,7 +12,7 @@
 
 **Time box:** 2 days. If any pass-criterion fails AND you've spent 2 days, write up the Node-service fallback verdict instead of trying to make it work.
 
-**Depends on:** Plan A complete (cloud-core importable by worker).
+**Depends on:** Plan A complete — specifically Task A5b ("Make the e2b adapter worker-safe"). The spike imports `createSubstrate` from `@slicc/cloud-core`, NOT raw `e2b`, so we validate the exact same code path Plan D uses. Spiking against raw e2b would miss adapter-level issues (process.env mutation, missing apiKey on connect/list) that would only surface after Plan D ships.
 
 ---
 
@@ -97,98 +97,90 @@ git commit -m "spike(worker): add e2b SDK dependency (Plan C)"
 // TEMPORARY: this file exists only for Plan C (Workers + e2b compat spike).
 // Removed when Plan D ships. Do not import from here in real handlers.
 
-/**
- * Direct e2b SDK calls inside a Worker. Each handler is independent so we can
- * isolate which SDK calls (if any) fail under Workers' runtime constraints.
- */
-export async function handleSpike(request: Request, env: SpikeEnv): Promise<Response> {
-  const url = new URL(request.url);
-  // Reject if the spike isn't explicitly enabled — no accidental production leak.
-  if (env.SPIKE_ENABLED !== '1') {
-    return new Response('spike disabled', { status: 404 });
-  }
-  if (!env.E2B_API_KEY) {
-    return new Response('E2B_API_KEY missing', { status: 500 });
-  }
-
-  const op = url.pathname.replace('/spike/', '');
-  switch (op) {
-    case 'create':
-      return runCreate(env);
-    case 'pause':
-      return runPause(request, env);
-    case 'resume':
-      return runResume(request, env);
-    case 'kill':
-      return runKill(request, env);
-    default:
-      return new Response(`unknown spike op: ${op}`, { status: 404 });
-  }
-}
+import { createSubstrate, type SandboxSubstrate } from '@slicc/cloud-core';
 
 interface SpikeEnv {
   E2B_API_KEY: string;
   SPIKE_ENABLED: string;
 }
 
-async function runCreate(env: SpikeEnv): Promise<Response> {
-  // Dynamic import: defer e2b load to Workers request time so the cold-start
-  // path for unrelated routes isn't slowed.
-  const { Sandbox, waitForFile } = await import('e2b');
-  // Worker apiKey injection — never read process.env in handlers.
-  // The e2b SDK reads E2B_API_KEY from env; in Workers, set via globalThis hack
-  // or by passing options. The SDK supports an apiKey option in v2:
+/**
+ * Spike via @slicc/cloud-core's `createSubstrate` — same code path Plan D's
+ * handlers use. If the adapter has Workers-incompatible bits (process.env
+ * mutation, missing apiKey on connect/list), this spike surfaces them.
+ */
+export async function handleSpike(request: Request, env: SpikeEnv): Promise<Response> {
+  const url = new URL(request.url);
+  if (env.SPIKE_ENABLED !== '1') return new Response('spike disabled', { status: 404 });
+  if (!env.E2B_API_KEY) return new Response('E2B_API_KEY missing', { status: 500 });
+
+  const substrate = createSubstrate('e2b', { apiKey: env.E2B_API_KEY });
+  const op = url.pathname.replace('/spike/', '');
+  switch (op) {
+    case 'create':
+      return runCreate(substrate);
+    case 'pause':
+      return runPause(substrate, request);
+    case 'resume':
+      return runResume(substrate, request);
+    case 'kill':
+      return runKill(substrate, request);
+    case 'list':
+      return runList(substrate);
+    default:
+      return new Response(`unknown spike op: ${op}`, { status: 404 });
+  }
+}
+
+async function runCreate(substrate: SandboxSubstrate): Promise<Response> {
   const t0 = Date.now();
-  const sbx = await Sandbox.create('slicc', {
-    apiKey: env.E2B_API_KEY,
+  const handle = await substrate.create({
+    template: 'slicc',
+    autoPauseOnCap: false,
     metadata: { source: 'plan-c-spike' },
-    timeoutMs: 60_000,
+    envVars: { ADOBE_IMS_TOKEN: 'spike-fake-token' },
   });
   const createdMs = Date.now() - t0;
-
-  // Quick file write + command run.
-  await sbx.files.write('/tmp/spike.txt', 'hello from worker');
-  const result = await sbx.commands.run('cat /tmp/spike.txt');
-
+  await handle.writeFile('/tmp/spike.txt', 'hello from worker via cloud-core');
+  const result = await handle.run('cat /tmp/spike.txt');
   return Response.json({
-    sandboxId: sbx.sandboxId,
+    sandboxId: handle.sandboxId,
     createdMs,
     fileRoundtripStdout: result.stdout,
     exitCode: result.exitCode,
   });
 }
 
-async function runPause(request: Request, env: SpikeEnv): Promise<Response> {
-  const { Sandbox } = await import('e2b');
+async function runPause(substrate: SandboxSubstrate, request: Request): Promise<Response> {
   const { sandboxId } = (await request.json()) as { sandboxId: string };
-  const sbx = await Sandbox.connect(sandboxId, { apiKey: env.E2B_API_KEY });
+  const handle = await substrate.connect(sandboxId);
   const t0 = Date.now();
-  await sbx.pause();
+  await handle.pause();
   return Response.json({ ok: true, pausedMs: Date.now() - t0 });
 }
 
-async function runResume(request: Request, env: SpikeEnv): Promise<Response> {
-  const { Sandbox } = await import('e2b');
+async function runResume(substrate: SandboxSubstrate, request: Request): Promise<Response> {
   const { sandboxId } = (await request.json()) as { sandboxId: string };
   const t0 = Date.now();
-  const sbx = await Sandbox.connect(sandboxId, { apiKey: env.E2B_API_KEY });
-  // Sandbox.connect on a paused sandbox auto-resumes. Confirm with a command:
-  const result = await sbx.commands.run('echo resumed');
-  return Response.json({
-    ok: true,
-    resumedMs: Date.now() - t0,
-    stdout: result.stdout,
-  });
+  const handle = await substrate.connect(sandboxId);
+  const result = await handle.run('echo resumed');
+  return Response.json({ ok: true, resumedMs: Date.now() - t0, stdout: result.stdout });
 }
 
-async function runKill(request: Request, env: SpikeEnv): Promise<Response> {
-  const { Sandbox } = await import('e2b');
+async function runKill(substrate: SandboxSubstrate, request: Request): Promise<Response> {
   const { sandboxId } = (await request.json()) as { sandboxId: string };
-  const sbx = await Sandbox.connect(sandboxId, { apiKey: env.E2B_API_KEY });
-  await sbx.kill();
+  const handle = await substrate.connect(sandboxId);
+  await handle.kill();
   return Response.json({ ok: true });
 }
+
+async function runList(substrate: SandboxSubstrate): Promise<Response> {
+  const items = await substrate.list();
+  return Response.json({ count: items.length, items });
+}
 ```
+
+This validates: substrate.create + writeFile + run via cloud-core (C-1), the cloud-core adapter under Workers' Node-compat (C-2 implicit), wall-clock for create (C-3), and the fact that apiKey is passed through cloud-core's substrate WITHOUT process.env mutation (C-4 + the key never reaches the browser).
 
 - [ ] **Step 2: Wire the route**
 

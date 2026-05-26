@@ -62,17 +62,29 @@ packages/node-server/src/cloud/       ← reduced
 
 - [ ] **Step 1: Write package.json**
 
+cloud-core needs a real build step (emitting `dist/`) so node-server's published-tarball case can inline it the same way `@slicc/shared-ts` is inlined today. Locally (dev), the workspace symlink + ts source resolution works directly; for `npm pack` / `sliccy` publish, we inline.
+
 ```json
 {
   "name": "@slicc/cloud-core",
   "private": true,
   "version": "0.0.0",
   "type": "module",
-  "main": "src/index.ts",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
   "exports": {
-    ".": "./src/index.ts"
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./tests/fake-substrate": {
+      "types": "./dist/tests/fake-substrate.d.ts",
+      "default": "./dist/tests/fake-substrate.js"
+    }
   },
+  "files": ["dist"],
   "scripts": {
+    "build": "tsc -p tsconfig.json",
     "test": "vitest run",
     "typecheck": "tsc --noEmit"
   },
@@ -92,14 +104,18 @@ packages/node-server/src/cloud/       ← reduced
 {
   "extends": "../../tsconfig.cli.json",
   "compilerOptions": {
-    "rootDir": "src",
+    "rootDir": ".",
     "outDir": "dist",
     "composite": false,
-    "noEmit": true
+    "noEmit": false,
+    "declaration": true,
+    "declarationMap": true
   },
   "include": ["src/**/*", "tests/**/*"]
 }
 ```
+
+(`tests/` is included so `@slicc/cloud-core/tests/fake-substrate` resolves to a built artifact for downstream test consumers.)
 
 - [ ] **Step 3: Write src/index.ts placeholder**
 
@@ -531,6 +547,95 @@ git commit -m "refactor(cloud-core): move e2b substrate adapter"
 
 ---
 
+### Task A5b: Make the e2b adapter worker-safe
+
+**Files:**
+
+- Modify: `packages/cloud-core/src/substrates/e2b.ts`
+
+**Why:** the existing adapter uses `process.env['E2B_API_KEY'] = cfg.apiKey` and relies on the SDK reading the global env. That breaks in Cloudflare Workers (no `process.env`) and creates Workers-incompatibility that the Plan C spike wouldn't surface unless the spike actually goes through `createSubstrate`. Fix here so Plan C can validate the same path Plan D will use.
+
+- [ ] **Step 1: Remove the env mutation; pass `apiKey` to every SDK call**
+
+Replace the body of `createE2bSubstrate` so it threads `cfg.apiKey` explicitly to each `Sandbox.create` / `Sandbox.connect` / `Sandbox.list` call (the SDK supports an `apiKey` option on all of them in v2):
+
+```ts
+import { Sandbox } from 'e2b';
+import type { SandboxSubstrate, SubstrateConfig /* … */ } from '../substrate.js';
+
+export function createE2bSubstrate(cfg: SubstrateConfig): SandboxSubstrate {
+  const apiKey = cfg.apiKey;
+  return {
+    id: 'e2b',
+    async create(opts) {
+      const sbx = await Sandbox.create(opts.template, {
+        apiKey, // ← explicit, was process.env mutation
+        envs: opts.envVars,
+        metadata: opts.metadata,
+        ...(opts.autoPauseOnCap ? { lifecycle: { onTimeout: 'pause' } } : {}),
+      });
+      return wrap(sbx, apiKey); // ← thread apiKey to handle ops
+    },
+    async connect(sandboxId) {
+      const sbx = await Sandbox.connect(sandboxId, { apiKey });
+      return wrap(sbx, apiKey);
+    },
+    async list(opts) {
+      const paginator = Sandbox.list({ apiKey, query: { metadata: opts?.metadata } });
+      const items: SandboxSummary[] = [];
+      while (paginator.hasNext) {
+        const page = await paginator.nextItems();
+        for (const info of page) {
+          if (info.name === 'slicc') {
+            items.push({
+              sandboxId: info.sandboxId,
+              name: info.metadata?.['name'],
+              state: mapState(info.state),
+              metadata: info.metadata,
+            });
+          }
+        }
+      }
+      return items;
+    },
+  };
+}
+
+function wrap(sbx: Sandbox, apiKey: string): SandboxHandle {
+  // ... existing wrap impl unchanged, EXCEPT that any internal calls that
+  // re-issue SDK requests (e.g., a hypothetical re-connect) pass apiKey too.
+  // The current wrap only forwards calls to the already-connected `sbx`, so
+  // no changes needed inside wrap itself — `apiKey` is kept for completeness.
+  // ...
+}
+```
+
+- [ ] **Step 2: Verify no process.env reference remains**
+
+```bash
+grep -n "process.env" packages/cloud-core/src/substrates/e2b.ts
+```
+
+Expected: no matches.
+
+- [ ] **Step 3: Update live test (no change expected — it already passes apiKey via cfg)**
+
+```bash
+SLICC_TEST_E2B_API_KEY="$E2B_API_KEY" \
+  npx vitest run --project node-server packages/node-server/tests/cloud-live.test.ts
+```
+
+Expected: 1 passed.
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add -A
+git commit -m "refactor(cloud-core): make e2b adapter worker-safe (no process.env, apiKey passed explicitly)"
+```
+
+---
+
 ### Task A6: Move secrets-filter to cloud-core
 
 **Files:**
@@ -831,9 +936,12 @@ export class FileRegistry implements Registry {
       throw err;
     }
     if (typeof raw !== 'object' || raw === null) return [];
-    const entries = (raw as { entries?: unknown }).entries;
-    if (!Array.isArray(entries)) return [];
-    return entries.filter(isConeEntry);
+    // Preserve the legacy { sessions } schema used by existing ~/.slicc/cloud-sessions.json
+    // files. DO NOT rename to `entries` — that'd silently empty out paused-cone state for
+    // every existing CLI user on upgrade.
+    const sessions = (raw as { sessions?: unknown }).sessions;
+    if (!Array.isArray(sessions)) return [];
+    return sessions.filter(isConeEntry);
   }
 
   async findByNameOrId(query: string): Promise<ConeEntry | null> {
@@ -841,12 +949,17 @@ export class FileRegistry implements Registry {
     return entries.find((e) => e.sandboxId === query || e.name === query) ?? null;
   }
 
+  // Behavior contract: existing CLI's `append` was upsert. Preserve upsert here so
+  // re-starting a sandbox with the same id (or a recovery rebuild that races) doesn't
+  // throw. Tests must assert upsert semantics.
   async append(entry: ConeEntry): Promise<void> {
     const entries = await this.list();
-    if (entries.some((e) => e.sandboxId === entry.sandboxId)) {
-      throw new Error(`entry already exists: ${entry.sandboxId}`);
+    const i = entries.findIndex((e) => e.sandboxId === entry.sandboxId);
+    if (i >= 0) {
+      entries[i] = { ...entries[i]!, ...entry };
+    } else {
+      entries.push(entry);
     }
-    entries.push(entry);
     await this.writeAll(entries);
   }
 
@@ -866,7 +979,8 @@ export class FileRegistry implements Registry {
 
   private async writeAll(entries: ConeEntry[]): Promise<void> {
     await fs.mkdir(dirname(this.path), { recursive: true });
-    await fs.writeFile(this.path, JSON.stringify({ entries }, null, 2));
+    // Preserve { sessions } schema for backwards-compat with existing files.
+    await fs.writeFile(this.path, JSON.stringify({ sessions: entries }, null, 2));
   }
 }
 ```
@@ -1707,6 +1821,94 @@ Expected: 1 passed. Confirms the e2b round-trip is unchanged.
 ```bash
 git add -A
 git commit -m "refactor(cloud-core): drop transitional shims; node-server imports @slicc/cloud-core directly"
+```
+
+---
+
+### Task A16: Extend inline-shared.mjs to also inline cloud-core
+
+**Files:**
+
+- Modify: `packages/node-server/scripts/inline-shared.mjs`
+- Modify: `packages/node-server/package.json` build script ordering
+
+**Why:** the published `sliccy` npm tarball ships `dist/node-server/` but does NOT include private workspace packages. Today `inline-shared.mjs` inlines `@slicc/shared-ts` into `dist/node-server/_shared/`. We need the same treatment for `@slicc/cloud-core` so `node dist/node-server/index.js` works after `npm install sliccy` on a clean machine.
+
+- [ ] **Step 1: Read current inline-shared.mjs**
+
+```bash
+cat packages/node-server/scripts/inline-shared.mjs
+```
+
+Understand the existing pattern: it copies `packages/shared-ts/dist/` into `dist/node-server/_shared/`, then rewrites `from '@slicc/shared-ts'` imports in `dist/node-server/**/*.{js,d.ts}` to relative paths.
+
+- [ ] **Step 2: Add a second inline pass for cloud-core**
+
+Either refactor the script into a parameterized "inline workspace dep" function, or copy the existing pattern. For minimal churn, copy the pattern:
+
+```mjs
+// After the existing shared-ts inline block, add:
+
+const cloudCoreDist = resolve(repoRoot, 'packages/cloud-core/dist');
+const inlinedCloudCoreDir = resolve(nodeServerDist, '_cloud-core');
+
+if (!existsSync(cloudCoreDist)) {
+  console.error(
+    `[inline-shared] @slicc/cloud-core dist not found at ${cloudCoreDist}. ` +
+      `Build @slicc/cloud-core first.`
+  );
+  process.exit(1);
+}
+
+// Copy cloud-core/dist/ → dist/node-server/_cloud-core/
+copyDirRecursive(cloudCoreDist, inlinedCloudCoreDir);
+
+// Rewrite '@slicc/cloud-core' imports → relative './_cloud-core/index.js'
+// Rewrite '@slicc/cloud-core/tests/fake-substrate' → relative
+//   './_cloud-core/tests/fake-substrate.js'
+rewriteImports(nodeServerDist, [
+  ['@slicc/cloud-core/tests/fake-substrate', '_cloud-core/tests/fake-substrate.js'],
+  ['@slicc/cloud-core', '_cloud-core/index.js'],
+]);
+
+console.log('[inline-shared] inlined @slicc/cloud-core into', inlinedCloudCoreDir);
+```
+
+(The exact helper names — `copyDirRecursive`, `rewriteImports` — depend on the script's current shape. Refactor what's there to be reusable across both shared-ts and cloud-core.)
+
+- [ ] **Step 3: Update node-server's build script**
+
+In `packages/node-server/package.json`, prepend a cloud-core build to ensure `packages/cloud-core/dist/` exists before inline-shared runs:
+
+```jsonc
+"build": "node --input-type=module -e \"import { rmSync } from 'node:fs'; rmSync('../../dist/node-server', { recursive: true, force: true });\" && npm run build -w @slicc/shared-ts && npm run build -w @slicc/cloud-core && tsc -p ../../tsconfig.cli.json && node scripts/inline-shared.mjs"
+```
+
+(If the root `npm run build` already builds shared-ts before node-server, mirror that pattern for cloud-core. Adapt to whatever the actual current sequencing is.)
+
+- [ ] **Step 4: Verify the inline works end-to-end**
+
+```bash
+npm run build
+ls dist/node-server/_cloud-core
+grep -l "from '@slicc/cloud-core'" dist/node-server/**/*.js || echo "all rewritten"
+```
+
+Expected: `_cloud-core` directory exists with the compiled output; no remaining `'@slicc/cloud-core'` imports in dist (all rewritten to relative paths).
+
+- [ ] **Step 5: Sanity-check sliccy can run from dist**
+
+```bash
+node dist/node-server/index.js --help
+```
+
+Expected: prints CLI usage; no MODULE_NOT_FOUND for `@slicc/cloud-core`.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add -A
+git commit -m "build(node-server): inline @slicc/cloud-core for published-tarball case"
 ```
 
 ---

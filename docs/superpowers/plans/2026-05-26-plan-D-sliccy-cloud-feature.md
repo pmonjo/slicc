@@ -4,7 +4,7 @@
 
 **Goal:** Ship the user-facing web feature: dashboard at `sliccy.ai/cloud`, IMS sign-in, REST API for cone lifecycle, per-user DurableObject, reconciliation, CI integration. Adobe-only v1; per-user caps; denylist abuse mitigation.
 
-**Architecture:** Worker extends with `/api/cloud/*` handlers + `/cloud` static dashboard + `/auth/cloud-callback`. Per-user state in `CloudSessionsDurableObject`. Auth via implicit-grant IMS bearer on every API call; JWT verified against IMS jwks; cap + rate-limit middleware; reconciliation with e2b on every list and mutation. Handlers consume `@slicc/cloud-core` operations directly.
+**Architecture:** Worker extends with `/api/cloud/*` handlers + `/cloud` static dashboard + `/auth/cloud-callback`. Per-user state AND lifecycle mutations live in `CloudSessionsDurableObject` — the handler authenticates, applies rate-limit, then forwards to a DO endpoint that runs the full lifecycle (reconcile → cap → substrate call → registry write) inside a single `blockConcurrencyWhile` block. This is the only way to make cap checks atomic with `Sandbox.create`. Handlers are thin auth-and-forward shims. Dashboard assets are built into `dist/ui/cloud/` (existing ASSETS binding, no new static dir).
 
 **Tech Stack:** Cloudflare Workers (Wrangler), e2b SDK v2, jose (JWT), DurableObjects, vanilla TS for the dashboard.
 
@@ -23,22 +23,20 @@ packages/cloudflare-worker/
 │   ├── index.ts                            ← MODIFY: register routes, DO class export
 │   ├── cloud/                              ← NEW directory
 │   │   ├── auth.ts                         ← JWT pipeline (jwks, allowlist, denylist, ownerOrg)
-│   │   ├── auth-cache.ts                   ← Token → AuthResult cache, 10min TTL
-│   │   ├── auth-middleware.ts              ← authenticateRequest wrapper
-│   │   ├── caps.ts                         ← cap check for start/resume
-│   │   ├── rate-limit.ts                   ← per-user soft rate-limit
+│   │   ├── auth-cache.ts                   ← Token → AuthResult cache; TTL = min(10min, tokenExp)
+│   │   ├── auth-middleware.ts              ← authenticateRequest wrapper (threads tokenExp)
+│   │   ├── caps.ts                         ← cap-math pure function (called inside DO)
+│   │   ├── rate-limit.ts                   ← per-user soft rate-limit (worker-level)
 │   │   ├── error-envelope.ts               ← uniform JSON error response shape
-│   │   ├── handlers.ts                     ← /api/cloud/start, /list, /pause, /resume, /kill
+│   │   ├── handlers.ts                     ← THIN SHIMS: auth → rate-limit → forward to DO
 │   │   ├── handler-signout.ts              ← /api/cloud/sign-out
 │   │   ├── handler-admin.ts                ← /api/cloud/admin/stats
-│   │   ├── cloud-sessions-do.ts            ← CloudSessionsDurableObject class
-│   │   └── registry-do.ts                  ← Registry impl wrapping the DO stub
+│   │   ├── cloud-sessions-do.ts            ← DO with lifecycle endpoints + local-storage Registry
+│   │   └── local-registry.ts               ← Registry impl backed by DO's own state.storage
 │   ├── auth/
-│   │   └── cloud-callback.ts               ← /auth/cloud-callback HTML response
-│   └── static/cloud/                       ← dashboard static assets
-│       ├── index.html
-│       ├── app.js
-│       └── styles.css
+│   │   ├── cloud-callback.ts               ← /auth/cloud-callback HTML shell
+│   │   └── cloud-callback.js               ← external script for the popup (no inline JS)
+│   └── (dashboard assets in dist/ui/cloud/ — built alongside the webapp, not a separate dir)
 └── tests/
     ├── cloud-auth.test.ts                  ← JWT validation, allowlist/denylist
     ├── cloud-auth-cache.test.ts            ← cache TTL behaviour
@@ -181,6 +179,9 @@ export interface AuthResult {
   email: string;
   userName: string;
   ownerOrg?: string;
+  /** Token exp claim (Unix seconds). Used by the auth cache to cap TTL at
+   * min(10min, tokenExp - now). Surfaced from JWT validation. */
+  tokenExp?: number;
 }
 
 export class AuthError extends Error {
@@ -304,6 +305,7 @@ export async function validateBearer(token: string, env: ValidateBearerEnv): Pro
     email,
     userName,
     ownerOrg,
+    tokenExp: payload.exp,
   };
 }
 ```
@@ -479,7 +481,9 @@ export async function authenticateRequest(
   if (cached) return cached;
   try {
     const result = await validateBearer(token, env);
-    await setCached(token, result);
+    // Cap cache TTL at min(10min, tokenExp − now) per spec — never cache past
+    // the token's own expiry.
+    await setCached(token, result, result.tokenExp);
     return result;
   } catch (err) {
     if (err instanceof AuthError) {
@@ -501,9 +505,13 @@ git commit -m "feat(worker/cloud): authenticateRequest middleware + error envelo
 
 ---
 
-## Phase D-2 — DurableObject + Registry
+## Phase D-2 — DurableObject (lifecycle resides here)
 
-### Task D5: CloudSessionsDurableObject
+**Architecture note:** the DO holds BOTH state AND the lifecycle business logic. Each lifecycle endpoint (`/start-cone`, `/resume-cone`, `/pause-cone`, `/kill-cone`, `/list-cones`) wraps the call in `state.blockConcurrencyWhile(...)` so reconciliation + cap check + e2b call + registry mutation all run as one atomic per-user step. The handler layer (Phase D-4) is reduced to authenticate + rate-limit + forward.
+
+The cloud-core `Registry` interface is still used inside the DO — backed by `state.storage` directly via a tiny adapter (`local-registry.ts`). That keeps cloud-core's operations testable with a FakeSubstrate and an in-memory Registry, while the DO provides the real serialization at runtime.
+
+### Task D5: CloudSessionsDurableObject (lifecycle endpoints)
 
 **Files:**
 
@@ -619,71 +627,11 @@ git commit -m "feat(worker/cloud): CloudSessionsDurableObject"
 
 ---
 
-### Task D6: Registry adapter
+### Task D6: (intentionally dropped — no DoRegistry needed)
 
-**Files:**
+In the earlier draft of Plan D, a `DoRegistry` adapter wrapped the DO stub for use by worker-side handlers calling cloud-core ops. That architecture had a fatal flaw: each cloud-core op makes multiple DO calls (list, append, update); the worker-side sequence wasn't atomic, so two concurrent `/start` calls could both pass the cap check.
 
-- Create: `packages/cloudflare-worker/src/cloud/registry-do.ts`
-
-- [ ] **Step 1: Implement DoRegistry**
-
-```ts
-// packages/cloudflare-worker/src/cloud/registry-do.ts
-import type { ConeEntry, Registry } from '@slicc/cloud-core';
-
-export class DoRegistry implements Registry {
-  constructor(private readonly stub: DurableObjectStub) {}
-
-  async list(): Promise<ConeEntry[]> {
-    const res = await this.stub.fetch('https://do/list');
-    return (await res.json()) as ConeEntry[];
-  }
-  async findByNameOrId(query: string): Promise<ConeEntry | null> {
-    const res = await this.stub.fetch('https://do/findByNameOrId', {
-      method: 'POST',
-      body: JSON.stringify({ query }),
-    });
-    return (await res.json()) as ConeEntry | null;
-  }
-  async append(entry: ConeEntry): Promise<void> {
-    const res = await this.stub.fetch('https://do/append', {
-      method: 'POST',
-      body: JSON.stringify({ entry }),
-    });
-    if (!res.ok) throw new Error(await res.text());
-  }
-  async update(sandboxId: string, patch: Partial<ConeEntry>): Promise<void> {
-    const res = await this.stub.fetch('https://do/update', {
-      method: 'POST',
-      body: JSON.stringify({ sandboxId, patch }),
-    });
-    if (!res.ok) throw new Error(await res.text());
-  }
-  async remove(sandboxId: string): Promise<void> {
-    const res = await this.stub.fetch('https://do/remove', {
-      method: 'POST',
-      body: JSON.stringify({ sandboxId }),
-    });
-    if (!res.ok) throw new Error(await res.text());
-  }
-}
-
-export function getDoRegistry(
-  env: { CLOUD_SESSIONS: DurableObjectNamespace },
-  userId: string
-): DoRegistry {
-  const id = env.CLOUD_SESSIONS.idFromName(userId);
-  return new DoRegistry(env.CLOUD_SESSIONS.get(id));
-}
-```
-
-- [ ] **Step 2: Typecheck + commit**
-
-```bash
-npm run typecheck
-git add -A
-git commit -m "feat(worker/cloud): DoRegistry adapter implementing cloud-core Registry"
-```
+The corrected architecture (Task D5) runs cloud-core ops INSIDE the DO with `state.blockConcurrencyWhile`, using `LocalRegistry` to talk to the DO's own storage. Handlers (Task D9 onwards) become thin shims that forward to DO endpoints; there is no `DoRegistry` and no worker-side Registry wrapping. Nothing to do for D6.
 
 ---
 
@@ -884,29 +832,13 @@ git commit -m "feat(worker/cloud): per-user rate-limit middleware"
 - Create: `packages/cloudflare-worker/tests/cloud-handlers-helpers.ts`
 - Create: `packages/cloudflare-worker/tests/cloud-handlers.test.ts`
 
-- [ ] **Step 1: Implement handlers.ts (start + shared scaffolding)**
+- [ ] **Step 1: Implement handlers.ts (thin shims forwarding to DO)**
 
 ```ts
 // packages/cloudflare-worker/src/cloud/handlers.ts
-import {
-  createSubstrate,
-  filterSecretsEnv,
-  isCloudError,
-  startCone,
-  listCones,
-  pauseCone,
-  resumeCone,
-  killCone,
-  type Registry,
-  type SandboxSubstrate,
-} from '@slicc/cloud-core';
 import { authenticateRequest } from './auth-middleware.js';
-import { errorResponse, okResponse } from './error-envelope.js';
-import { getDoRegistry } from './registry-do.js';
-import { checkCapsForRun } from './caps.js';
+import { errorResponse } from './error-envelope.js';
 import { checkRateLimit } from './rate-limit.js';
-
-const ADOBE_TOKEN_DOMAINS = 'adobe-llm-proxy.paolo-moz.workers.dev';
 
 export interface CloudEnv {
   CLOUD_SESSIONS: DurableObjectNamespace;
@@ -920,95 +852,106 @@ export interface CloudEnv {
   CONE_CAP_PAUSED: string;
 }
 
-export interface HandlerDeps {
-  /** Injected for tests; built from env when not provided. */
-  substrate?: SandboxSubstrate;
+function getDoStub(env: CloudEnv, userId: string): DurableObjectStub {
+  const id = env.CLOUD_SESSIONS.idFromName(userId);
+  return env.CLOUD_SESSIONS.get(id);
 }
 
-function buildSubstrate(env: CloudEnv): SandboxSubstrate {
-  return createSubstrate('e2b', { apiKey: env.E2B_API_KEY });
-}
-
-function cloudErrorToResponse(err: unknown): Response {
-  if (isCloudError(err)) {
-    const codeMap: Record<string, number> = {
-      CAP_EXCEEDED: 403,
-      NOT_FOUND: 404,
-      NAME_TAKEN: 409,
-      ALREADY_PAUSED: 409,
-      ALREADY_RUNNING: 409,
-      LEADER_NOT_READY: 503,
-      SANDBOX_NOT_READY: 503,
-      CDP_NOT_READY: 503,
-      CDP_ERROR: 500,
-      INTERNAL: 500,
-    };
-    return errorResponse(codeMap[err.code] ?? 500, err.code, err.message, err.details);
-  }
-  return errorResponse(500, 'INTERNAL', err instanceof Error ? err.message : String(err));
-}
-
-export async function handleStart(
-  request: Request,
-  env: CloudEnv,
-  deps: HandlerDeps = {}
+async function forwardToDo(
+  stub: DurableObjectStub,
+  endpoint: string,
+  body: Record<string, unknown>
 ): Promise<Response> {
+  return await stub.fetch(`https://do${endpoint}`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+}
+
+export async function handleStart(request: Request, env: CloudEnv): Promise<Response> {
   const auth = await authenticateRequest(request, env);
   if (auth instanceof Response) return auth;
-
   const rate = checkRateLimit(auth.userId, 'start');
   if (!rate.ok) {
     return errorResponse(429, 'RATE_LIMITED', 'too many start requests', {
       retryAfterSec: rate.retryAfterSec,
     });
   }
-
   const bearer = request.headers.get('Authorization')!.slice(7);
   const body = (await request.json().catch(() => ({}))) as { name?: string };
+  const stub = getDoStub(env, auth.userId);
+  return forwardToDo(stub, '/start-cone', {
+    bearer,
+    name: body.name,
+    userId: auth.userId,
+    email: auth.email,
+    workerOrigin: new URL(request.url).origin,
+  });
+}
 
-  const registry: Registry = getDoRegistry(env, auth.userId);
-  const cones = await registry.list();
-  const cap = checkCapsForRun(cones, env);
-  if (!cap.ok) {
-    return errorResponse(403, 'CAP_EXCEEDED', `at ${cap.reason} cap`, {
-      running: cap.running,
-      paused: cap.paused,
-      cap: { running: cap.runningCap, paused: cap.pausedCap },
+export async function handleList(request: Request, env: CloudEnv): Promise<Response> {
+  const auth = await authenticateRequest(request, env);
+  if (auth instanceof Response) return auth;
+  const rate = checkRateLimit(auth.userId, 'list');
+  if (!rate.ok) {
+    return errorResponse(429, 'RATE_LIMITED', 'too many list requests', {
+      retryAfterSec: rate.retryAfterSec,
     });
   }
+  const stub = getDoStub(env, auth.userId);
+  return forwardToDo(stub, '/list-cones', { userId: auth.userId });
+}
 
-  // Synthesize envContents = the IMS token. filterSecretsEnv runs defense-in-depth.
-  const envContents = filterSecretsEnv(
-    [`ADOBE_IMS_TOKEN=${bearer}`, `ADOBE_IMS_TOKEN_DOMAINS=${ADOBE_TOKEN_DOMAINS}`].join('\n')
-  );
-
-  try {
-    const substrate = deps.substrate ?? buildSubstrate(env);
-    const result = await startCone(
-      { substrate, registry },
-      {
-        envContents,
-        envs: {
-          ADOBE_IMS_TOKEN: bearer,
-          ADOBE_IMS_TOKEN_DOMAINS: ADOBE_TOKEN_DOMAINS,
-        },
-        workerBaseUrl: new URL(request.url).origin,
-        sliccVersion: 'web-' + new Date().toISOString().slice(0, 10),
-        name: body.name,
-        metadata: { userId: auth.userId, email: auth.email },
-      }
-    );
-    return okResponse({
-      sandboxId: result.sandboxId,
-      name: result.name,
-      joinUrl: result.joinUrl,
-      trayId: result.trayId,
+export async function handlePause(request: Request, env: CloudEnv): Promise<Response> {
+  const auth = await authenticateRequest(request, env);
+  if (auth instanceof Response) return auth;
+  const rate = checkRateLimit(auth.userId, 'pause');
+  if (!rate.ok) {
+    return errorResponse(429, 'RATE_LIMITED', 'too many pause requests', {
+      retryAfterSec: rate.retryAfterSec,
     });
-  } catch (err) {
-    return cloudErrorToResponse(err);
   }
+  const body = (await request.json()) as { sandboxId: string };
+  const stub = getDoStub(env, auth.userId);
+  return forwardToDo(stub, '/pause-cone', { sandboxId: body.sandboxId });
+}
+
+export async function handleResume(request: Request, env: CloudEnv): Promise<Response> {
+  const auth = await authenticateRequest(request, env);
+  if (auth instanceof Response) return auth;
+  const rate = checkRateLimit(auth.userId, 'resume');
+  if (!rate.ok) {
+    return errorResponse(429, 'RATE_LIMITED', 'too many resume requests', {
+      retryAfterSec: rate.retryAfterSec,
+    });
+  }
+  const bearer = request.headers.get('Authorization')!.slice(7);
+  const body = (await request.json()) as { sandboxId: string };
+  const stub = getDoStub(env, auth.userId);
+  return forwardToDo(stub, '/resume-cone', {
+    bearer,
+    sandboxId: body.sandboxId,
+    localSliccVersion: 'web-' + new Date().toISOString().slice(0, 10),
+  });
+}
+
+export async function handleKill(request: Request, env: CloudEnv): Promise<Response> {
+  const auth = await authenticateRequest(request, env);
+  if (auth instanceof Response) return auth;
+  const rate = checkRateLimit(auth.userId, 'kill');
+  if (!rate.ok) {
+    return errorResponse(429, 'RATE_LIMITED', 'too many kill requests', {
+      retryAfterSec: rate.retryAfterSec,
+    });
+  }
+  const body = (await request.json()) as { sandboxId: string };
+  const stub = getDoStub(env, auth.userId);
+  return forwardToDo(stub, '/kill-cone', { sandboxId: body.sandboxId });
 }
 ```
+
+The handler is now ~10 lines per endpoint: auth, rate-limit, forward to DO. All business logic (reconciliation, cap check, substrate calls, registry writes) is in the DO endpoints (Task D5) running under `blockConcurrencyWhile`.
 
 - [ ] **Step 2: cloud-handlers-helpers.ts** — mock DO namespace
 
@@ -1179,215 +1122,349 @@ git commit -m "feat(worker/cloud): /api/cloud/start with cap + rate-limit"
 
 ---
 
-### Task D10: /list handler
+### Task D10: Handler-level tests (auth + forward shape)
 
 **Files:**
 
-- Modify: `packages/cloudflare-worker/src/cloud/handlers.ts` — add `handleList`
-- Modify: `packages/cloudflare-worker/tests/cloud-handlers.test.ts` — list tests
+- Modify: `packages/cloudflare-worker/tests/cloud-handlers.test.ts`
+- Modify: `packages/cloudflare-worker/tests/cloud-handlers-helpers.ts` — replace CRUD-mock with lifecycle-mock
 
-- [ ] **Step 1: Append handleList**
+Handlers in the new architecture (D9) are thin: their job is to authenticate, rate-limit, and forward to a DO endpoint with a well-shaped body. These tests verify exactly that, without trying to simulate the DO's lifecycle. The DO's actual behavior is tested separately in Task D11.
+
+- [ ] **Step 1: Update the mock helper to record forwarded requests**
+
+Replace `tests/cloud-handlers-helpers.ts`:
 
 ```ts
-export async function handleList(
-  request: Request,
-  env: CloudEnv,
-  deps: HandlerDeps = {}
-): Promise<Response> {
-  const auth = await authenticateRequest(request, env);
-  if (auth instanceof Response) return auth;
-  const rate = checkRateLimit(auth.userId, 'list');
-  if (!rate.ok) {
-    return errorResponse(429, 'RATE_LIMITED', 'too many list requests', {
-      retryAfterSec: rate.retryAfterSec,
-    });
-  }
-  const registry = getDoRegistry(env, auth.userId);
-  try {
-    const substrate = deps.substrate ?? buildSubstrate(env);
-    const cones = await listCones({ substrate, registry }, { metadata: { userId: auth.userId } });
-    return okResponse({ cones });
-  } catch (err) {
-    return cloudErrorToResponse(err);
-  }
+import type { ConeEntry } from '@slicc/cloud-core';
+
+interface RecordedCall {
+  path: string;
+  body: unknown;
+}
+
+const recorded = new Map<string, RecordedCall[]>();
+const responses = new Map<string, Response>();
+
+export function resetMockNamespace(): void {
+  recorded.clear();
+  responses.clear();
+}
+
+/**
+ * Pre-seed what the mock DO will return for a given key+endpoint pair.
+ * Calls .clone() internally — same canned response can be served to multiple calls.
+ */
+export function setMockResponse(userId: string, endpoint: string, response: Response): void {
+  responses.set(`${userId}:${endpoint}`, response);
+}
+
+export function getRecordedCalls(userId: string): RecordedCall[] {
+  return recorded.get(userId) ?? [];
+}
+
+export function makeMockNamespace(): DurableObjectNamespace {
+  return {
+    idFromName: (name: string) => ({ toString: () => name }) as DurableObjectId,
+    idFromString: (s: string) => ({ toString: () => s }) as DurableObjectId,
+    newUniqueId: () => ({ toString: () => crypto.randomUUID() }) as DurableObjectId,
+    get: (id: DurableObjectId) => {
+      const userId = id.toString();
+      return {
+        async fetch(req: Request | string): Promise<Response> {
+          const r = typeof req === 'string' ? new Request(req) : req;
+          const url = new URL(r.url);
+          const body = await r.json().catch(() => ({}));
+          const calls = recorded.get(userId) ?? [];
+          calls.push({ path: url.pathname, body });
+          recorded.set(userId, calls);
+          const canned = responses.get(`${userId}:${url.pathname}`);
+          if (canned) return canned.clone();
+          return Response.json({ ok: true });
+        },
+      } as unknown as DurableObjectStub;
+    },
+  } as unknown as DurableObjectNamespace;
+}
+
+export function makeCloudEnv(overrides: Partial<Record<string, unknown>> = {}) {
+  return {
+    CLOUD_SESSIONS: makeMockNamespace(),
+    E2B_API_KEY: 'test-e2b-key',
+    IMS_ENVIRONMENT: 'prod',
+    IMS_CLIENT_ID: 'test-client',
+    ALLOWED_EMAIL_DOMAIN: 'adobe.com',
+    BLOCKED_EMAILS: '',
+    REQUIRE_OWNER_ORG: 'false',
+    CONE_CAP_RUNNING: '1',
+    CONE_CAP_PAUSED: '5',
+    ...overrides,
+  } as unknown as import('../src/cloud/handlers.js').CloudEnv;
 }
 ```
 
-- [ ] **Step 2: List test**
+- [ ] **Step 2: Write handler tests**
 
-In `cloud-handlers.test.ts`, add:
+Replace `tests/cloud-handlers.test.ts`:
 
 ```ts
-describe('handleList', () => {
-  it('returns user cones reconciled with substrate', async () => {
-    await setCached('test-bearer', { userId: 'u1', email: 'k@adobe.com', userName: 'K' });
+import { describe, it, expect, beforeEach } from 'vitest';
+import {
+  handleStart,
+  handleList,
+  handlePause,
+  handleResume,
+  handleKill,
+} from '../src/cloud/handlers.js';
+import { setCached, clearAll as clearAuthCache } from '../src/cloud/auth-cache.js';
+import { clearAll as clearRateLimit } from '../src/cloud/rate-limit.js';
+import {
+  makeCloudEnv,
+  resetMockNamespace,
+  setMockResponse,
+  getRecordedCalls,
+} from './cloud-handlers-helpers.js';
+
+beforeEach(() => {
+  clearAuthCache();
+  clearRateLimit();
+  resetMockNamespace();
+});
+
+const AUTH = { userId: 'u1', email: 'k@adobe.com', userName: 'K' };
+
+describe('thin handlers forward to DO lifecycle endpoints', () => {
+  it('handleStart → POSTs /start-cone with bearer + name + userId', async () => {
+    await setCached('test-bearer', AUTH);
     const env = makeCloudEnv();
-    const substrate = new FakeSubstrate();
-    substrate.seedSandbox('s-mine', {
-      metadata: { userId: 'u1', name: 'mine' },
-      state: 'running',
+    setMockResponse(
+      'u1',
+      '/start-cone',
+      Response.json({ sandboxId: 's1', joinUrl: 'https://w/join/s1' })
+    );
+    const req = new Request('https://w/api/cloud/start', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer test-bearer' },
+      body: JSON.stringify({ name: 'smoke' }),
     });
+    const res = await handleStart(req, env);
+    expect(res.status).toBe(200);
+    const calls = getRecordedCalls('u1');
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.path).toBe('/start-cone');
+    const body = calls[0]!.body as { bearer: string; name: string; userId: string };
+    expect(body).toMatchObject({
+      bearer: 'test-bearer',
+      name: 'smoke',
+      userId: 'u1',
+      email: 'k@adobe.com',
+    });
+    expect(body).toHaveProperty('workerOrigin');
+  });
+
+  it('handleList → POSTs /list-cones with userId', async () => {
+    await setCached('test-bearer', AUTH);
+    const env = makeCloudEnv();
+    setMockResponse('u1', '/list-cones', Response.json({ cones: [] }));
     const req = new Request('https://w/api/cloud/list', {
       headers: { Authorization: 'Bearer test-bearer' },
     });
-    const res = await handleList(req, env, { substrate });
+    const res = await handleList(req, env);
     expect(res.status).toBe(200);
-    const body = (await res.json()) as { cones: Array<{ sandboxId: string }> };
-    expect(body.cones.some((c) => c.sandboxId === 's-mine')).toBe(true);
+    expect(getRecordedCalls('u1')).toHaveLength(1);
+    expect(getRecordedCalls('u1')[0]!.path).toBe('/list-cones');
+  });
+
+  it('handlePause → POSTs /pause-cone with sandboxId', async () => {
+    await setCached('test-bearer', AUTH);
+    const env = makeCloudEnv();
+    const req = new Request('https://w/api/cloud/pause', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer test-bearer' },
+      body: JSON.stringify({ sandboxId: 's1' }),
+    });
+    await handlePause(req, env);
+    expect(getRecordedCalls('u1')[0]!.body).toMatchObject({ sandboxId: 's1' });
+  });
+
+  it('handleResume → POSTs /resume-cone with bearer + sandboxId', async () => {
+    await setCached('test-bearer', AUTH);
+    const env = makeCloudEnv();
+    const req = new Request('https://w/api/cloud/resume', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer test-bearer' },
+      body: JSON.stringify({ sandboxId: 's1' }),
+    });
+    await handleResume(req, env);
+    expect(getRecordedCalls('u1')[0]!.body).toMatchObject({
+      bearer: 'test-bearer',
+      sandboxId: 's1',
+    });
+  });
+
+  it('handleKill → POSTs /kill-cone with sandboxId', async () => {
+    await setCached('test-bearer', AUTH);
+    const env = makeCloudEnv();
+    const req = new Request('https://w/api/cloud/kill', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer test-bearer' },
+      body: JSON.stringify({ sandboxId: 's1' }),
+    });
+    await handleKill(req, env);
+    expect(getRecordedCalls('u1')[0]!.body).toMatchObject({ sandboxId: 's1' });
+  });
+
+  it('rejects unauthenticated requests with 401', async () => {
+    const env = makeCloudEnv();
+    const req = new Request('https://w/api/cloud/start', { method: 'POST' });
+    const res = await handleStart(req, env);
+    expect(res.status).toBe(401);
   });
 });
 ```
-
-(FakeSubstrate.seedSandbox needs to honor `opts.metadata` filtering in `list`; add that during execution if not already supported. Test catches it.)
 
 - [ ] **Step 3: Verify + commit**
 
 ```bash
 npx vitest run --project cloudflare-worker packages/cloudflare-worker/tests/cloud-handlers.test.ts
 git add -A
-git commit -m "feat(worker/cloud): /api/cloud/list with reconciliation"
+git commit -m "test(worker/cloud): handler-level tests for auth + DO-forward shape"
 ```
 
 ---
 
-### Task D11: /pause, /resume, /kill handlers
+### Task D11: DO lifecycle tests (cap math, idempotency, reconciliation)
 
 **Files:**
 
-- Modify: `packages/cloudflare-worker/src/cloud/handlers.ts`
-- Modify: `packages/cloudflare-worker/tests/cloud-handlers.test.ts`
+- Modify: `packages/cloudflare-worker/src/cloud/cloud-sessions-do.ts` — make the substrate factory injectable
+- Create: `packages/cloudflare-worker/tests/cloud-sessions-do.test.ts`
 
-- [ ] **Step 1: Append handlers**
+These tests cover the parts of the lifecycle that previously lived in worker-side handlers — atomic cap check, idempotent kill, reconciliation drift. The DO is exercised directly with a FakeSubstrate.
+
+- [ ] **Step 1: Make substrate factory injectable**
+
+Modify `cloud-sessions-do.ts` to accept an optional substrate factory through env (or DI). Add to `DoEnv`:
 
 ```ts
-export async function handlePause(
-  request: Request,
-  env: CloudEnv,
-  deps: HandlerDeps = {}
-): Promise<Response> {
-  const auth = await authenticateRequest(request, env);
-  if (auth instanceof Response) return auth;
-  const rate = checkRateLimit(auth.userId, 'pause');
-  if (!rate.ok)
-    return errorResponse(429, 'RATE_LIMITED', 'too many pause requests', {
-      retryAfterSec: rate.retryAfterSec,
-    });
-  const { sandboxId } = (await request.json()) as { sandboxId: string };
-  const registry = getDoRegistry(env, auth.userId);
-  try {
-    const substrate = deps.substrate ?? buildSubstrate(env);
-    await pauseCone({ substrate, registry }, sandboxId);
-    return okResponse();
-  } catch (err) {
-    return cloudErrorToResponse(err);
-  }
+interface DoEnv {
+  E2B_API_KEY: string;
+  CONE_CAP_RUNNING: string;
+  CONE_CAP_PAUSED: string;
+  /** Tests only: injects a substrate factory in place of createSubstrate('e2b', …). */
+  __SUBSTRATE_FACTORY__?: () => SandboxSubstrate;
 }
 
-export async function handleResume(
-  request: Request,
-  env: CloudEnv,
-  deps: HandlerDeps = {}
-): Promise<Response> {
-  const auth = await authenticateRequest(request, env);
-  if (auth instanceof Response) return auth;
-  const rate = checkRateLimit(auth.userId, 'resume');
-  if (!rate.ok)
-    return errorResponse(429, 'RATE_LIMITED', 'too many resume requests', {
-      retryAfterSec: rate.retryAfterSec,
-    });
-  const bearer = request.headers.get('Authorization')!.slice(7);
-  const { sandboxId } = (await request.json()) as { sandboxId: string };
-  const registry = getDoRegistry(env, auth.userId);
-  // Cap check excludes the about-to-resume cone since it transitions.
-  const all = await registry.list();
-  const others = all.filter((c) => c.sandboxId !== sandboxId);
-  const cap = checkCapsForRun(others, env);
-  if (!cap.ok) {
-    return errorResponse(403, 'CAP_EXCEEDED', 'resuming would exceed running cap', {
-      running: cap.running,
-      cap: { running: cap.runningCap, paused: cap.pausedCap },
-    });
-  }
-  try {
-    const substrate = deps.substrate ?? buildSubstrate(env);
-    const result = await resumeCone(
-      { substrate, registry },
-      {
-        query: sandboxId,
-        localSliccVersion: 'web-' + new Date().toISOString().slice(0, 10),
-        refreshSecretsContents: [
-          `ADOBE_IMS_TOKEN=${bearer}`,
-          `ADOBE_IMS_TOKEN_DOMAINS=${ADOBE_TOKEN_DOMAINS}`,
-        ].join('\n'),
-      }
-    );
-    return okResponse({
-      sandboxId: result.sandboxId,
-      joinUrl: result.joinUrl,
-      trayRebuilt: result.trayRebuilt,
-    });
-  } catch (err) {
-    return cloudErrorToResponse(err);
-  }
-}
-
-export async function handleKill(
-  request: Request,
-  env: CloudEnv,
-  deps: HandlerDeps = {}
-): Promise<Response> {
-  const auth = await authenticateRequest(request, env);
-  if (auth instanceof Response) return auth;
-  const rate = checkRateLimit(auth.userId, 'kill');
-  if (!rate.ok)
-    return errorResponse(429, 'RATE_LIMITED', 'too many kill requests', {
-      retryAfterSec: rate.retryAfterSec,
-    });
-  const { sandboxId } = (await request.json()) as { sandboxId: string };
-  const registry = getDoRegistry(env, auth.userId);
-  try {
-    const substrate = deps.substrate ?? buildSubstrate(env);
-    await killCone({ substrate, registry }, sandboxId);
-    return okResponse();
-  } catch (err) {
-    if (isCloudError(err) && err.code === 'NOT_FOUND') return okResponse();
-    return cloudErrorToResponse(err);
-  }
+// in CloudSessionsDurableObject:
+private substrate() {
+  if (this.env.__SUBSTRATE_FACTORY__) return this.env.__SUBSTRATE_FACTORY__();
+  return createSubstrate('e2b', { apiKey: this.env.E2B_API_KEY });
 }
 ```
 
-- [ ] **Step 2: Tests**
+(The `__SUBSTRATE_FACTORY__` field is never present in production Wrangler env. It's purely a test hatch.)
 
-Add three tests:
+- [ ] **Step 2: Test the DO directly**
 
 ```ts
-describe('handlePause', () => {
-  it('pauses an existing running cone', async () => {
-    /* seed running, call /pause, assert DO entry now paused */
-  });
-});
+// packages/cloudflare-worker/tests/cloud-sessions-do.test.ts
+import { describe, it, expect } from 'vitest';
+import { CloudSessionsDurableObject } from '../src/cloud/cloud-sessions-do.js';
+import { FakeSubstrate } from '@slicc/cloud-core/tests/fake-substrate';
 
-describe('handleResume', () => {
-  it('rejects when resuming would exceed running cap', async () => {
-    /* seed: 1 running + 1 paused. resume the paused → 403 CAP_EXCEEDED */
-  });
-});
+function makeFakeState() {
+  const storage = new Map<string, unknown>();
+  const state = {
+    storage: {
+      get: async (k: string) => storage.get(k),
+      put: async (k: string, v: unknown) => {
+        storage.set(k, v);
+      },
+      delete: async (k: string) => {
+        storage.delete(k);
+      },
+    },
+    blockConcurrencyWhile: async <T>(fn: () => Promise<T>) => fn(),
+  } as unknown as ConstructorParameters<typeof CloudSessionsDurableObject>[0];
+  return { state, storage };
+}
 
-describe('handleKill', () => {
-  it('is idempotent — kill of missing cone returns 200', async () => {
-    /* no seed, call /kill, expect 200 */
+function makeDoEnv(substrate: FakeSubstrate) {
+  return {
+    E2B_API_KEY: 'test',
+    CONE_CAP_RUNNING: '1',
+    CONE_CAP_PAUSED: '5',
+    __SUBSTRATE_FACTORY__: () => substrate,
+  };
+}
+
+async function call(
+  do_: CloudSessionsDurableObject,
+  path: string,
+  body: unknown
+): Promise<Response> {
+  return do_.fetch(
+    new Request(`https://do${path}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    })
+  );
+}
+
+describe('CloudSessionsDurableObject — lifecycle endpoints', () => {
+  it('start-cone returns 403 CAP_EXCEEDED when running cap is hit', async () => {
+    const substrate = new FakeSubstrate();
+    substrate.seedSandbox('s1', {
+      metadata: { userId: 'u1', name: 'existing' },
+      state: 'running',
+    });
+    const { state } = makeFakeState();
+    const do_ = new CloudSessionsDurableObject(state, makeDoEnv(substrate));
+    // First start: succeeds (substrate.list sees s1, but DO is empty → reconciliation
+    // rebuilds DO with s1 as running; cap check then rejects).
+    const res = await call(do_, '/start-cone', {
+      bearer: 'b',
+      userId: 'u1',
+      email: 'k@adobe.com',
+      workerOrigin: 'https://w',
+    });
+    expect(res.status).toBe(403);
+    const body = (await res.json()) as { error: string };
+    expect(body.error).toBe('CAP_EXCEEDED');
+  });
+
+  it('kill-cone is idempotent', async () => {
+    const substrate = new FakeSubstrate();
+    const { state } = makeFakeState();
+    const do_ = new CloudSessionsDurableObject(state, makeDoEnv(substrate));
+    const res = await call(do_, '/kill-cone', { sandboxId: 'never-existed' });
+    expect(res.status).toBe(200);
+  });
+
+  it('list-cones reconciles DO state against substrate', async () => {
+    const substrate = new FakeSubstrate();
+    substrate.seedSandbox('s-orphan', {
+      metadata: { userId: 'u1', name: 'orphan' },
+      state: 'running',
+    });
+    const { state } = makeFakeState();
+    const do_ = new CloudSessionsDurableObject(state, makeDoEnv(substrate));
+    const res = await call(do_, '/list-cones', { userId: 'u1' });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { cones: Array<{ sandboxId: string }> };
+    // Orphan in substrate gets reconciled into the DO.
+    expect(body.cones.some((c) => c.sandboxId === 's-orphan')).toBe(true);
   });
 });
 ```
-
-(Sketches; flesh out with the helpers from D9.)
 
 - [ ] **Step 3: Verify + commit**
 
 ```bash
-npx vitest run --project cloudflare-worker packages/cloudflare-worker/tests/cloud-handlers.test.ts
+npx vitest run --project cloudflare-worker packages/cloudflare-worker/tests/cloud-sessions-do.test.ts
 git add -A
-git commit -m "feat(worker/cloud): /pause /resume /kill with cap-on-resume + idempotent kill"
+git commit -m "test(worker/cloud): DO lifecycle endpoints — cap, idempotent kill, reconciliation"
 ```
 
 ---
@@ -1576,21 +1653,39 @@ git commit -m "feat(worker/cloud): wire /api/cloud/* routes in worker dispatcher
 - Create: `packages/cloudflare-worker/src/auth/cloud-callback.ts`
 - Modify: `packages/cloudflare-worker/src/index.ts`
 
-- [ ] **Step 1: Create the callback**
+- [ ] **Step 1: Create the callback HTML (no inline JS) + external script**
+
+The popup carries an IMS bearer in `location.hash`. Per the spec's security section, the CSP must be `script-src 'self'` — no inline JS — so the token-bearing page doesn't loosen its CSP. Two files: HTML shell + external JS.
+
+`packages/cloudflare-worker/src/auth/cloud-callback.ts`:
 
 ```ts
-// packages/cloudflare-worker/src/auth/cloud-callback.ts
 const HTML = `<!doctype html>
 <html><head><meta charset="utf-8"><title>Signing in…</title></head>
-<body>
-<script>
+<body>Signing in… you can close this tab if it doesn't close automatically.
+<script src="/auth/cloud-callback.js"></script>
+</body></html>`;
+
+export function handleCloudCallback(): Response {
+  return new Response(HTML, {
+    headers: {
+      'content-type': 'text/html; charset=utf-8',
+      'content-security-policy': "default-src 'self'; script-src 'self'; frame-ancestors 'none';",
+    },
+  });
+}
+```
+
+`packages/webapp/src/cloud-dashboard/auth-callback.js` (built to `dist/ui/auth/cloud-callback.js` via the same webapp build pipeline that handles the dashboard — add it as an extra rollup input):
+
+```js
 (function () {
   var hash = window.location.hash.replace(/^#/, '');
   var params = new URLSearchParams(hash);
   var token = params.get('access_token');
   var expiresIn = params.get('expires_in');
   if (!window.opener) {
-    document.body.innerText = 'Sign-in completed, but no opener — close this tab.';
+    document.body.textContent = 'Sign-in completed, but no opener — close this tab.';
     return;
   }
   if (token) {
@@ -1606,22 +1701,9 @@ const HTML = `<!doctype html>
   }
   window.close();
 })();
-</script>
-Signing in… you can close this tab if it doesn't close automatically.
-</body></html>`;
-
-export function handleCloudCallback(): Response {
-  return new Response(HTML, {
-    headers: {
-      'content-type': 'text/html; charset=utf-8',
-      'content-security-policy':
-        "default-src 'self'; script-src 'unsafe-inline'; frame-ancestors 'none';",
-    },
-  });
-}
 ```
 
-- [ ] **Step 2: Register**
+- [ ] **Step 2: Register both routes**
 
 In `packages/cloudflare-worker/src/index.ts`:
 
@@ -1631,6 +1713,10 @@ import { handleCloudCallback } from './auth/cloud-callback.js';
 // inside fetch() dispatcher:
 if (url.pathname === '/auth/cloud-callback') {
   return handleCloudCallback();
+}
+if (url.pathname === '/auth/cloud-callback.js') {
+  // Served by the ASSETS binding from dist/ui/auth/cloud-callback.js.
+  return env.ASSETS.fetch(new Request(new URL('/auth/cloud-callback.js', request.url), request));
 }
 ```
 
@@ -1652,12 +1738,14 @@ git commit -m "feat(worker/cloud): /auth/cloud-callback for IMS implicit-grant p
 
 **Files:**
 
-- Create: `packages/cloudflare-worker/static/cloud/index.html`
-- Create: `packages/cloudflare-worker/static/cloud/styles.css`
-- Modify: `packages/cloudflare-worker/wrangler.jsonc` — static assets binding
-- Modify: `packages/cloudflare-worker/src/index.ts` — serve /cloud
+- Create: `packages/webapp/src/cloud-dashboard/index.html`
+- Create: `packages/webapp/src/cloud-dashboard/styles.css`
+- Modify: `packages/webapp/vite.config.ts` (or equivalent) — emit dashboard files to `dist/ui/cloud/`
+- Modify: `packages/cloudflare-worker/src/index.ts` — serve `/cloud` from existing ASSETS binding
 
-- [ ] **Step 1: index.html**
+**Why this location:** the worker already binds `assets.directory` to `../../dist/ui/` for the existing webapp SPA + tray join/controller pages. Creating a new `static/` directory would conflict with that binding. Instead, the dashboard is built alongside the webapp into `dist/ui/cloud/` — same build pipeline, same ASSETS binding, no wrangler.jsonc changes.
+
+- [ ] **Step 1: index.html** (lives at `packages/webapp/src/cloud-dashboard/index.html`; built to `dist/ui/cloud/index.html`)
 
 ```html
 <!doctype html>
@@ -1842,7 +1930,7 @@ git commit -m "feat(worker/cloud): dashboard HTML+CSS skeleton at /cloud with CS
 
 **Files:**
 
-- Create: `packages/cloudflare-worker/static/cloud/app.js`
+- Create: `packages/webapp/src/cloud-dashboard/app.js`
 
 - [ ] **Step 1: Create app.js (sign-in only; list/actions in next tasks)**
 
@@ -1984,7 +2072,7 @@ git commit -m "feat(dashboard): IMS implicit-grant sign-in flow"
 
 **Files:**
 
-- Modify: `packages/cloudflare-worker/static/cloud/app.js`
+- Modify: `packages/webapp/src/cloud-dashboard/app.js`
 
 - [ ] **Step 1: Replace the `refreshList()` stub and add safe-DOM rendering**
 
@@ -2131,7 +2219,7 @@ git commit -m "feat(dashboard): list rendering with safe DOM construction + focu
 
 **Files:**
 
-- Modify: `packages/cloudflare-worker/static/cloud/app.js`
+- Modify: `packages/webapp/src/cloud-dashboard/app.js`
 
 - [ ] **Step 1: Replace the stubs**
 
