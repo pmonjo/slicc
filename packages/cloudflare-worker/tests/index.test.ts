@@ -134,15 +134,28 @@ const fakeAssets = {
     }),
 };
 
+const fakeCloudSessions = {
+  idFromName: (_name: string) => ({ toString: () => 'fake-cloud-id' }),
+  idFromString: (_id: string) => ({ toString: () => 'fake-cloud-id' }),
+  newUniqueId: () => ({ toString: () => 'fake-cloud-id' }),
+  get: (_id: unknown) => ({
+    fetch: async (_req: Request) => new Response('cloud DO not stubbed', { status: 501 }),
+  }),
+};
+
 function createTestHarness(start = Date.parse('2026-03-11T00:00:00.000Z')): {
-  env: { TRAY_HUB: FakeNamespace; ASSETS: typeof fakeAssets };
+  env: {
+    TRAY_HUB: FakeNamespace;
+    ASSETS: typeof fakeAssets;
+    CLOUD_SESSIONS: typeof fakeCloudSessions;
+  };
   advance: (ms: number) => void;
   readTray: (trayId: string) => Promise<TrayRecord | undefined>;
 } {
   let now = start;
   const namespace = new FakeNamespace(() => now);
   return {
-    env: { TRAY_HUB: namespace, ASSETS: fakeAssets },
+    env: { TRAY_HUB: namespace, ASSETS: fakeAssets, CLOUD_SESSIONS: fakeCloudSessions },
     advance: (ms: number) => {
       now += ms;
     },
