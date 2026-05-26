@@ -37,7 +37,6 @@ export function makeMockNamespace(): DurableObjectNamespaceLike {
       ({
         async fetch(input: string | Request, init?: RequestInit) {
           const url = typeof input === 'string' ? input : input.url;
-          const method = (typeof input === 'string' ? init?.method : input.method) ?? 'GET';
           const bodyRaw = typeof input === 'string' ? init?.body : await input.text();
           const body = bodyRaw ? (JSON.parse(bodyRaw.toString()) as Record<string, unknown>) : {};
           const endpoint = new URL(url).pathname;
