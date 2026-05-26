@@ -164,7 +164,6 @@ describe('CloudSessionsDurableObject — lifecycle endpoints', () => {
     const res = await call(do_, '/start-cone', {
       bearer: 'b',
       userId: 'u1',
-      email: 'k@adobe.com',
       workerOrigin: 'https://w',
       name: 'smoke',
     });
@@ -185,7 +184,6 @@ describe('CloudSessionsDurableObject — lifecycle endpoints', () => {
     const res = await call(do_, '/start-cone', {
       bearer: 'b',
       userId: 'u1',
-      email: 'k@adobe.com',
       workerOrigin: 'https://w',
     });
     expect(res.status).toBe(403);
@@ -203,7 +201,6 @@ describe('CloudSessionsDurableObject — lifecycle endpoints', () => {
     const res = await call(do_, '/start-cone', {
       bearer: 'b',
       userId: 'u1',
-      email: 'k@adobe.com',
       workerOrigin: 'https://w',
       name: ' existing ',
     });
@@ -263,7 +260,6 @@ describe('CloudSessionsDurableObject — lifecycle endpoints', () => {
     const res = await call(do_, '/start-cone', {
       bearer: 'b',
       userId: 'u1',
-      email: 'k@adobe.com',
       workerOrigin: 'https://w',
       name: 'slow-start',
     });

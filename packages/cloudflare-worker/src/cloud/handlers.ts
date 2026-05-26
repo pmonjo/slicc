@@ -59,7 +59,6 @@ export async function handleStart(request: Request, env: CloudEnv): Promise<Resp
     bearer,
     name: body.name,
     userId: auth.userId,
-    email: auth.email,
     workerOrigin: new URL(request.url).origin,
   });
 }

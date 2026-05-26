@@ -34,7 +34,6 @@ interface StartConeBody {
   bearer: string;
   name?: string;
   userId: string;
-  email: string;
   workerOrigin: string;
 }
 interface ResumeConeBody {
@@ -152,7 +151,7 @@ export class CloudSessionsDurableObject {
           workerBaseUrl: body.workerOrigin,
           sliccVersion: 'web-' + new Date().toISOString().slice(0, 10),
           name: body.name?.trim(),
-          metadata: { userId: body.userId, email: body.email },
+          metadata: { userId: body.userId },
         }
       );
       return okResponse({

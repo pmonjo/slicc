@@ -52,9 +52,11 @@ describe('handleStart', () => {
       bearer: 'test-bearer',
       name: 'smoke',
       userId: 'u1',
-      email: 'kpauls@adobe.com',
       workerOrigin: 'https://w.test',
     });
+    // Email must NOT be forwarded to the DO — it's PII and the e2b sandbox
+    // metadata is third-party-visible. Only userId (opaque IMS sub) flows.
+    expect(calls[0]!.body).not.toHaveProperty('email');
   });
 
   it('returns 401 without Authorization header', async () => {
