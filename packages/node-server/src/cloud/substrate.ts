@@ -1,7 +1,7 @@
-// Interfaces all live in @slicc/cloud-core now. The CLI keeps the
-// `createSubstrate` factory here until Task A5 moves it (and the e2b
-// adapter) into cloud-core. Until then, this file re-exports the
-// interfaces and provides the factory.
+// Interfaces, e2b adapter, and the createSubstrate factory all live in
+// @slicc/cloud-core now. This file is a thin re-export shim that
+// preserves the existing `./substrate.js` import path for node-server's
+// cloud-command files. Removed in Task A15.
 
 export type {
   SandboxSubstrate,
@@ -16,11 +16,4 @@ export type {
   SandboxSummary,
 } from '@slicc/cloud-core';
 
-import type { SubstrateFactory } from '@slicc/cloud-core';
-import { createE2bSubstrate } from './substrates/e2b.js';
-
-export const createSubstrate: SubstrateFactory = (id, cfg) => {
-  if (id === 'e2b') return createE2bSubstrate(cfg);
-  // SubstrateId is currently the literal 'e2b'; this branch is unreachable today.
-  throw new Error(`unknown substrate: ${id}`);
-};
+export { createSubstrate } from '@slicc/cloud-core';

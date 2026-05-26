@@ -28,6 +28,7 @@
     "e2b": "^2.23.0"
   },
   "devDependencies": {
+    "@types/node": "^24.12.4",
     "vitest": "^4.1.6"
   }
 }
