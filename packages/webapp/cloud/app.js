@@ -1,9 +1,14 @@
 const TOKEN_KEY = 'cloud-ims-token';
 const TOKEN_EXP_KEY = 'cloud-ims-token-exp';
-const IMS_AUTHORIZE_URL = 'https://ims-na1.adobelogin.com/ims/authorize/v2';
-const REDIRECT_URI = `${window.location.origin}/auth/cloud-callback`;
-const SCOPE = 'openid,profile,email,session,ab.manage';
-const IMS_CLIENT_ID = 'darkalley';
+
+let CONFIG = null;
+async function loadConfig() {
+  if (CONFIG) return CONFIG;
+  const res = await fetch('/api/cloud/config');
+  if (!res.ok) throw new Error('config fetch failed: ' + res.status);
+  CONFIG = await res.json();
+  return CONFIG;
+}
 
 function getToken() {
   const token = localStorage.getItem(TOKEN_KEY);
@@ -45,17 +50,43 @@ function setSignedOut() {
   document.getElementById('user-box').classList.add('hidden');
 }
 
-function startImsPopup() {
+async function startImsPopup() {
+  const config = await loadConfig();
+  const isOnRelayOrigin = new URL(config.imsRelayUrl).host === window.location.host;
+  const nonce = crypto.randomUUID();
+
+  let redirectUri;
+  let state;
+  if (isOnRelayOrigin) {
+    // Production: dashboard is on the same origin as the relay. Direct redirect.
+    redirectUri = window.location.origin + config.imsReceivePath;
+    state = nonce;
+  } else {
+    // Dev (localhost or other origin): bounce via sliccy.ai/auth/callback.
+    // The relay reads state, decodes { source, port, path, nonce }, and
+    // redirects to http://localhost:<port>/auth/cloud-callback?nonce=<nonce>#<original-hash>.
+    redirectUri = config.imsRelayUrl;
+    const port = Number(window.location.port) || (window.location.protocol === 'https:' ? 443 : 80);
+    state = btoa(
+      JSON.stringify({
+        source: 'local',
+        port,
+        path: config.imsReceivePath,
+        nonce,
+      })
+    );
+  }
+
   return new Promise((resolve, reject) => {
     const params = new URLSearchParams({
-      client_id: IMS_CLIENT_ID,
-      scope: SCOPE,
+      client_id: config.imsClientId,
+      scope: config.imsScope,
       response_type: 'token',
-      redirect_uri: REDIRECT_URI,
-      state: crypto.randomUUID(),
+      redirect_uri: redirectUri,
+      state,
     });
     const popup = window.open(
-      `${IMS_AUTHORIZE_URL}?${params}`,
+      `${config.imsAuthorizeUrl}?${params}`,
       'sliccy-cloud-ims',
       'width=480,height=640'
     );
@@ -294,3 +325,16 @@ if (getToken()) {
 } else {
   setSignedOut();
 }
+
+const signInBtn = document.getElementById('sign-in-btn');
+signInBtn.disabled = true;
+signInBtn.textContent = 'Loading…';
+loadConfig()
+  .then(() => {
+    signInBtn.disabled = false;
+    signInBtn.textContent = 'Sign in with Adobe';
+  })
+  .catch((e) => {
+    signInBtn.textContent = 'Config error';
+    showToast('Could not load IMS config: ' + e.message);
+  });

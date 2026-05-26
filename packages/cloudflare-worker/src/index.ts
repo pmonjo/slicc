@@ -29,6 +29,7 @@ import {
 import { handleSignOut } from './cloud/handler-signout.js';
 import { handleAdminStats } from './cloud/handler-admin.js';
 import { handleCloudCallback, handleCloudCallbackScript } from './auth/cloud-callback.js';
+import { handleCloudConfig } from './cloud/handler-config.js';
 
 export interface WorkerEnv {
   TRAY_HUB: DurableObjectNamespaceLike;
@@ -112,6 +113,8 @@ export async function handleWorkerRequest(
     const cloudEnv = env as unknown as Parameters<typeof handleStart>[1];
     const adminEnv = env as unknown as Parameters<typeof handleAdminStats>[1];
     switch (op) {
+      case 'config':
+        return handleCloudConfig(request, env);
       case 'start':
         return handleStart(request, cloudEnv);
       case 'list':
@@ -332,6 +335,7 @@ export async function handleWorkerRequest(
         'POST /oauth/revoke',
         'GET /api/runtime-config',
         'ANY /api/fetch-proxy',
+        'GET /api/cloud/config',
         'POST /api/cloud/start',
         'GET /api/cloud/list',
         'POST /api/cloud/pause',
