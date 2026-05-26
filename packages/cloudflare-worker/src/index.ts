@@ -20,6 +20,16 @@ import { buildApiCatalogResponse } from './api-catalog.js';
 import { buildLlmsTxtResponse } from './llms-txt.js';
 import { buildRelResponse } from './rel-docs.js';
 import { handleSpike } from './spike/cloud-spike.js';
+import {
+  handleStart,
+  handleList,
+  handlePause,
+  handleResume,
+  handleKill,
+} from './cloud/handlers.js';
+import { handleSignOut } from './cloud/handler-signout.js';
+import { handleAdminStats } from './cloud/handler-admin.js';
+import { handleCloudCallback, handleCloudCallbackScript } from './auth/cloud-callback.js';
 
 export interface WorkerEnv {
   TRAY_HUB: DurableObjectNamespaceLike;
@@ -95,6 +105,37 @@ export async function handleWorkerRequest(
     target.hostname = 'www.sliccy.ai';
     return Response.redirect(target.toString(), 301);
   }
+
+  // Cloud cones routes (Plan D).
+  if (url.pathname.startsWith('/api/cloud/')) {
+    const op = url.pathname.replace('/api/cloud/', '');
+    // Handlers expect CloudEnv/AdminEnv types, which are structurally compatible
+    // with WorkerEnv but have different optionality. Cast at dispatch boundary.
+    const cloudEnv = env as unknown as Parameters<typeof handleStart>[1];
+    const adminEnv = env as unknown as Parameters<typeof handleAdminStats>[1];
+    switch (op) {
+      case 'start':
+        return handleStart(request, cloudEnv);
+      case 'list':
+        return handleList(request, cloudEnv);
+      case 'pause':
+        return handlePause(request, cloudEnv);
+      case 'resume':
+        return handleResume(request, cloudEnv);
+      case 'kill':
+        return handleKill(request, cloudEnv);
+      case 'sign-out':
+        return handleSignOut(request);
+      case 'admin/stats':
+        return handleAdminStats(request, adminEnv);
+      default:
+        return new Response(`unknown cloud op: ${op}`, { status: 404 });
+    }
+  }
+
+  // IMS implicit-grant callback (Plan D).
+  if (url.pathname === '/auth/cloud-callback') return handleCloudCallback();
+  if (url.pathname === '/auth/cloud-callback.js') return handleCloudCallbackScript();
 
   if (url.pathname.startsWith('/spike/')) {
     return handleSpike(request, env);
@@ -271,6 +312,15 @@ export async function handleWorkerRequest(
         'POST /oauth/revoke',
         'GET /api/runtime-config',
         'ANY /api/fetch-proxy',
+        'POST /api/cloud/start',
+        'GET /api/cloud/list',
+        'POST /api/cloud/pause',
+        'POST /api/cloud/resume',
+        'POST /api/cloud/kill',
+        'POST /api/cloud/sign-out',
+        'GET /api/cloud/admin/stats',
+        'GET /auth/cloud-callback',
+        'GET /auth/cloud-callback.js',
       ],
     },
     200
