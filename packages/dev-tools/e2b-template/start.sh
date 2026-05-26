@@ -24,6 +24,14 @@ ADOBE_IMS_TOKEN_DOMAINS=${ADOBE_IMS_TOKEN_DOMAINS:-adobe-llm-proxy.paolo-moz.wor
 EOF
 fi
 
+# Clear stale /tmp/slicc-join.json that the template snapshot baked in.
+# E2B's template build waits for this file to appear before snapshotting, so
+# every cloned sandbox starts with a build-time stale copy. node-server will
+# write a fresh one once it registers a tray; pollCloudStatus reads the
+# freshly-stamped updatedAt and rejects the stale snapshot anyway, but
+# clearing the file gives us deterministic empty-→-fresh transition.
+rm -f /tmp/slicc-join.json
+
 # Tee stderr to /tmp/slicc-stderr.log AND keep it on container stderr so it
 # surfaces in e2b build logs (otherwise build-time failures are blind).
 # tee in a process-substitution preserves the exec's exit code.

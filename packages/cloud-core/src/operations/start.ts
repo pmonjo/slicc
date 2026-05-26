@@ -69,6 +69,13 @@ export async function startCone(deps: StartConeDeps, opts: StartConeOpts): Promi
     },
     name: opts.name,
   });
+  // Capture freshness baseline AFTER sandbox creation: any /tmp/slicc-join.json
+  // with updatedAt at or before this ISO is from the template snapshot, not
+  // the new sandbox's leader. Subtract a small skew margin for clock drift
+  // between the worker fetching this timestamp and the sandbox writing the
+  // file: the sandbox's clock might be slightly behind, so a tiny margin
+  // gives the leader's first real write a chance to be accepted.
+  const minUpdatedAt = new Date(Date.now() - 5_000).toISOString();
 
   try {
     // Two-layer secrets bootstrap (see Plan B): start.sh prefers env-derived
@@ -81,6 +88,7 @@ export async function startCone(deps: StartConeDeps, opts: StartConeOpts): Promi
       status = await pollCloudStatus(handle, {
         timeoutMs: opts.pollTimeoutMs ?? 60_000,
         intervalMs: opts.pollIntervalMs ?? 500,
+        minUpdatedAt,
       });
     } catch (pollErr) {
       // Surface boot diagnostics before tearing down. Spec failure mode #7.
