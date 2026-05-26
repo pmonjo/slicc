@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { killCone, type CloudError } from '../src/index.js';
 import type { SubstrateId, SandboxHandle } from '../src/index.js';
-import { MemRegistry, makeFakeHandle, makeFakeSubstrate } from './fixtures/index.js';
+import { MemRegistry, makeFakeSubstrate } from './fixtures/index.js';
 
 // Specialized handle for kill tests: allows controlled throw on kill.
 function makeKillTestHandle(throwOnKill?: Error): SandboxHandle {

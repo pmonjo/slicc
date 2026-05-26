@@ -1,6 +1,5 @@
 import { describe, it, expect } from 'vitest';
 import { listCones } from '../src/operations/list.js';
-import type { SandboxSummary } from '../src/index.js';
 import { MemRegistry, makeFakeSubstrate } from './fixtures/index.js';
 
 describe('listCones', () => {
