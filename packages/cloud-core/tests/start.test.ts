@@ -55,7 +55,7 @@ function makeStartTestSubstrate(opts: { joinJson: string }): SandboxSubstrate {
 }
 
 describe('startCone', () => {
-  it('creates a sandbox, polls join.json, appends to registry, returns StartResult', async () => {
+  it('creates a sandbox, polls join.json, appends placeholder then updates registry, returns StartResult', async () => {
     // Use a recent timestamp that will pass the minUpdatedAt check (5s skew margin)
     const updatedAt = new Date().toISOString();
     const substrate = makeStartTestSubstrate({
@@ -79,6 +79,7 @@ describe('startCone', () => {
     expect(result.name).toBe('smoke');
     expect(result.sandboxId).toBe('sbx-fake');
 
+    // After completion, should have exactly one entry with the full data (placeholder updated)
     const entries = await registry.list();
     expect(entries).toHaveLength(1);
     expect(entries[0]?.name).toBe('smoke');
@@ -86,9 +87,10 @@ describe('startCone', () => {
     expect(entries[0]?.lastJoinUpdatedAt).toBe(updatedAt);
     expect(entries[0]?.trayId).toBe('t-1');
     expect(entries[0]?.substrate).toBe('e2b');
+    expect(entries[0]?.joinUrl).toBe('https://w/join/x');
   });
 
-  it('throws SANDBOX_NOT_READY when pollCloudStatus times out', async () => {
+  it('throws SANDBOX_NOT_READY when pollCloudStatus times out and cleans up placeholder', async () => {
     const substrate = makeStartTestSubstrate({ joinJson: '{}' }); // no joinUrl → poll never returns
     const registry = new MemRegistry();
     await expect(
@@ -103,7 +105,7 @@ describe('startCone', () => {
         }
       )
     ).rejects.toMatchObject({ name: 'CloudError', code: 'SANDBOX_NOT_READY' });
-    // Registry should have no entries (best-effort cleanup happened pre-throw).
+    // Registry should have no entries (placeholder was removed during cleanup).
     expect(await registry.list()).toHaveLength(0);
     // Substrate should have no sandboxes (killed during cleanup).
     expect(await substrate.list()).toHaveLength(0);
@@ -157,6 +159,76 @@ describe('startCone', () => {
         }
       )
     ).rejects.toThrow(/missing deps/);
+  });
+
+  it('appends placeholder entry to registry BEFORE pollCloudStatus runs', async () => {
+    // This test protects against the orphan-recovery race: concurrent /list-cones
+    // calls should see the new sandbox in the registry (pass 1) during the slow
+    // poll window, NOT go through orphan recovery (pass 2).
+    const updatedAt = new Date().toISOString();
+    let pollStarted = false;
+    let entryPresentAtPollStart = false;
+
+    const registry = new MemRegistry();
+
+    // Create a custom substrate that captures the registry state when readFile
+    // is first called (which happens inside pollCloudStatus).
+    const substrate: SandboxSubstrate = {
+      id: 'e2b' as SubstrateId,
+      async create(_opts: CreateOpts): Promise<SandboxHandle> {
+        const handle = makeFakeHandle({ sandboxId: 'sbx-race' });
+        return {
+          sandboxId: handle.sandboxId,
+          substrate: handle.substrate,
+          pause: handle.pause,
+          kill: handle.kill,
+          getInfo: handle.getInfo,
+          writeFile: handle.writeFile,
+          readFile: async (path: string) => {
+            if (path === '/tmp/slicc-join.json' && !pollStarted) {
+              pollStarted = true;
+              // Check if the registry already has an entry for this sandbox
+              const entries = await registry.list();
+              entryPresentAtPollStart = entries.some((e) => e.sandboxId === 'sbx-race');
+            }
+            if (path === '/tmp/slicc-join.json') {
+              return JSON.stringify({
+                joinUrl: 'https://w/join/race',
+                trayId: 't-race',
+                updatedAt,
+              });
+            }
+            throw new Error(`ENOENT ${path}`);
+          },
+          run: handle.run,
+        } as SandboxHandle;
+      },
+      async connect() {
+        throw new Error('not used');
+      },
+      async list(): Promise<SandboxSummary[]> {
+        return [];
+      },
+    };
+
+    await startCone(
+      { substrate, registry },
+      {
+        envContents: '',
+        workerBaseUrl: 'https://w',
+        sliccVersion: 'test',
+      }
+    );
+
+    // The placeholder should have been present in the registry BEFORE pollCloudStatus
+    // started reading the file.
+    expect(entryPresentAtPollStart).toBe(true);
+
+    // After completion, verify the entry was updated with the real joinUrl
+    const entries = await registry.list();
+    expect(entries).toHaveLength(1);
+    expect(entries[0]?.sandboxId).toBe('sbx-race');
+    expect(entries[0]?.joinUrl).toBe('https://w/join/race');
   });
 
   it('rejects stale /tmp/slicc-join.json from template snapshot and waits for fresh one', async () => {
@@ -237,9 +309,11 @@ describe('startCone', () => {
     expect(result.joinUrl).toBe('https://w/join/fresh');
     expect(readCount).toBeGreaterThan(1); // Proves the stale read was rejected
 
+    // After update, should have exactly one entry with the fresh data
     const entries = await registry.list();
     expect(entries).toHaveLength(1);
     expect(entries[0]?.trayId).toBe('t-fresh');
     expect(entries[0]?.lastJoinUpdatedAt).toBe(freshUpdatedAt);
+    expect(entries[0]?.joinUrl).toBe('https://w/join/fresh');
   });
 });

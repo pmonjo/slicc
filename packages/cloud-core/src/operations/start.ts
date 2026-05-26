@@ -69,6 +69,7 @@ export async function startCone(deps: StartConeDeps, opts: StartConeOpts): Promi
     },
     name: opts.name,
   });
+
   // Capture freshness baseline AFTER sandbox creation: any /tmp/slicc-join.json
   // with updatedAt at or before this ISO is from the template snapshot, not
   // the new sandbox's leader. Subtract a small skew margin for clock drift
@@ -76,6 +77,28 @@ export async function startCone(deps: StartConeDeps, opts: StartConeOpts): Promi
   // file: the sandbox's clock might be slightly behind, so a tiny margin
   // gives the leader's first real write a chance to be accepted.
   const minUpdatedAt = new Date(Date.now() - 5_000).toISOString();
+  const createdAt = new Date().toISOString();
+
+  // Pre-append a placeholder entry IMMEDIATELY after create returns. This
+  // ensures concurrent /list-cones calls see the cone in the registry
+  // (pass 1) instead of treating it as an orphan (pass 2). The empty joinUrl
+  // means the dashboard hides the Open button until pollCloudStatus completes
+  // and the entry is updated below.
+  //
+  // Without this pre-append, the orphan recovery in listCones would call
+  // substrate.connect() + readFile('/tmp/slicc-join.json') during the slow
+  // poll window — which reads the stale template-baked URL, races into the
+  // dashboard, and lets the user click an Open link pointing at a dead tray.
+  const placeholder: ConeEntry = {
+    substrate: deps.substrate.id,
+    sandboxId: handle.sandboxId,
+    name: opts.name,
+    createdAt,
+    lastSeen: createdAt,
+    state: 'running',
+    joinUrl: '',
+  };
+  await deps.registry.append(placeholder);
 
   try {
     // Two-layer secrets bootstrap (see Plan B): start.sh prefers env-derived
@@ -101,19 +124,13 @@ export async function startCone(deps: StartConeDeps, opts: StartConeOpts): Promi
       );
     }
 
-    const now = new Date().toISOString();
-    const entry: ConeEntry = {
-      substrate: deps.substrate.id,
-      sandboxId: handle.sandboxId,
-      name: opts.name,
-      createdAt: now,
-      lastSeen: now,
-      state: 'running',
+    // Promote the placeholder to a fully-populated entry.
+    await deps.registry.update(handle.sandboxId, {
       joinUrl: status.joinUrl,
       trayId: status.trayId,
       lastJoinUpdatedAt: status.updatedAt,
-    };
-    await deps.registry.append(entry);
+      lastSeen: new Date().toISOString(),
+    });
 
     return {
       sandboxId: handle.sandboxId,
@@ -121,11 +138,16 @@ export async function startCone(deps: StartConeDeps, opts: StartConeOpts): Promi
       joinUrl: status.joinUrl,
     };
   } catch (err) {
-    // Best-effort cleanup; ignore errors during teardown.
+    // Best-effort cleanup: remove the placeholder entry and kill the sandbox.
+    try {
+      await deps.registry.remove(handle.sandboxId);
+    } catch {
+      /* swallow */
+    }
     try {
       await handle.kill();
     } catch {
-      // Swallow — surfacing the start error is more useful.
+      /* swallow */
     }
     throw err;
   }
