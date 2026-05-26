@@ -16,12 +16,7 @@ export type {
   SandboxSummary,
 } from '@slicc/cloud-core';
 
-import type {
-  SubstrateConfig,
-  SandboxSubstrate,
-  SubstrateId,
-  SubstrateFactory,
-} from '@slicc/cloud-core';
+import type { SubstrateFactory } from '@slicc/cloud-core';
 import { createE2bSubstrate } from './substrates/e2b.js';
 
 export const createSubstrate: SubstrateFactory = (id, cfg) => {
