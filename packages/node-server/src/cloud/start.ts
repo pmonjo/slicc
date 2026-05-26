@@ -17,8 +17,24 @@ export interface RunStartOpts {
   onAfterCreate?: (handle: SandboxHandle) => Promise<void>;
 }
 
+/**
+ * Extract ADOBE_IMS_TOKEN (+ DOMAINS) from an env-file body so they can be
+ * injected as sandbox env vars at Sandbox.create. start.sh writes them to
+ * /slicc/secrets.env BEFORE node-server boots, eliminating the historical 5s
+ * race window where the page-side bootstrap fetch found no secrets file.
+ */
+function extractAdobeBootstrap(envContents: string): Record<string, string> {
+  const envs: Record<string, string> = {};
+  for (const line of envContents.split('\n')) {
+    const m = line.match(/^\s*(ADOBE_IMS_TOKEN(?:_DOMAINS)?)\s*=\s*(.*)$/);
+    if (m) envs[m[1]!] = m[2]!.trim();
+  }
+  return envs;
+}
+
 export async function runStart(opts: RunStartOpts): Promise<StartResult> {
   const envContents = await fs.readFile(opts.envFilePath, 'utf-8');
+  const adobeBootstrap = extractAdobeBootstrap(envContents);
   const registry = new FileRegistry(opts.registryPath);
 
   // If we have a test hook, wrap the substrate to inject it.
@@ -39,6 +55,7 @@ export async function runStart(opts: RunStartOpts): Promise<StartResult> {
     { substrate, registry },
     {
       envContents,
+      envs: adobeBootstrap,
       workerBaseUrl: opts.workerBaseUrl,
       template: opts.template,
       name: opts.name,

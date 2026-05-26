@@ -144,4 +144,53 @@ describe('slicc --cloud start', () => {
       })
     ).rejects.toThrow();
   });
+
+  it('extracts ADOBE_IMS_TOKEN and ADOBE_IMS_TOKEN_DOMAINS into sandbox envVars', async () => {
+    // Write a secrets.env with ADOBE_IMS_TOKEN, ADOBE_IMS_TOKEN_DOMAINS, and OTHER_SECRET
+    const adobeEnvFile = path.join(dir, 'adobe-secrets.env');
+    await fs.writeFile(
+      adobeEnvFile,
+      [
+        'ADOBE_IMS_TOKEN=ims-token-123',
+        'ADOBE_IMS_TOKEN_DOMAINS=adobe.io,adobelogin.com',
+        'OTHER_SECRET=do-not-include',
+        'ANTHROPIC_API_KEY=sk-test',
+      ].join('\n') + '\n'
+    );
+
+    const substrate = new FakeSubstrate();
+    await runStart({
+      substrate,
+      envFilePath: adobeEnvFile,
+      registryPath,
+      sliccVersion: '3.2.2',
+      workerBaseUrl: 'https://www.sliccy.ai',
+      pollTimeoutMs: 5_000,
+      pollIntervalMs: 10,
+      onAfterCreate: async (handle) => {
+        await handle.writeFile(
+          '/tmp/slicc-join.json',
+          JSON.stringify({
+            joinUrl: 'https://www.sliccy.ai/join/tok',
+            trayId: 't1',
+            controllerUrl: 'wss://w/controller/c',
+            webhookUrl: 'https://w/webhook/wb/wid',
+            runtime: 'slicc-hosted-leader',
+            sliccVersion: '3.2.2',
+            updatedAt: new Date().toISOString(),
+          })
+        );
+      },
+    });
+
+    // Assert that the substrate received envVars with ADOBE_IMS_TOKEN and ADOBE_IMS_TOKEN_DOMAINS
+    expect(substrate.lastCreateOpts).toBeTruthy();
+    expect(substrate.lastCreateOpts?.envVars).toMatchObject({
+      ADOBE_IMS_TOKEN: 'ims-token-123',
+      ADOBE_IMS_TOKEN_DOMAINS: 'adobe.io,adobelogin.com',
+      SLICC_TRAY_WORKER_BASE_URL: 'https://www.sliccy.ai',
+    });
+    // OTHER_SECRET should NOT be in envVars (stays in envContents file)
+    expect(substrate.lastCreateOpts?.envVars?.OTHER_SECRET).toBeUndefined();
+  });
 });

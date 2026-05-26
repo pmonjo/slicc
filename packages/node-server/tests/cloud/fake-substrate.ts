@@ -21,8 +21,11 @@ export class FakeSubstrate implements SandboxSubstrate {
   readonly id = 'e2b' as const;
   readonly sandboxes = new Map<string, FakeSandboxData>();
   private nextId = 0;
+  /** Last CreateOpts passed to create(), for test assertions. */
+  public lastCreateOpts: CreateOpts | null = null;
 
   async create(opts: CreateOpts): Promise<SandboxHandle> {
+    this.lastCreateOpts = opts;
     const id = `fake-${++this.nextId}`;
     const data: FakeSandboxData = {
       id,
