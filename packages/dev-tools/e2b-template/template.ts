@@ -53,10 +53,11 @@ async function main(): Promise<void> {
     // to satisfy the import graph).
     .runCmd('cd /opt/slicc && npm install --omit=dev --ignore-scripts')
     .makeDir(['/data/profile', '/slicc'])
-    .setStartCmd('slicc-start', waitForFile('/tmp/slicc-join.json'));
+    .setStartCmd('slicc-start', waitForFile('/usr/local/bin/slicc-start'));
 
   console.log('Template definition built, starting Template.build…');
   const buildInfo = await Template.build(template, 'slicc', {
+    memoryMB: 2048,
     onBuildLogs: defaultBuildLogger({ minLevel: 'debug' }),
   });
   console.log('Published template slicc:', buildInfo);
