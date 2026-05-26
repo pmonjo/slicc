@@ -1,5 +1,5 @@
-import { describe, it, expect, beforeAll, beforeEach, vi, afterEach } from 'vitest';
-import { SignJWT, exportJWK, generateKeyPair, type KeyLike } from 'jose';
+import { describe, it, expect, beforeAll, vi, afterEach } from 'vitest';
+import { SignJWT, exportJWK, generateKeyPair, type CryptoKey } from 'jose';
 import { validateBearer, AuthError, extractBearer } from '../src/cloud/auth.js';
 
 const ENV = {
@@ -10,8 +10,8 @@ const ENV = {
   REQUIRE_OWNER_ORG: 'false',
 };
 
-let privateKey: KeyLike;
-let publicKey: KeyLike;
+let privateKey: CryptoKey;
+let publicKey: CryptoKey;
 let kid: string;
 let fetchSpy: ReturnType<typeof vi.spyOn>;
 
@@ -133,8 +133,8 @@ describe('validateBearer', () => {
 
 describe('extractBearer', () => {
   it('throws MISSING_TOKEN for missing Authorization header', () => {
-    expect(() => extractBearer(new Request('https://x/'))).toThrowError(AuthError);
-    expect(() => extractBearer(new Request('https://x/'))).toThrowError(/expected Authorization/);
+    expect(() => extractBearer(new Request('https://x/'))).toThrow(AuthError);
+    expect(() => extractBearer(new Request('https://x/'))).toThrow(/expected Authorization/);
   });
 
   it('extracts Bearer token correctly', () => {
