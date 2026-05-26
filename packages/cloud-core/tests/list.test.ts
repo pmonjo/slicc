@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { listCones } from '../src/operations/list.js';
 import { MemRegistry, makeFakeSubstrate } from './fixtures/index.js';
+import type { SandboxSubstrate } from '../src/index.js';
 
 describe('listCones', () => {
   it('returns registry entries enriched with live state', async () => {
@@ -178,21 +179,56 @@ describe('listCones', () => {
     expect(recovered?.lastJoinUpdatedAt).toBe('2026-05-27T00:00:00Z');
   });
 
-  it('gracefully handles orphans where /tmp/slicc-join.json is unreadable', async () => {
+  it('does not call substrate.connect for paused orphans (no auto-resume)', async () => {
     const registry = new MemRegistry();
+    // connectError proves connect was NOT called — if it were called, listCones
+    // would throw or swallow the error, but we want to prove the branch is skipped.
     const substrate = makeFakeSubstrate({
       listResult: [
         {
-          sandboxId: 's-orphan-unreadable',
+          sandboxId: 's-paused-orphan',
           state: 'paused',
           metadata: { name: 'paused-orphan' },
         },
       ],
-      connectError: new Error('sandbox paused, cannot connect'),
+      connectError: new Error('connect should not be called for paused orphans'),
     });
     const result = await listCones({ substrate, registry });
-    const recovered = result.find((c) => c.sandboxId === 's-orphan-unreadable');
+    const recovered = result.find((c) => c.sandboxId === 's-paused-orphan');
+    // If connect had been called, the error would have been swallowed by the catch,
+    // but we still expect recovery to succeed with empty joinUrl.
     expect(recovered?.joinUrl).toBe('');
     expect(recovered?.state).toBe('paused');
+    // Verify the entry was added to registry
+    expect(registry.entries.some((e) => e.sandboxId === 's-paused-orphan')).toBe(true);
+  });
+
+  it('calls substrate.connect only for running orphans, not paused', async () => {
+    const registry = new MemRegistry();
+    const connects: string[] = [];
+    const fakeHandle = makeFakeSubstrate().connect('fake');
+    const substrate: SandboxSubstrate = {
+      id: 'e2b' as const,
+      async create() {
+        throw new Error('create should not be called');
+      },
+      async connect(sandboxId: string) {
+        connects.push(sandboxId);
+        return fakeHandle;
+      },
+      async list() {
+        return [
+          { sandboxId: 's-running', state: 'running' as const, metadata: { name: 'running' } },
+          { sandboxId: 's-paused', state: 'paused' as const, metadata: { name: 'paused' } },
+        ];
+      },
+    };
+    await listCones({ substrate, registry });
+    // Only the running sandbox should trigger a connect call
+    expect(connects).toEqual(['s-running']);
+    // Both orphans should be recovered
+    expect(registry.entries).toHaveLength(2);
+    const paused = registry.entries.find((e) => e.sandboxId === 's-paused');
+    expect(paused?.joinUrl).toBe(''); // No joinUrl recovery for paused
   });
 });

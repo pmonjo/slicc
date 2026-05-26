@@ -76,7 +76,13 @@ export async function listCones(
     let trayId = summary.metadata?.['trayId'];
     let lastJoinUpdatedAt = summary.metadata?.['lastJoinUpdatedAt'];
 
-    if (!joinUrl) {
+    // Recover joinUrl from /tmp/slicc-join.json ONLY when sandbox is running.
+    // Calling substrate.connect() on a paused sandbox would RESUME it, which:
+    // (a) burns sandbox runtime silently
+    // (b) destabilizes the leader chromium mid-list
+    // Paused orphans surface with joinUrl='' — UI hides the Open button.
+    // User explicitly resumes via /api/cloud/resume which writes a fresh joinUrl.
+    if (!joinUrl && summary.state === 'running') {
       try {
         const handle = await deps.substrate.connect(summary.sandboxId);
         const joinData = await handle.readFile('/tmp/slicc-join.json');
@@ -85,7 +91,7 @@ export async function listCones(
         trayId = trayId ?? parsed.trayId;
         lastJoinUpdatedAt = lastJoinUpdatedAt ?? parsed.updatedAt;
       } catch (err) {
-        // File not readable (sandbox paused/dead, or file doesn't exist).
+        // File not readable (sandbox is transitioning, or file doesn't exist).
         // Leave joinUrl empty — UI will handle gracefully.
       }
     }
