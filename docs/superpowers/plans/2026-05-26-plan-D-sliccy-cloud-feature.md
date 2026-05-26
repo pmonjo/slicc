@@ -518,97 +518,272 @@ The cloud-core `Registry` interface is still used inside the DO — backed by `s
 - Create: `packages/cloudflare-worker/src/cloud/cloud-sessions-do.ts`
 - Modify: `packages/cloudflare-worker/src/index.ts` — export the DO class
 
-- [ ] **Step 1: Create the DO**
+- [ ] **Step 1: Create LocalRegistry (DO-storage-backed Registry impl)**
+
+`packages/cloudflare-worker/src/cloud/local-registry.ts`:
 
 ```ts
-// packages/cloudflare-worker/src/cloud/cloud-sessions-do.ts
-import type { DurableObject, DurableObjectState } from '@cloudflare/workers-types';
-import type { ConeEntry } from '@slicc/cloud-core';
+import type { ConeEntry, Registry } from '@slicc/cloud-core';
+import type { DurableObjectState } from '@cloudflare/workers-types';
 
 interface PersistedState {
-  cones: ConeEntry[];
+  // Matches FileRegistry's schema for forensic consistency.
+  sessions: ConeEntry[];
+}
+
+export class LocalRegistry implements Registry {
+  constructor(private readonly storage: DurableObjectState['storage']) {}
+
+  private async readAll(): Promise<ConeEntry[]> {
+    return (await this.storage.get<PersistedState>('state'))?.sessions ?? [];
+  }
+  private async writeAll(sessions: ConeEntry[]): Promise<void> {
+    await this.storage.put('state', { sessions });
+  }
+
+  async list(): Promise<ConeEntry[]> {
+    return this.readAll();
+  }
+  async findByNameOrId(query: string): Promise<ConeEntry | null> {
+    const all = await this.readAll();
+    return all.find((c) => c.sandboxId === query || c.name === query) ?? null;
+  }
+  async append(entry: ConeEntry): Promise<void> {
+    const all = await this.readAll();
+    const i = all.findIndex((c) => c.sandboxId === entry.sandboxId);
+    if (i >= 0) all[i] = { ...all[i]!, ...entry };
+    else all.push(entry);
+    await this.writeAll(all);
+  }
+  async update(sandboxId: string, patch: Partial<ConeEntry>): Promise<void> {
+    const all = await this.readAll();
+    const i = all.findIndex((c) => c.sandboxId === sandboxId);
+    if (i < 0) throw new Error(`entry not found: ${sandboxId}`);
+    all[i] = { ...all[i]!, ...patch };
+    await this.writeAll(all);
+  }
+  async remove(sandboxId: string): Promise<void> {
+    const all = await this.readAll();
+    await this.writeAll(all.filter((c) => c.sandboxId !== sandboxId));
+  }
+}
+```
+
+- [ ] **Step 2: Create the DO with lifecycle endpoints**
+
+`packages/cloudflare-worker/src/cloud/cloud-sessions-do.ts`:
+
+```ts
+import type { DurableObject, DurableObjectState } from '@cloudflare/workers-types';
+import {
+  createSubstrate,
+  isCloudError,
+  startCone,
+  listCones,
+  pauseCone,
+  resumeCone,
+  killCone,
+  type SandboxSubstrate,
+} from '@slicc/cloud-core';
+import { checkCapsForRun } from './caps.js';
+import { errorResponse, okResponse } from './error-envelope.js';
+import { LocalRegistry } from './local-registry.js';
+
+interface DoEnv {
+  E2B_API_KEY: string;
+  CONE_CAP_RUNNING: string;
+  CONE_CAP_PAUSED: string;
+  /** Test-only hatch: inject a substrate factory in place of e2b.
+   * Never set in production Wrangler env. */
+  __SUBSTRATE_FACTORY__?: () => SandboxSubstrate;
+}
+
+const ADOBE_TOKEN_DOMAINS = 'adobe-llm-proxy.paolo-moz.workers.dev';
+
+interface StartConeBody {
+  bearer: string;
+  name?: string;
+  userId: string;
+  email: string;
+  workerOrigin: string;
+}
+interface ResumeConeBody {
+  bearer: string;
+  sandboxId: string;
+  localSliccVersion: string;
+}
+interface SimpleSandboxBody {
+  sandboxId: string;
+}
+interface ListConesBody {
+  userId: string;
 }
 
 export class CloudSessionsDurableObject implements DurableObject {
   constructor(
     private readonly state: DurableObjectState,
-    _env: unknown
+    private readonly env: DoEnv
   ) {}
 
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
+    // Every lifecycle op runs inside blockConcurrencyWhile so reconciliation +
+    // cap check + substrate call + registry write are atomic per user.
     return this.state.blockConcurrencyWhile(() => this.dispatch(url.pathname, request));
   }
 
+  private substrate(): SandboxSubstrate {
+    if (this.env.__SUBSTRATE_FACTORY__) return this.env.__SUBSTRATE_FACTORY__();
+    return createSubstrate('e2b', { apiKey: this.env.E2B_API_KEY });
+  }
+  private registry(): LocalRegistry {
+    return new LocalRegistry(this.state.storage);
+  }
+
   private async dispatch(op: string, request: Request): Promise<Response> {
-    switch (op) {
-      case '/list':
-        return Response.json(await this.list());
-      case '/findByNameOrId': {
-        const { query } = (await request.json()) as { query: string };
-        return Response.json(await this.findByNameOrId(query));
+    try {
+      switch (op) {
+        case '/start-cone':
+          return await this.startConeOp((await request.json()) as StartConeBody);
+        case '/resume-cone':
+          return await this.resumeConeOp((await request.json()) as ResumeConeBody);
+        case '/pause-cone':
+          return await this.pauseConeOp((await request.json()) as SimpleSandboxBody);
+        case '/kill-cone':
+          return await this.killConeOp((await request.json()) as SimpleSandboxBody);
+        case '/list-cones':
+          return await this.listConesOp((await request.json()) as ListConesBody);
+        default:
+          return new Response(`unknown DO op: ${op}`, { status: 404 });
       }
-      case '/append': {
-        const { entry } = (await request.json()) as { entry: ConeEntry };
-        await this.append(entry);
-        return Response.json({ ok: true });
+    } catch (err) {
+      if (isCloudError(err)) {
+        return errorResponse(errCodeToStatus(err.code), err.code, err.message, err.details);
       }
-      case '/update': {
-        const { sandboxId, patch } = (await request.json()) as {
-          sandboxId: string;
-          patch: Partial<ConeEntry>;
-        };
-        await this.update(sandboxId, patch);
-        return Response.json({ ok: true });
-      }
-      case '/remove': {
-        const { sandboxId } = (await request.json()) as { sandboxId: string };
-        await this.remove(sandboxId);
-        return Response.json({ ok: true });
-      }
-      default:
-        return new Response(`unknown DO op: ${op}`, { status: 404 });
+      return errorResponse(500, 'INTERNAL', err instanceof Error ? err.message : String(err));
     }
   }
 
-  private async readState(): Promise<PersistedState> {
-    return (await this.state.storage.get<PersistedState>('state')) ?? { cones: [] };
-  }
-  private async writeState(s: PersistedState): Promise<void> {
-    await this.state.storage.put('state', s);
+  // ── Lifecycle ops (each runs inside blockConcurrencyWhile via fetch) ──
+
+  private async startConeOp(body: StartConeBody): Promise<Response> {
+    const substrate = this.substrate();
+    const registry = this.registry();
+    // 1. Reconcile DO state against substrate (drops dead entries, picks up orphans).
+    const reconciled = await listCones(
+      { substrate, registry },
+      { metadata: { userId: body.userId } }
+    );
+    // 2. Cap check against reconciled state.
+    const cap = checkCapsForRun(reconciled, this.env);
+    if (!cap.ok) {
+      return errorResponse(403, 'CAP_EXCEEDED', `at ${cap.reason} cap`, {
+        running: cap.running,
+        paused: cap.paused,
+        cap: { running: cap.runningCap, paused: cap.pausedCap },
+      });
+    }
+    // 3. Run startCone — atomic with the cap check above.
+    const result = await startCone(
+      { substrate, registry },
+      {
+        envContents: [
+          `ADOBE_IMS_TOKEN=${body.bearer}`,
+          `ADOBE_IMS_TOKEN_DOMAINS=${ADOBE_TOKEN_DOMAINS}`,
+        ].join('\n'),
+        envs: {
+          ADOBE_IMS_TOKEN: body.bearer,
+          ADOBE_IMS_TOKEN_DOMAINS: ADOBE_TOKEN_DOMAINS,
+        },
+        workerBaseUrl: body.workerOrigin,
+        sliccVersion: 'web-' + new Date().toISOString().slice(0, 10),
+        name: body.name,
+        metadata: { userId: body.userId, email: body.email },
+      }
+    );
+    return okResponse({
+      sandboxId: result.sandboxId,
+      name: result.name,
+      joinUrl: result.joinUrl,
+      trayId: result.trayId,
+    });
   }
 
-  async list(): Promise<ConeEntry[]> {
-    return (await this.readState()).cones;
-  }
-  async findByNameOrId(query: string): Promise<ConeEntry | null> {
-    const cones = (await this.readState()).cones;
-    return cones.find((c) => c.sandboxId === query || c.name === query) ?? null;
-  }
-  async append(entry: ConeEntry): Promise<void> {
-    const s = await this.readState();
-    if (s.cones.some((c) => c.sandboxId === entry.sandboxId)) {
-      throw new Error(`entry already exists: ${entry.sandboxId}`);
+  private async resumeConeOp(body: ResumeConeBody): Promise<Response> {
+    const substrate = this.substrate();
+    const registry = this.registry();
+    const all = await listCones({ substrate, registry });
+    const others = all.filter((c) => c.sandboxId !== body.sandboxId);
+    const cap = checkCapsForRun(others, this.env);
+    if (!cap.ok) {
+      return errorResponse(403, 'CAP_EXCEEDED', 'resuming would exceed running cap', {
+        running: cap.running,
+        cap: { running: cap.runningCap, paused: cap.pausedCap },
+      });
     }
-    s.cones.push(entry);
-    await this.writeState(s);
+    const result = await resumeCone(
+      { substrate, registry },
+      {
+        query: body.sandboxId,
+        localSliccVersion: body.localSliccVersion,
+        refreshSecretsContents: [
+          `ADOBE_IMS_TOKEN=${body.bearer}`,
+          `ADOBE_IMS_TOKEN_DOMAINS=${ADOBE_TOKEN_DOMAINS}`,
+        ].join('\n'),
+      }
+    );
+    return okResponse({
+      sandboxId: result.sandboxId,
+      joinUrl: result.joinUrl,
+      trayRebuilt: result.trayRebuilt,
+    });
   }
-  async update(sandboxId: string, patch: Partial<ConeEntry>): Promise<void> {
-    const s = await this.readState();
-    const i = s.cones.findIndex((c) => c.sandboxId === sandboxId);
-    if (i < 0) throw new Error(`entry not found: ${sandboxId}`);
-    s.cones[i] = { ...s.cones[i]!, ...patch };
-    await this.writeState(s);
+
+  private async pauseConeOp(body: SimpleSandboxBody): Promise<Response> {
+    await pauseCone({ substrate: this.substrate(), registry: this.registry() }, body.sandboxId);
+    return okResponse();
   }
-  async remove(sandboxId: string): Promise<void> {
-    const s = await this.readState();
-    s.cones = s.cones.filter((c) => c.sandboxId !== sandboxId);
-    await this.writeState(s);
+
+  private async killConeOp(body: SimpleSandboxBody): Promise<Response> {
+    try {
+      await killCone({ substrate: this.substrate(), registry: this.registry() }, body.sandboxId);
+    } catch (err) {
+      if (isCloudError(err) && err.code === 'NOT_FOUND') {
+        // Kill is idempotent.
+        return okResponse();
+      }
+      throw err;
+    }
+    return okResponse();
   }
+
+  private async listConesOp(body: ListConesBody): Promise<Response> {
+    const cones = await listCones(
+      { substrate: this.substrate(), registry: this.registry() },
+      { metadata: { userId: body.userId } }
+    );
+    return okResponse({ cones });
+  }
+}
+
+function errCodeToStatus(code: string): number {
+  const map: Record<string, number> = {
+    CAP_EXCEEDED: 403,
+    NOT_FOUND: 404,
+    NAME_TAKEN: 409,
+    ALREADY_PAUSED: 409,
+    ALREADY_RUNNING: 409,
+    LEADER_NOT_READY: 503,
+    SANDBOX_NOT_READY: 503,
+    CDP_NOT_READY: 503,
+    CDP_ERROR: 500,
+    INTERNAL: 500,
+  };
+  return map[code] ?? 500;
 }
 ```
 
-- [ ] **Step 2: Export from worker index.ts**
+- [ ] **Step 3: Export from worker index.ts**
 
 ```ts
 // in packages/cloudflare-worker/src/index.ts (top-level):
@@ -617,7 +792,7 @@ export { CloudSessionsDurableObject } from './cloud/cloud-sessions-do.js';
 
 (Wrangler's migration entry references the class; without the export it fails to bind.)
 
-- [ ] **Step 3: Typecheck + commit**
+- [ ] **Step 4: Typecheck + commit**
 
 ```bash
 npm run typecheck
@@ -1868,20 +2043,36 @@ header {
 }
 ```
 
-- [ ] **Step 3: wrangler.jsonc static binding**
+- [ ] **Step 3: Add the dashboard as a webapp build input**
 
-```jsonc
-{
-  "assets": {
-    "directory": "./packages/cloudflare-worker/static",
-    "binding": "ASSETS",
+The worker's existing `ASSETS` binding already points at `../../dist/ui/`. Do NOT change it. Instead, add the dashboard as a separate Rollup input in the webapp's Vite config so its `index.html` lands at `dist/ui/cloud/index.html`.
+
+Edit `packages/webapp/vite.config.ts`. Find the `build.rollupOptions.input` block (or create one) and add the dashboard entry:
+
+```ts
+build: {
+  rollupOptions: {
+    input: {
+      main: resolve(__dirname, 'index.html'),                       // existing
+      cloud: resolve(__dirname, 'src/cloud-dashboard/index.html'),  // NEW
+      // also wire the OAuth callback's external JS so it lands at /auth/cloud-callback.js:
+      authCloudCallback: resolve(__dirname, 'src/cloud-dashboard/auth-callback.js'),
+    },
   },
-}
+},
 ```
 
-(Adapt to match the worker's existing static-assets setup if one exists already.)
+(Adapt to whatever the current vite config shape is. The goal: dashboard assets emit to `dist/ui/cloud/`, callback JS emits to `dist/ui/auth/cloud-callback.js`. Both served by the existing ASSETS binding.)
 
-- [ ] **Step 4: Serve /cloud with CSP**
+Verify:
+
+```bash
+npm run build -w @slicc/webapp
+ls dist/ui/cloud/                    # expect: index.html, hashed app.js, styles.css
+ls dist/ui/auth/cloud-callback.js    # expect: the callback script
+```
+
+- [ ] **Step 4: Serve /cloud with CSP via existing ASSETS binding**
 
 In `packages/cloudflare-worker/src/index.ts`:
 
