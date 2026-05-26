@@ -5,7 +5,14 @@ import type { ConeEntry } from '@slicc/cloud-core';
 const env = { CONE_CAP_RUNNING: '1', CONE_CAP_PAUSED: '5' };
 
 function cone(id: string, state: ConeEntry['state']): ConeEntry {
-  return { sandboxId: id, substrate: 'e2b', createdAt: '', lastSeen: '', state };
+  return {
+    sandboxId: id,
+    substrate: 'e2b',
+    createdAt: '',
+    lastSeen: '',
+    joinUrl: '',
+    state,
+  };
 }
 
 describe('checkCapsForRun', () => {
