@@ -37,6 +37,7 @@ import type { BshDiscoveryFS } from './bsh-discovery.js';
 import type { JshDiscoveryFS } from './jsh-discovery.js';
 import type { JshProcessConfig } from './jsh-executor.js';
 import { executeJsCode, executeJshFile } from './jsh-executor.js';
+import { EMPTY_BYTES } from './just-bash-compat.js';
 import { parseShellArgs } from './parse-shell-args.js';
 import { createProxiedFetch } from './proxied-fetch.js';
 import { ScriptCatalog } from './script-catalog.js';
@@ -373,7 +374,7 @@ export class WasmShellHeadless implements HeadlessShellLike {
         fs: this.vfsAdapter,
         cwd: this.cwd,
         env: new Map(Object.entries(this.lastEnv)),
-        stdin: '',
+        stdin: EMPTY_BYTES,
         exec: (cmd, opts) => this.bash.exec(cmd, { env: this.lastEnv, cwd: opts?.cwd ?? this.cwd }),
       },
       this.buildJshProcessConfig()
@@ -598,7 +599,7 @@ export class WasmShellHeadless implements HeadlessShellLike {
         fs: this.vfsAdapter,
         cwd: this.cwd,
         env: new Map(Object.entries(this.lastEnv)),
-        stdin: '',
+        stdin: EMPTY_BYTES,
         exec: (cmd, opts) => this.bash.exec(cmd, { env: this.lastEnv, cwd: opts?.cwd ?? this.cwd }),
       },
       this.buildJshProcessConfig()
