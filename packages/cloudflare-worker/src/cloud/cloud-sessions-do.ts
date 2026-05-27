@@ -171,19 +171,28 @@ export class CloudSessionsDurableObject {
     const substrate = this.substrate();
     const registry = this.registry();
 
-    // Atomic phase: list, cap check (excluding the target), entry existence/state.
-    // RESERVE the slot under the lock by flipping target to 'running' so a concurrent
-    // /resume sees it in cap count and bounces. If the slow resume below fails,
-    // we flip back to 'paused' in the catch.
+    // Reconcile state outside the lock — substrate.list() + extendTimeout()
+    // may take seconds. Concurrent /list-cones / /resume-cone calls can still
+    // arrive during this window; their own reconciliation is idempotent.
+    try {
+      await listCones({ substrate, registry }, { metadata: { userId: body.userId } });
+    } catch (err) {
+      if (isCloudError(err)) {
+        return errorResponse(errCodeToStatus(err.code), err.code, err.message, err.details);
+      }
+      return errorResponse(500, 'INTERNAL', err instanceof Error ? err.message : String(err));
+    }
+
+    // Atomic phase: registry-only reads + state flip. Fast (<10ms typical).
     const precheck = await this.state.blockConcurrencyWhile(async () => {
-      const all = await listCones({ substrate, registry }, { metadata: { userId: body.userId } });
+      const all = await registry.list();
       const target = all.find((c) => c.sandboxId === body.sandboxId);
       if (!target) {
         return {
           error: errorResponse(404, 'NOT_FOUND', `cloud session not found: ${body.sandboxId}`),
         };
       }
-      if (target.state === 'running') {
+      if (target.state === 'running' || target.state === 'reserved') {
         return {
           error: errorResponse(
             409,
@@ -203,8 +212,8 @@ export class CloudSessionsDurableObject {
         };
       }
 
-      // Reserve the slot: flip target to 'running' so concurrent /resume sees it in cap count.
-      await registry.update(body.sandboxId, { state: 'running' });
+      // Reserve the slot: flip target to 'reserved' so concurrent /resume sees it in cap count.
+      await registry.update(body.sandboxId, { state: 'reserved' });
       return { error: null };
     });
     if (precheck.error) return precheck.error;

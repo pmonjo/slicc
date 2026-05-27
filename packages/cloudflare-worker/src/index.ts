@@ -102,7 +102,16 @@ try {
   }
   location.replace(target + location.hash);
 } catch (e) {
-  document.getElementById('msg').textContent = 'OAuth redirect failed: ' + e.message + '. Close this window and try again.';
+  var msg = 'OAuth redirect failed: ' + e.message + '. Close this window and try again.';
+  document.getElementById('msg').textContent = msg;
+  if (window.opener) {
+    try {
+      window.opener.postMessage({ type: 'sliccy.cloud.imsError', error: e.message }, '*');
+    } catch (postErr) {
+      /* opener may be cross-origin and reject; the inline message is the fallback */
+    }
+  }
+  setTimeout(function() { window.close(); }, 3000);
 }
 </script>
 </body></html>`.replace(
