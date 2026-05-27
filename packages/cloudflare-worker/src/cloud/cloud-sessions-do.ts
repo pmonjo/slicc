@@ -8,7 +8,6 @@ import {
   resumeCone,
   killCone,
   type SandboxSubstrate,
-  type ConeEntry,
 } from '@slicc/cloud-core';
 import { checkCapsForRun } from './caps.js';
 import { errorResponse, okResponse } from './error-envelope.js';
@@ -98,10 +97,11 @@ export class CloudSessionsDurableObject {
     const substrate = this.substrate();
     const registry = this.registry();
 
-    // Reconcile outside lock (slow e2b API calls).
-    let reconciled: ConeEntry[];
+    // Reconcile outside lock (slow e2b API calls). Side-effecting: updates
+    // the registry to match substrate state; return value intentionally
+    // unused since the atomic phase below re-reads fresh registry state.
     try {
-      reconciled = await listCones({ substrate, registry }, { metadata: { userId: body.userId } });
+      await listCones({ substrate, registry }, { metadata: { userId: body.userId } });
     } catch (err) {
       if (isCloudError(err)) {
         return errorResponse(errCodeToStatus(err.code), err.code, err.message, err.details);

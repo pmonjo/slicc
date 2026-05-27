@@ -375,7 +375,6 @@ describe('CloudSessionsDurableObject — lifecycle endpoints', () => {
     const do_ = new CloudSessionsDurableObject(state as any, makeDoEnv(substrate));
 
     // Pre-populate registry with paused entry so listCones doesn't fail
-    const registryKey = await state.storage.get<string[]>('cloud-sessions-list');
     const entry = {
       sandboxId: 's-fail',
       substrate: 'e2b',
