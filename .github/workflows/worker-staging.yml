@@ -5,6 +5,7 @@ on:
     branches: [main]
     paths:
       - 'packages/cloudflare-worker/**'
+      - 'packages/cloud-core/**'
       - 'packages/webapp/src/providers/**'
       - 'packages/webapp/providers/**'
 

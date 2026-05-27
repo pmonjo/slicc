@@ -19,6 +19,7 @@ jobs:
       webapp: ${{ steps.filter.outputs.webapp }}
       vfs-root: ${{ steps.filter.outputs.vfs-root }}
       assets: ${{ steps.filter.outputs.assets }}
+      cloud-core: ${{ steps.filter.outputs.cloud-core }}
       node-server: ${{ steps.filter.outputs.node-server }}
       extension: ${{ steps.filter.outputs.extension }}
       cloudflare-worker: ${{ steps.filter.outputs.cloudflare-worker }}
