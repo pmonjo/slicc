@@ -16,7 +16,7 @@ function isConeEntry(x: unknown): x is ConeEntry {
     typeof e.joinUrl === 'string' &&
     typeof e.lastSeen === 'string' &&
     typeof e.state === 'string' &&
-    (e.state === 'running' || e.state === 'paused' || e.state === 'dead')
+    (e.state === 'running' || e.state === 'paused' || e.state === 'dead' || e.state === 'reserved')
   );
 }
 

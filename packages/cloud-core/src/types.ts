@@ -19,8 +19,12 @@ export interface ConeEntry {
   joinUrl: string;
   /** ISO 8601 timestamp; updated on every list/resume tick. */
   lastSeen: string;
-  /** Sandbox state. */
-  state: 'running' | 'paused' | 'dead';
+  /**
+   * Sandbox state. 'reserved' is used for in-flight start/resume operations
+   * holding a cap slot before the substrate reports real state. Reconciled
+   * state from substrate will only ever be running/paused/dead.
+   */
+  state: 'running' | 'paused' | 'dead' | 'reserved';
   /**
    * Last-known tray identity from `/tmp/slicc-join.json`. Set by `runStart`
    * after the initial cloud-status read; preserved by `runPause` (do NOT

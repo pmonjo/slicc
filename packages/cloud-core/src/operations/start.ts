@@ -71,6 +71,16 @@ async function tailStderr(handle: SandboxHandle, n: number): Promise<string> {
   }
 }
 
+function parseCapLimit(name: string, raw: string): number {
+  const n = Number.parseInt(raw, 10);
+  if (!Number.isFinite(n) || n < 0) {
+    throw new Error(
+      `Invalid cap env ${name}=${JSON.stringify(raw)}: must be a non-negative integer`
+    );
+  }
+  return n;
+}
+
 /**
  * Reserve a slot in the registry atomically under DO lock, BEFORE substrate.create.
  * Returns a synthetic reservationId (pending-<uuid>) that counts toward the cap.
@@ -91,12 +101,12 @@ export async function reserveSlot(
   const { listCones } = await import('./list.js');
   const existing = await listCones(deps, opts.userId ? { metadata: { userId: opts.userId } } : {});
 
-  // Cap check: count both running and paused entries (reservations count as running)
+  // Cap check: count both running and reserved entries (reservations count as running)
   if (opts.env) {
-    const running = existing.filter((e) => e.state === 'running').length;
+    const running = existing.filter((e) => e.state === 'running' || e.state === 'reserved').length;
     const paused = existing.filter((e) => e.state === 'paused').length;
-    const runningCap = Number.parseInt(opts.env.CONE_CAP_RUNNING, 10);
-    const pausedCap = Number.parseInt(opts.env.CONE_CAP_PAUSED, 10);
+    const runningCap = parseCapLimit('CONE_CAP_RUNNING', opts.env.CONE_CAP_RUNNING);
+    const pausedCap = parseCapLimit('CONE_CAP_PAUSED', opts.env.CONE_CAP_PAUSED);
     if (running >= runningCap) {
       throw new CloudError('CAP_EXCEEDED', `at running cap (${running}/${runningCap})`, {
         running,
@@ -117,14 +127,14 @@ export async function reserveSlot(
     throw new CloudError('NAME_TAKEN', `cloud session name already exists: ${requestedName}`);
   }
 
-  // Append placeholder entry
+  // Append placeholder entry with 'reserved' state
   const placeholder: ConeEntry = {
     substrate: deps.substrate.id,
     sandboxId: reservationId,
     name: requestedName,
     createdAt,
     lastSeen: createdAt,
-    state: 'running',
+    state: 'reserved',
     joinUrl: '',
     metadata: opts.metadata,
   };
@@ -173,7 +183,7 @@ export async function startCone(deps: StartConeDeps, opts: StartConeOpts): Promi
     // The placeholder ensures concurrent /list-cones calls see the cone in the registry
     // (pass 1) instead of treating it as an orphan (pass 2). The empty joinUrl
     // means the dashboard hides the Open button until pollCloudStatus completes
-    // and the entry is updated below.
+    // and the entry is updated below. State is 'reserved' until poll completes.
     if (opts.reservationId) {
       // Remove the reservation entry and append the real one
       await deps.registry.remove(opts.reservationId);
@@ -183,7 +193,7 @@ export async function startCone(deps: StartConeDeps, opts: StartConeOpts): Promi
         name: opts.name,
         createdAt,
         lastSeen: createdAt,
-        state: 'running',
+        state: 'reserved',
         joinUrl: '',
         metadata: opts.metadata,
       };
@@ -198,7 +208,7 @@ export async function startCone(deps: StartConeDeps, opts: StartConeOpts): Promi
         name: opts.name,
         createdAt,
         lastSeen: createdAt,
-        state: 'running',
+        state: 'reserved',
         joinUrl: '',
       };
       await deps.registry.append(placeholder);
@@ -229,8 +239,9 @@ export async function startCone(deps: StartConeDeps, opts: StartConeOpts): Promi
       );
     }
 
-    // Promote the placeholder to a fully-populated entry.
+    // Promote the placeholder to a fully-populated running entry.
     await deps.registry.update(handle.sandboxId, {
+      state: 'running',
       joinUrl: status.joinUrl,
       trayId: status.trayId,
       lastJoinUpdatedAt: status.updatedAt,

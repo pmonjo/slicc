@@ -353,7 +353,7 @@ describe('startCone', () => {
     expect(entries).toHaveLength(1);
     expect(entries[0]?.sandboxId).toBe(reservationId);
     expect(entries[0]?.name).toBe('reserved');
-    expect(entries[0]?.state).toBe('running');
+    expect(entries[0]?.state).toBe('reserved');
     expect(entries[0]?.joinUrl).toBe('');
 
     // Verify a second reservation hits CAP_EXCEEDED

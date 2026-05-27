@@ -42,7 +42,8 @@ export async function resumeCone(
     if (!entry) throw new CloudError('NOT_FOUND', `cloud session not found: ${opts.query}`);
 
     // NEW: ALREADY_RUNNING check (additive — existing CLI resume didn't have this).
-    if (entry.state === 'running') {
+    // Accept both 'running' and 'reserved' as "already in flight".
+    if (entry.state === 'running' || entry.state === 'reserved') {
       throw new CloudError('ALREADY_RUNNING', `cloud session is already running: ${opts.query}`);
     }
   }

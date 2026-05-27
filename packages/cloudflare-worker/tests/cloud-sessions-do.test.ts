@@ -11,7 +11,7 @@ import type {
 
 interface FakeSandbox {
   id: string;
-  state: 'running' | 'paused' | 'dead';
+  state: 'running' | 'paused' | 'dead' | 'reserved';
   metadata: Record<string, string>;
   name?: string;
   createdAt: string;

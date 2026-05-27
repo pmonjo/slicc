@@ -49,13 +49,21 @@ export async function listCones(
     // Skip entries that don't match the metadata filter
     if (!matchesFilter(entry)) continue;
 
+    // Reserved entries skip reconciliation — they are in-flight operations holding
+    // a cap slot. The operation that reserved it is responsible for promoting it
+    // to 'running' (on success) or cleaning it up (on failure).
+    if (entry.state === 'reserved') {
+      reconciled.push(entry);
+      continue;
+    }
+
     const liveEntry = liveById.get(entry.sandboxId);
     if (!liveEntry) {
-      // Substrate doesn't know about it. Two cases:
-      // 1. Reservation placeholders (sandboxId starts with 'pending-'): keep as running
-      // 2. Real sandboxes that expired or were killed externally: mark dead
+      // Substrate doesn't know about it — mark dead unless it's a placeholder
+      // (sandboxId starts with 'pending-', which should only happen if an operation
+      // crashed before promoting the reservation to 'reserved' state).
       if (entry.sandboxId.startsWith('pending-')) {
-        // Reservation placeholder — keep it alive
+        // Reservation placeholder in old state format — keep it alive
         reconciled.push(entry);
       } else {
         // Real sandbox is missing — mark dead
