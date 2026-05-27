@@ -51,6 +51,72 @@ export interface SprinkleManagerCallbacks {
 
 const OPEN_SPRINKLES_KEY = 'slicc-open-sprinkles';
 /**
+ * Query parameter that carries the open-sprinkles set. URL is the
+ * primary source of truth — a manual reload / shared link restores the
+ * exact same panels. `OPEN_SPRINKLES_KEY` (localStorage) is kept for
+ * one release as a migration fallback: `restoreOpenSprinkles` reads it
+ * only when the URL has no `sprinkles` param, then clears it. New
+ * writes go to both URL and localStorage during this window so a
+ * downgrade in mid-migration doesn't lose the user's open set (see the
+ * spec's Rollback Plan).
+ */
+const URL_OPEN_SPRINKLES_PARAM = 'sprinkles';
+
+/**
+ * Read the open-sprinkles set from the URL. Returns `null` when the
+ * `sprinkles` param is absent (signaling "fall back to legacy or
+ * first-run"); returns `[]` when the param is present-but-empty
+ * (signaling "explicitly nothing open"). Safe to call from any
+ * context — returns `null` outside the DOM (worker, SSR).
+ */
+export function readOpenSprinklesFromUrl(): string[] | null {
+  try {
+    if (typeof window === 'undefined' || !window.location) return null;
+    const params = new URLSearchParams(window.location.search);
+    const raw = params.get(URL_OPEN_SPRINKLES_PARAM);
+    if (raw === null) return null;
+    if (raw === '') return [];
+    return raw
+      .split(',')
+      .map((s) => s.trim())
+      .filter((s) => s.length > 0);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Replace the `sprinkles` query param without touching other params
+ * (e.g. `tray`, `detached`) or pushing a new history entry. Empty
+ * list removes the param entirely so a shared URL with no open
+ * sprinkles doesn't grow `?sprinkles=`. No-ops outside the DOM.
+ */
+export function writeOpenSprinklesToUrl(names: readonly string[]): void {
+  try {
+    if (
+      typeof window === 'undefined' ||
+      !window.location ||
+      typeof history === 'undefined' ||
+      typeof history.replaceState !== 'function'
+    ) {
+      return;
+    }
+    const url = new URL(window.location.href);
+    if (names.length === 0) {
+      url.searchParams.delete(URL_OPEN_SPRINKLES_PARAM);
+    } else {
+      // Join with raw commas — names are basenames of `.shtml` files
+      // and never contain commas. Leaving commas unencoded keeps the
+      // URL readable in the address bar.
+      url.searchParams.set(URL_OPEN_SPRINKLES_PARAM, names.join(','));
+    }
+    const next = url.pathname + url.search + url.hash;
+    history.replaceState(history.state ?? null, '', next);
+  } catch {
+    /* history not writable, ignore */
+  }
+}
+/**
  * Persistent ledger of every sprinkle name we've ever discovered in
  * this profile. When `restoreOpenSprinkles()` runs and finds an
  * entry in `availableSprinkles` that isn't in the ledger, it's a
@@ -146,6 +212,14 @@ export class SprinkleManager {
   private onSendToSprinkle?: (name: string, data: unknown) => void;
   private readonly changeListeners = new Set<() => void>();
   private changeNotifyScheduled = false;
+  /**
+   * Coalesce URL writes — `open()` + `close()` bursts inside a single
+   * microtask should produce ONE `history.replaceState` call against
+   * the final snapshot, not one per mutation. Without this an
+   * open-then-immediately-close sequence (e.g. restore + auto-close)
+   * spams history and wastes the chance to keep the address bar quiet.
+   */
+  private urlWriteScheduled = false;
 
   constructor(
     fs: VirtualFS,
@@ -201,17 +275,21 @@ export class SprinkleManager {
   }
 
   /** Restore sprinkles that were open in the previous session.
-   *  On first run (no localStorage entry), auto-open sprinkles marked with data-sprinkle-autoopen.
+   *  URL `?sprinkles=` is the primary source of truth — a manual
+   *  reload or shared link reopens the same panels. When the URL
+   *  has no `sprinkles` param we fall back to the legacy
+   *  `slicc-open-sprinkles` localStorage entry once (then clear it).
+   *  On first run (no URL param AND no localStorage entry),
+   *  auto-open sprinkles marked with data-sprinkle-autoopen.
    *  Always surfaces sprinkles that have landed in the VFS since
    *  the last time the panel saw them (skill installs in a prior
    *  session, or the very first time we boot a profile that
    *  predates the known-sprinkles ledger). */
   async restoreOpenSprinkles(): Promise<void> {
     try {
-      const raw = localStorage.getItem(OPEN_SPRINKLES_KEY);
-      if (raw) {
-        const names: string[] = JSON.parse(raw);
-        for (const name of names) {
+      const urlNames = readOpenSprinklesFromUrl();
+      if (urlNames !== null) {
+        for (const name of urlNames) {
           try {
             await this.open(name);
           } catch {
@@ -219,23 +297,47 @@ export class SprinkleManager {
           }
         }
       } else {
-        // No previously-opened sprinkles — open autoopen ones
-        // (legacy behavior). The non-autoopen ones get a rail
-        // icon via `surfaceUnseenSprinkles()` below.
-        const attention = this.autoOpenBehavior === 'attention';
-        const autoOpenedOnce = this.loadAutoOpenedOnce();
-        const consumed = new Set<string>();
-        for (const sprinkle of this.availableSprinkles.values()) {
-          if (!sprinkle.autoOpen) continue;
-          if (autoOpenedOnce.has(sprinkle.name)) continue;
+        const raw = localStorage.getItem(OPEN_SPRINKLES_KEY);
+        if (raw) {
+          // One-time migration: legacy localStorage → URL. The
+          // subsequent `open()` calls each re-persist (URL +
+          // localStorage), and after the burst we clear the legacy
+          // key so future reloads take the URL branch above.
           try {
-            await this.open(sprinkle.name, undefined, { attention });
-            consumed.add(sprinkle.name);
-          } catch {
-            log.warn('Failed to auto-open sprinkle', { name: sprinkle.name });
+            const names: string[] = JSON.parse(raw);
+            for (const name of names) {
+              try {
+                await this.open(name);
+              } catch {
+                log.warn('Failed to restore sprinkle', { name });
+              }
+            }
+          } finally {
+            try {
+              localStorage.removeItem(OPEN_SPRINKLES_KEY);
+            } catch {
+              /* localStorage unavailable, ignore */
+            }
           }
+        } else {
+          // No previously-opened sprinkles — open autoopen ones
+          // (legacy behavior). The non-autoopen ones get a rail
+          // icon via `surfaceUnseenSprinkles()` below.
+          const attention = this.autoOpenBehavior === 'attention';
+          const autoOpenedOnce = this.loadAutoOpenedOnce();
+          const consumed = new Set<string>();
+          for (const sprinkle of this.availableSprinkles.values()) {
+            if (!sprinkle.autoOpen) continue;
+            if (autoOpenedOnce.has(sprinkle.name)) continue;
+            try {
+              await this.open(sprinkle.name, undefined, { attention });
+              consumed.add(sprinkle.name);
+            } catch {
+              log.warn('Failed to auto-open sprinkle', { name: sprinkle.name });
+            }
+          }
+          if (consumed.size > 0) this.persistAutoOpenedOnce(consumed);
         }
-        if (consumed.size > 0) this.persistAutoOpenedOnce(consumed);
       }
     } catch {
       /* corrupt localStorage, ignore */
@@ -336,6 +438,14 @@ export class SprinkleManager {
    * still in `attentionOnly` (passive surfacing, never clicked) are
    * filtered out — restoring a panel the user never engaged with
    * would be surprising on reload.
+   *
+   * URL `?sprinkles=...` is the primary store (so reload / shared
+   * link restores the same panels). `slicc-open-sprinkles` in
+   * localStorage is still written during this release as a safety
+   * net for downgrades and as the migration source for the
+   * URL-aware `restoreOpenSprinkles` branch. The URL write is
+   * coalesced via `queueMicrotask` so an open+close burst yields
+   * one `history.replaceState`, not several.
    */
   private persistOpenSprinkles(): void {
     try {
@@ -346,6 +456,19 @@ export class SprinkleManager {
     } catch {
       /* localStorage full, ignore */
     }
+    this.schedulePersistOpenSprinklesToUrl();
+  }
+
+  private schedulePersistOpenSprinklesToUrl(): void {
+    if (this.urlWriteScheduled) return;
+    this.urlWriteScheduled = true;
+    queueMicrotask(() => {
+      this.urlWriteScheduled = false;
+      const userOpened = [...this.openSprinkles.keys()].filter(
+        (name) => !this.attentionOnly.has(name)
+      );
+      writeOpenSprinklesToUrl(userOpened);
+    });
   }
 
   /**

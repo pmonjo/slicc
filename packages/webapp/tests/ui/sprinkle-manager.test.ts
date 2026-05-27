@@ -3,7 +3,11 @@ import 'fake-indexeddb/auto';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { VirtualFS } from '../../src/fs/virtual-fs.js';
 import { FsWatcher } from '../../src/fs/fs-watcher.js';
-import { SprinkleManager } from '../../src/ui/sprinkle-manager.js';
+import {
+  SprinkleManager,
+  readOpenSprinklesFromUrl,
+  writeOpenSprinklesToUrl,
+} from '../../src/ui/sprinkle-manager.js';
 import type { LickEvent } from '../../src/scoops/lick-manager.js';
 
 vi.mock('../../src/ui/sprinkle-renderer.js', () => ({
@@ -67,6 +71,14 @@ describe('SprinkleManager', () => {
   beforeEach(async () => {
     vi.stubGlobal('localStorage', makeMemoryStorage());
     vi.stubGlobal('document', makeFakeDocument());
+    // Reset the URL to a known state so URL-persistence tests start
+    // clean and a leaked `?sprinkles=...` from a previous test can't
+    // restore unexpected panels in the next one.
+    try {
+      window.history.replaceState(null, '', '/');
+    } catch {
+      /* jsdom may already be in a clean state */
+    }
     vfs = await VirtualFS.create({
       dbName: `test-sprinkle-manager-${dbCounter++}`,
       wipe: true,
@@ -615,5 +627,177 @@ describe('SprinkleManager', () => {
     ];
     expect(name).toBe('iconic');
     expect(options?.icon).toBe('music');
+  });
+
+  describe('URL-based open-state persistence (?sprinkles=)', () => {
+    function urlSprinklesParam(): string | null {
+      return new URLSearchParams(window.location.search).get('sprinkles');
+    }
+
+    it('readOpenSprinklesFromUrl returns null when no param is present', () => {
+      window.history.replaceState(null, '', '/');
+      expect(readOpenSprinklesFromUrl()).toBeNull();
+    });
+
+    it('readOpenSprinklesFromUrl returns [] for an empty param', () => {
+      window.history.replaceState(null, '', '/?sprinkles=');
+      expect(readOpenSprinklesFromUrl()).toEqual([]);
+    });
+
+    it('readOpenSprinklesFromUrl splits CSV names', () => {
+      window.history.replaceState(null, '', '/?sprinkles=migrate-page,llm-wiki');
+      expect(readOpenSprinklesFromUrl()).toEqual(['migrate-page', 'llm-wiki']);
+    });
+
+    it('writeOpenSprinklesToUrl sets the param and preserves other params (tray)', () => {
+      window.history.replaceState(null, '', '/?tray=https%3A%2F%2Fexample.com');
+      writeOpenSprinklesToUrl(['dash', 'wiki']);
+      const params = new URLSearchParams(window.location.search);
+      expect(params.get('sprinkles')).toBe('dash,wiki');
+      // tray param must be preserved exactly (decoded URLSearchParams view)
+      expect(params.get('tray')).toBe('https://example.com');
+    });
+
+    it('writeOpenSprinklesToUrl with empty array removes the param entirely', () => {
+      window.history.replaceState(null, '', '/?sprinkles=a,b&detached=1');
+      writeOpenSprinklesToUrl([]);
+      const params = new URLSearchParams(window.location.search);
+      expect(params.has('sprinkles')).toBe(false);
+      expect(params.get('detached')).toBe('1');
+    });
+
+    it('open() writes the sprinkle name to the URL (coalesced microtask flush)', async () => {
+      await vfs.writeFile('/shared/sprinkles/dash/dash.shtml', '<title>D</title><div>hi</div>');
+      await mgr.refresh();
+      await mgr.open('dash');
+      // URL write is queued onto a microtask — drain it.
+      await Promise.resolve();
+      expect(urlSprinklesParam()).toBe('dash');
+    });
+
+    it('close() removes the sprinkle from the URL', async () => {
+      await vfs.writeFile('/shared/sprinkles/dash/dash.shtml', '<title>D</title><div>hi</div>');
+      await vfs.writeFile('/shared/sprinkles/wiki/wiki.shtml', '<title>W</title><div>hi</div>');
+      await mgr.refresh();
+      await mgr.open('dash');
+      await mgr.open('wiki');
+      await Promise.resolve();
+      expect(urlSprinklesParam()).toBe('dash,wiki');
+
+      mgr.close('dash');
+      await Promise.resolve();
+      expect(urlSprinklesParam()).toBe('wiki');
+
+      mgr.close('wiki');
+      await Promise.resolve();
+      // Empty open set → param removed entirely.
+      expect(urlSprinklesParam()).toBeNull();
+    });
+
+    it('attention-only opens are excluded from the URL', async () => {
+      await vfs.writeFile('/shared/sprinkles/quiet/quiet.shtml', '<title>Q</title><div>hi</div>');
+      await mgr.refresh();
+      await mgr.open('quiet', undefined, { attention: true });
+      await Promise.resolve();
+      expect(urlSprinklesParam()).toBeNull();
+
+      // Promotion to user-opened should land in the URL.
+      mgr.markActivated('quiet');
+      await Promise.resolve();
+      expect(urlSprinklesParam()).toBe('quiet');
+    });
+
+    it('persistOpenSprinkles preserves the tray param across open/close', async () => {
+      window.history.replaceState(null, '', '/?tray=https%3A%2F%2Ftray.example');
+      await vfs.writeFile('/shared/sprinkles/dash/dash.shtml', '<title>D</title><div>hi</div>');
+      await mgr.refresh();
+      await mgr.open('dash');
+      await Promise.resolve();
+      const params = new URLSearchParams(window.location.search);
+      expect(params.get('sprinkles')).toBe('dash');
+      expect(params.get('tray')).toBe('https://tray.example');
+
+      mgr.close('dash');
+      await Promise.resolve();
+      const after = new URLSearchParams(window.location.search);
+      expect(after.has('sprinkles')).toBe(false);
+      expect(after.get('tray')).toBe('https://tray.example');
+    });
+
+    it('synchronous open+close burst collapses into a single URL write', async () => {
+      // The coalescer collapses persist calls scheduled within the
+      // same microtask (e.g. close-then-open during a tab swap, or
+      // close-many during a "close all" action). Two awaited
+      // open()s are separated by file-read microtask boundaries and
+      // each flushes its own URL write — that's expected.
+      await vfs.writeFile('/shared/sprinkles/a/a.shtml', '<title>A</title><div>hi</div>');
+      await vfs.writeFile('/shared/sprinkles/b/b.shtml', '<title>B</title><div>hi</div>');
+      await mgr.refresh();
+      await mgr.open('a');
+      await mgr.open('b');
+      await Promise.resolve();
+
+      const replaceSpy = vi.spyOn(window.history, 'replaceState');
+      // Two synchronous mutations in the same tick — both schedule
+      // microtask URL writes, the second is deduped by `urlWriteScheduled`.
+      mgr.close('a');
+      mgr.close('b');
+      await Promise.resolve();
+
+      // Exactly one replaceState reflecting the final empty set.
+      expect(replaceSpy).toHaveBeenCalledTimes(1);
+      expect(urlSprinklesParam()).toBeNull();
+      replaceSpy.mockRestore();
+    });
+
+    it('restoreOpenSprinkles reads the URL and reopens those panels', async () => {
+      await vfs.writeFile('/shared/sprinkles/dash/dash.shtml', '<title>D</title><div>hi</div>');
+      await vfs.writeFile('/shared/sprinkles/wiki/wiki.shtml', '<title>W</title><div>hi</div>');
+      window.history.replaceState(null, '', '/?sprinkles=dash,wiki');
+
+      await mgr.refresh();
+      await mgr.restoreOpenSprinkles();
+
+      expect(mgr.opened()).toContain('dash');
+      expect(mgr.opened()).toContain('wiki');
+    });
+
+    it('restoreOpenSprinkles migrates from legacy localStorage when URL has no param, then clears the key', async () => {
+      await vfs.writeFile('/shared/sprinkles/dash/dash.shtml', '<title>D</title><div>hi</div>');
+      // No URL param, but the legacy key carries a prior session's set.
+      window.history.replaceState(null, '', '/');
+      localStorage.setItem('slicc-open-sprinkles', JSON.stringify(['dash']));
+
+      await mgr.refresh();
+      await mgr.restoreOpenSprinkles();
+      await Promise.resolve();
+
+      // Sprinkle reopened, URL now carries the migrated set, legacy
+      // key cleared so a future reload takes the URL branch.
+      expect(mgr.opened()).toContain('dash');
+      expect(urlSprinklesParam()).toBe('dash');
+      expect(localStorage.getItem('slicc-open-sprinkles')).toBeNull();
+    });
+
+    it('restoreOpenSprinkles prefers URL over legacy localStorage when both exist', async () => {
+      await vfs.writeFile('/shared/sprinkles/url-one/url-one.shtml', '<title>U</title><div/>');
+      await vfs.writeFile('/shared/sprinkles/legacy/legacy.shtml', '<title>L</title><div/>');
+      window.history.replaceState(null, '', '/?sprinkles=url-one');
+      localStorage.setItem('slicc-open-sprinkles', JSON.stringify(['legacy']));
+
+      await mgr.refresh();
+      await mgr.restoreOpenSprinkles();
+      await Promise.resolve();
+
+      // The URL drives restore; the legacy entry is NOT user-opened
+      // (it may still surface in attention mode via the unseen-
+      // sprinkles pass, but only `url-one` lands in the persisted
+      // open set that defines what reloads come back).
+      expect(urlSprinklesParam()).toBe('url-one');
+      // Legacy key is preserved on the URL-wins branch — it'll be
+      // overwritten by the next user-driven open via the safety-net
+      // localStorage write in `persistOpenSprinkles`.
+      expect(localStorage.getItem('slicc-open-sprinkles')).not.toBeNull();
+    });
   });
 });
