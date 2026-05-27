@@ -44,11 +44,13 @@ export async function listCones(
   };
 
   // Pass 1: walk registry; reconcile against live.
+  // Reconciliation runs for EVERY registry entry regardless of metadata filter
+  // — otherwise zombie entries (e.g. legacy entries without userId metadata)
+  // never get marked dead and accumulate forever in cap math. The metadata
+  // filter is applied to the RETURN value only, so callers still see their
+  // per-user view.
   const reconciled: ConeEntry[] = [];
   for (const entry of registryEntries) {
-    // Skip entries that don't match the metadata filter
-    if (!matchesFilter(entry)) continue;
-
     // Reserved entries: check for stale reservations (TTL: 10 min) and reclaim.
     // Stale reservations are from crashed operations that never completed or rolled back.
     if (entry.state === 'reserved') {
@@ -164,5 +166,7 @@ export async function listCones(
       })
   );
 
-  return reconciled;
+  // Apply the metadata filter to the RETURN value only — reconciliation
+  // above ran on all entries to keep zombies from accumulating.
+  return reconciled.filter(matchesFilter);
 }

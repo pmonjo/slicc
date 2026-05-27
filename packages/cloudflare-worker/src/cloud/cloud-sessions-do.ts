@@ -220,7 +220,13 @@ export class CloudSessionsDurableObject {
           ),
         };
       }
-      const others = all.filter((c) => c.sandboxId !== body.sandboxId);
+      // Filter dead entries before cap math — dead entries are accounted for
+      // by listCones reconciliation above, but a stale entry that was JUST
+      // reconciled to dead in this same call wouldn't be filtered without
+      // this guard. Cap check should reflect only live (running/paused/reserved).
+      const others = all
+        .filter((c) => c.sandboxId !== body.sandboxId)
+        .filter((c) => c.state !== 'dead');
       const cap = checkCapsForRun(others, this.env);
       if (!cap.ok) {
         return {
