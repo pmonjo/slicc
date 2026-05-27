@@ -1381,8 +1381,10 @@ export class Layout {
   }
 
   /** Collapse the rail content panel without removing the sprinkle. The rail icon stays visible. */
-  minimizeSprinkle(_name: string): void {
-    this.primaryRail?.collapse();
+  minimizeSprinkle(name: string): void {
+    if (this.primaryRail?.getActiveItemId() === `sprinkle-${name}`) {
+      this.primaryRail.collapse();
+    }
   }
 
   // The legacy switchPrimaryTab/switchDrawerTab helpers were removed
