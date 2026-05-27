@@ -57,6 +57,41 @@ function makeStartTestSubstrate(opts: { joinJson: string }): SandboxSubstrate {
   };
 }
 
+describe('reserveSlot', () => {
+  it('throws CAP_EXCEEDED when paused cap is at limit', async () => {
+    const registry = new MemRegistry();
+    // Seed CONE_CAP_PAUSED=2 paused cones in both registry and substrate.
+    // listCones reconciles them. No userId filter so all cones count.
+    for (let i = 0; i < 2; i++) {
+      await registry.append({
+        sandboxId: `s${i}`,
+        substrate: 'e2b',
+        createdAt: '',
+        lastSeen: '',
+        state: 'paused',
+        joinUrl: 'https://w',
+      });
+    }
+    const substrate = makeFakeSubstrate({
+      listResult: [
+        { sandboxId: 's0', state: 'paused', metadata: {} },
+        { sandboxId: 's1', state: 'paused', metadata: {} },
+      ],
+    });
+    await expect(
+      reserveSlot(
+        { substrate, registry },
+        {
+          // No userId — all cones count
+          metadata: {},
+          sliccVersion: 'test',
+          env: { CONE_CAP_RUNNING: '5', CONE_CAP_PAUSED: '2' },
+        }
+      )
+    ).rejects.toMatchObject({ code: 'CAP_EXCEEDED' });
+  });
+});
+
 describe('startCone', () => {
   it('creates a sandbox, polls join.json, appends placeholder then updates registry, returns StartResult', async () => {
     // Use a recent timestamp that will pass the minUpdatedAt check (5s skew margin)
@@ -463,5 +498,118 @@ describe('startCone', () => {
     expect(entries[0]?.sandboxId).toBe('sbx-fake');
     expect(entries[0]?.name).toBe('reserved');
     expect(entries[0]?.joinUrl).toBe('https://w/join/real');
+  });
+
+  it('removes reservation when substrate.create fails', async () => {
+    const registry = new MemRegistry();
+    // Seed a reservation in the registry (as if reserveSlot was called):
+    const reservationId = 'pending-test-uuid';
+    await registry.append({
+      sandboxId: reservationId,
+      substrate: 'e2b',
+      createdAt: '',
+      lastSeen: '',
+      state: 'reserved',
+      joinUrl: '',
+    });
+    // Substrate that fails on create
+    const substrate: SandboxSubstrate = {
+      id: 'e2b' as SubstrateId,
+      async create(): Promise<SandboxHandle> {
+        throw new Error('e2b boom');
+      },
+      async connect() {
+        throw new Error('not used');
+      },
+      async list() {
+        return [];
+      },
+      async extendTimeout() {},
+    };
+    await expect(
+      startCone(
+        { substrate, registry },
+        {
+          reservationId,
+          envContents: '',
+          workerBaseUrl: 'https://w',
+          sliccVersion: 'test',
+        }
+      )
+    ).rejects.toThrow('e2b boom');
+    expect(registry.entries.find((e) => e.sandboxId === reservationId)).toBeUndefined();
+  });
+
+  it('removes real entry when pollCloudStatus fails after sandbox swap', async () => {
+    const registry = new MemRegistry();
+    const reservationId = 'pending-test-uuid-2';
+    await registry.append({
+      sandboxId: reservationId,
+      substrate: 'e2b',
+      createdAt: '',
+      lastSeen: '',
+      state: 'reserved',
+      joinUrl: '',
+    });
+
+    let killCalled = false;
+    const realSandboxId = 'sbx-created';
+
+    // Substrate creates successfully but readFile never returns joinUrl (poll fails)
+    const substrate: SandboxSubstrate = {
+      id: 'e2b' as SubstrateId,
+      async create(): Promise<SandboxHandle> {
+        const handle = makeFakeHandle({ sandboxId: realSandboxId });
+        return {
+          sandboxId: realSandboxId,
+          substrate: handle.substrate,
+          pause: handle.pause,
+          kill: async () => {
+            killCalled = true;
+          },
+          getInfo: handle.getInfo,
+          writeFile: handle.writeFile,
+          readFile: async (path: string) => {
+            if (path === '/tmp/slicc-join.json') {
+              // Return stale data that fails minUpdatedAt check
+              return JSON.stringify({
+                joinUrl: 'https://w/join/stale',
+                trayId: 't-stale',
+                updatedAt: '2020-01-01T00:00:00.000Z',
+              });
+            }
+            if (path === '/tmp/slicc-stderr.log') return 'no logs';
+            throw new Error(`ENOENT ${path}`);
+          },
+          run: handle.run,
+        };
+      },
+      async connect() {
+        throw new Error('not used');
+      },
+      async list() {
+        return [];
+      },
+      async extendTimeout() {},
+    };
+
+    await expect(
+      startCone(
+        { substrate, registry },
+        {
+          reservationId,
+          envContents: '',
+          workerBaseUrl: 'https://w',
+          sliccVersion: 'test',
+          pollTimeoutMs: 200,
+          pollIntervalMs: 50,
+        }
+      )
+    ).rejects.toMatchObject({ code: 'SANDBOX_NOT_READY' });
+
+    // Assert: reservation was removed, real entry was removed, sandbox was killed
+    expect(registry.entries.find((e) => e.sandboxId === reservationId)).toBeUndefined();
+    expect(registry.entries.find((e) => e.sandboxId === realSandboxId)).toBeUndefined();
+    expect(killCalled).toBe(true);
   });
 });

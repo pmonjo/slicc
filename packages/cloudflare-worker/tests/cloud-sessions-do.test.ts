@@ -331,4 +331,32 @@ describe('CloudSessionsDurableObject — lifecycle endpoints', () => {
     expect(errors).toHaveLength(1);
     expect(errors[0]?.error).toBe('CAP_EXCEEDED');
   });
+
+  it('concurrent resume-cone calls serialize via blockConcurrencyWhile — second gets CAP_EXCEEDED', async () => {
+    // Setup: two paused cones, cap=1 running.
+    const substrate = new FakeSubstrate();
+    substrate.seedSandbox('s1', { metadata: { userId: 'u1', name: 'a' }, state: 'paused' });
+    substrate.seedSandbox('s2', { metadata: { userId: 'u1', name: 'b' }, state: 'paused' });
+    const { state } = makeFakeState();
+    const do_ = new CloudSessionsDurableObject(state as any, makeDoEnv(substrate));
+    // Pre-populate registry with both cones (since substrate.list discovery is needed):
+    await call(do_, '/list-cones', { userId: 'u1' });
+    // Concurrent resumes:
+    const [res1, res2] = await Promise.all([
+      call(do_, '/resume-cone', {
+        bearer: 'b',
+        sandboxId: 's1',
+        localSliccVersion: 'v',
+        userId: 'u1',
+      }),
+      call(do_, '/resume-cone', {
+        bearer: 'b',
+        sandboxId: 's2',
+        localSliccVersion: 'v',
+        userId: 'u1',
+      }),
+    ]);
+    const statuses = [res1.status, res2.status].sort();
+    expect(statuses).toEqual([200, 403]); // one succeeds, one CAP_EXCEEDED
+  });
 });
