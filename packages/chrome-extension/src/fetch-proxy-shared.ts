@@ -96,6 +96,108 @@ function encodeBase64Bytes(bytes: Uint8Array): string {
 }
 
 /**
+ * Headers that Chrome silently strips or overrides on any `fetch()` call —
+ * including from an extension service worker. The decode-from-`X-Proxy-*`
+ * step writes them under their real names, but Chrome then erases them on
+ * the wire (Cookie/Referer/Proxy-* dropped; Origin rewritten to the
+ * extension's chrome-extension:// origin). The DNR shim below restores them.
+ */
+function isForbiddenRequestHeader(name: string): boolean {
+  const lower = name.toLowerCase();
+  return (
+    lower === 'cookie' || lower === 'origin' || lower === 'referer' || lower.startsWith('proxy-')
+  );
+}
+
+interface DnrRule {
+  id: number;
+  priority: number;
+  condition: { urlFilter: string; resourceTypes?: string[] };
+  action: {
+    type: 'modifyHeaders';
+    requestHeaders: Array<{ header: string; operation: 'set'; value: string }>;
+  };
+}
+interface DnrLike {
+  updateSessionRules: (opts: { addRules?: DnrRule[]; removeRuleIds?: number[] }) => Promise<void>;
+}
+
+function getDnr(): DnrLike | null {
+  const c = (globalThis as { chrome?: { declarativeNetRequest?: DnrLike } }).chrome;
+  const dnr = c?.declarativeNetRequest;
+  if (!dnr || typeof dnr.updateSessionRules !== 'function') return null;
+  return dnr;
+}
+
+// Monotonic counter for DNR session-rule IDs. Session rules live for the
+// SW's lifetime; we always remove the rule before the response resolves,
+// but a unique id per request prevents collisions if cleanup is delayed
+// for any reason (concurrent in-flight requests, retried install).
+let nextDnrRuleId = 1_000_000;
+
+function randomFragmentToken(): string {
+  const c = (globalThis as { crypto?: Crypto }).crypto;
+  if (c && typeof c.randomUUID === 'function') return c.randomUUID();
+  return `${Date.now()}-${Math.random().toString(36).slice(2)}-${Math.random().toString(36).slice(2)}`;
+}
+
+/**
+ * Forbidden request headers (Cookie/Origin/Referer/Proxy-*) are stripped or
+ * overridden by Chrome on any extension-SW `fetch()` — even when the
+ * `headers` init dict lists them under their real names. Restore them on
+ * the wire by installing a one-shot `chrome.declarativeNetRequest` session
+ * rule keyed to a unique URL fragment, then removing the rule after the
+ * fetch settles.
+ *
+ * URL fragments are never sent to the upstream server but DNR `urlFilter`
+ * DOES see them (empirically verified against Chrome for Testing 146), so
+ * the keying is leak-free for concurrent requests.
+ *
+ * Falls back to a no-op when `chrome.declarativeNetRequest` is unavailable
+ * (vitest / non-extension runtimes / older Chrome). In that case the
+ * forbidden headers are still passed to `fetch()` under their real names,
+ * matching the pre-DNR behavior — useful for unit tests that mock `fetch`.
+ */
+export async function installForbiddenHeaderRule(
+  url: string,
+  headers: Record<string, string>
+): Promise<{ fetchUrl: string; cleanup: () => Promise<void> }> {
+  const dnr = getDnr();
+  const requestHeaders: Array<{ header: string; operation: 'set'; value: string }> = [];
+  for (const [k, v] of Object.entries(headers)) {
+    if (isForbiddenRequestHeader(k)) {
+      requestHeaders.push({ header: k.toLowerCase(), operation: 'set', value: v });
+    }
+  }
+  if (!dnr || requestHeaders.length === 0) {
+    return { fetchUrl: url, cleanup: async () => {} };
+  }
+  const id = nextDnrRuleId++;
+  const fragment = `slicc-req-${randomFragmentToken()}`;
+  // Strip any caller-supplied fragment so the DNR urlFilter matches exactly
+  // one in-flight request. The upstream never sees either fragment.
+  const fetchUrl = `${url.split('#')[0]}#${fragment}`;
+  const rule: DnrRule = {
+    id,
+    priority: 100,
+    condition: { urlFilter: fetchUrl, resourceTypes: ['xmlhttprequest'] },
+    action: { type: 'modifyHeaders', requestHeaders },
+  };
+  await dnr.updateSessionRules({ addRules: [rule] });
+  let removed = false;
+  const cleanup = async (): Promise<void> => {
+    if (removed) return;
+    removed = true;
+    try {
+      await dnr.updateSessionRules({ removeRuleIds: [id] });
+    } catch {
+      // Best-effort — a leaked session rule expires when the SW unloads.
+    }
+  };
+  return { fetchUrl, cleanup };
+}
+
+/**
  * Variant that accepts a Promise for the pipeline so the caller can attach
  * the onMessage listener SYNCHRONOUSLY in the onConnect callback — Chrome
  * drops port messages that arrive before any listener exists, and the
@@ -186,31 +288,38 @@ export function handleFetchProxyConnectionAsync(
         body = pipeline.unmaskBodyBytes(raw, host).bytes;
       }
 
-      const upstream = await fetch(cleanedUrl, {
-        method: msg.method,
-        headers,
-        body: body as BodyInit | undefined,
-        signal: ac.signal,
-      });
-      const scrubbed = pipeline.scrubHeaders(upstream.headers);
-      const respHeaders = buildResponseHeaders(scrubbed, upstream.headers, pipeline);
-      send(port, {
-        type: 'response-head',
-        status: upstream.status,
-        statusText: upstream.statusText,
-        headers: respHeaders,
-      });
+      // Re-inject forbidden request headers via declarativeNetRequest because
+      // Chrome strips/overrides them on extension-SW fetch() — see the helper.
+      const dnrRule = await installForbiddenHeaderRule(cleanedUrl, headers);
+      try {
+        const upstream = await fetch(dnrRule.fetchUrl, {
+          method: msg.method,
+          headers,
+          body: body as BodyInit | undefined,
+          signal: ac.signal,
+        });
+        const scrubbed = pipeline.scrubHeaders(upstream.headers);
+        const respHeaders = buildResponseHeaders(scrubbed, upstream.headers, pipeline);
+        send(port, {
+          type: 'response-head',
+          status: upstream.status,
+          statusText: upstream.statusText,
+          headers: respHeaders,
+        });
 
-      if (upstream.body) {
-        const reader = upstream.body.getReader();
-        while (true) {
-          const { value, done } = await reader.read();
-          if (done) break;
-          const bodyScrubbed = pipeline.scrubResponseBytes(value);
-          send(port, { type: 'response-chunk', dataBase64: encodeBase64Bytes(bodyScrubbed) });
+        if (upstream.body) {
+          const reader = upstream.body.getReader();
+          while (true) {
+            const { value, done } = await reader.read();
+            if (done) break;
+            const bodyScrubbed = pipeline.scrubResponseBytes(value);
+            send(port, { type: 'response-chunk', dataBase64: encodeBase64Bytes(bodyScrubbed) });
+          }
         }
+        send(port, { type: 'response-end' });
+      } finally {
+        await dnrRule.cleanup();
       }
-      send(port, { type: 'response-end' });
     } catch (err) {
       send(port, {
         type: 'response-error',
@@ -289,35 +398,42 @@ export function handleFetchProxyConnection(port: PortLike, pipeline: SecretsPipe
         body = pipeline.unmaskBodyBytes(raw, host).bytes;
       }
 
-      const upstream = await fetch(cleanedUrl, {
-        method: msg.method,
-        headers,
-        body: body as BodyInit | undefined,
-        signal: ac.signal,
-      });
-      const scrubbed = pipeline.scrubHeaders(upstream.headers);
-      const respHeaders = buildResponseHeaders(scrubbed, upstream.headers, pipeline);
-      send(port, {
-        type: 'response-head',
-        status: upstream.status,
-        statusText: upstream.statusText,
-        headers: respHeaders,
-      });
+      // Re-inject forbidden request headers via declarativeNetRequest because
+      // Chrome strips/overrides them on extension-SW fetch() — see the helper.
+      const dnrRule = await installForbiddenHeaderRule(cleanedUrl, headers);
+      try {
+        const upstream = await fetch(dnrRule.fetchUrl, {
+          method: msg.method,
+          headers,
+          body: body as BodyInit | undefined,
+          signal: ac.signal,
+        });
+        const scrubbed = pipeline.scrubHeaders(upstream.headers);
+        const respHeaders = buildResponseHeaders(scrubbed, upstream.headers, pipeline);
+        send(port, {
+          type: 'response-head',
+          status: upstream.status,
+          statusText: upstream.statusText,
+          headers: respHeaders,
+        });
 
-      if (upstream.body) {
-        const reader = upstream.body.getReader();
-        while (true) {
-          const { value, done } = await reader.read();
-          if (done) break;
-          // Byte-safe scrub — no TextDecoder round-trip, so binary chunks
-          // (git packfiles, ZIPs, images) survive intact. Chunk-boundary
-          // scrub limitation matches CLI behavior: a coincidental real-value
-          // straddling a chunk boundary leaks through. v2: carry-over window.
-          const bodyScrubbed = pipeline.scrubResponseBytes(value);
-          send(port, { type: 'response-chunk', dataBase64: encodeBase64Bytes(bodyScrubbed) });
+        if (upstream.body) {
+          const reader = upstream.body.getReader();
+          while (true) {
+            const { value, done } = await reader.read();
+            if (done) break;
+            // Byte-safe scrub — no TextDecoder round-trip, so binary chunks
+            // (git packfiles, ZIPs, images) survive intact. Chunk-boundary
+            // scrub limitation matches CLI behavior: a coincidental real-value
+            // straddling a chunk boundary leaks through. v2: carry-over window.
+            const bodyScrubbed = pipeline.scrubResponseBytes(value);
+            send(port, { type: 'response-chunk', dataBase64: encodeBase64Bytes(bodyScrubbed) });
+          }
         }
+        send(port, { type: 'response-end' });
+      } finally {
+        await dnrRule.cleanup();
       }
-      send(port, { type: 'response-end' });
     } catch (err) {
       send(port, {
         type: 'response-error',

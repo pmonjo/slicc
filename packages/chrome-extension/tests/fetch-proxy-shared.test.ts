@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import {
   handleFetchProxyConnection,
   handleFetchProxyConnectionAsync,
@@ -439,5 +439,149 @@ describe('handleFetchProxyConnection — Set-Cookie encode on response', () => {
     await new Promise((r) => setTimeout(r, 10));
     const head = posts.find((p) => p.type === 'response-head');
     expect(head.headers['X-Proxy-Set-Cookie']).toBeUndefined();
+  });
+});
+
+// Chrome strips Cookie/Referer/Proxy-* and overrides Origin on extension-SW
+// `fetch()` even when those headers are listed in the init dict — empirically
+// verified against Chrome for Testing 146 with the fetch-proxy SW (see
+// `/tmp/slicc-empirical/echo-server.js` + `dnr-test.js`). The SW now installs
+// a one-shot `chrome.declarativeNetRequest.updateSessionRules` rule that
+// `set`s those headers on the wire and removes the rule when the response
+// settles. These tests pin the rule shape and lifecycle.
+describe('handleFetchProxyConnection — DNR forbidden-header rule', () => {
+  let pipeline: SecretsPipeline;
+  let dnrCalls: Array<{ addRules?: any[]; removeRuleIds?: number[] }>;
+
+  beforeEach(async () => {
+    pipeline = new SecretsPipeline({
+      sessionId: 'session-fixed',
+      source: { get: async () => undefined, listAll: async () => [] },
+    });
+    await pipeline.reload();
+    dnrCalls = [];
+    (globalThis as any).chrome = {
+      declarativeNetRequest: {
+        updateSessionRules: vi.fn(async (opts: any) => {
+          dnrCalls.push(opts);
+        }),
+      },
+    };
+  });
+
+  afterEach(() => {
+    delete (globalThis as any).chrome;
+  });
+
+  async function dispatch(
+    requestHeaders: Record<string, string>,
+    url = 'https://api.example.com/path'
+  ): Promise<{ fetchUrl: string; headersOnFetch: Record<string, string> }> {
+    let fetchUrl: string | undefined;
+    let headersOnFetch: Record<string, string> | undefined;
+    (globalThis as any).fetch = vi.fn(async (u: string, init: any) => {
+      fetchUrl = u;
+      headersOnFetch = init.headers;
+      return new Response('ok', { status: 200, statusText: 'OK' });
+    });
+    const port = makePort(() => {});
+    handleFetchProxyConnection(port, pipeline);
+    port.fireMessage({ type: 'request', url, method: 'GET', headers: requestHeaders });
+    await new Promise((r) => setTimeout(r, 10));
+    if (!fetchUrl || !headersOnFetch) throw new Error('fetch was not called');
+    return { fetchUrl, headersOnFetch };
+  }
+
+  it('installs a session rule that sets origin/cookie/referer/proxy-* on the wire', async () => {
+    await dispatch({
+      'X-Proxy-Origin': 'https://my.app',
+      'X-Proxy-Cookie': 'sid=abc',
+      'X-Proxy-Referer': 'https://my.ref/page',
+      'X-Proxy-Proxy-Authorization': 'Basic dXNlcjpwYXNz',
+    });
+    const installs = dnrCalls.filter((c) => c.addRules);
+    expect(installs).toHaveLength(1);
+    const rule = installs[0].addRules![0];
+    expect(rule.action.type).toBe('modifyHeaders');
+    const headerMap = new Map<string, string>(
+      rule.action.requestHeaders.map((h: any) => [h.header, h.value])
+    );
+    expect(headerMap.get('origin')).toBe('https://my.app');
+    expect(headerMap.get('cookie')).toBe('sid=abc');
+    expect(headerMap.get('referer')).toBe('https://my.ref/page');
+    expect(headerMap.get('proxy-authorization')).toBe('Basic dXNlcjpwYXNz');
+    for (const h of rule.action.requestHeaders) {
+      expect(h.operation).toBe('set');
+    }
+  });
+
+  it('keys the rule via a unique URL fragment that survives to the fetch call', async () => {
+    const { fetchUrl } = await dispatch({ 'X-Proxy-Origin': 'https://a.example' });
+    expect(fetchUrl).toMatch(/^https:\/\/api\.example\.com\/path#slicc-req-/);
+    const rule = dnrCalls.find((c) => c.addRules)!.addRules![0];
+    expect(rule.condition.urlFilter).toBe(fetchUrl);
+  });
+
+  it('removes the session rule after the response settles', async () => {
+    await dispatch({ 'X-Proxy-Origin': 'https://my.app' });
+    const installs = dnrCalls.filter((c) => c.addRules);
+    const removes = dnrCalls.filter((c) => c.removeRuleIds);
+    expect(installs).toHaveLength(1);
+    expect(removes).toHaveLength(1);
+    expect(removes[0].removeRuleIds).toEqual([installs[0].addRules![0].id]);
+  });
+
+  it('removes the session rule even when fetch rejects', async () => {
+    (globalThis as any).fetch = vi.fn(async () => {
+      throw new Error('network');
+    });
+    const port = makePort(() => {});
+    handleFetchProxyConnection(port, pipeline);
+    port.fireMessage({
+      type: 'request',
+      url: 'https://api.example.com/x',
+      method: 'GET',
+      headers: { 'X-Proxy-Origin': 'https://my.app' },
+    });
+    await new Promise((r) => setTimeout(r, 10));
+    expect(dnrCalls.filter((c) => c.removeRuleIds)).toHaveLength(1);
+  });
+
+  it('does not install a rule when no forbidden header is present', async () => {
+    // No X-Proxy-* headers AND a target URL that won't trigger the
+    // default-origin fallback path? It always does — default-Origin
+    // fallback synthesizes `origin` from the target URL, so DNR is
+    // always invoked once the SW reaches fetch. Verify the rule has
+    // ONLY `origin` (the fallback), not cookie/referer/proxy-*.
+    await dispatch({});
+    const installs = dnrCalls.filter((c) => c.addRules);
+    expect(installs).toHaveLength(1);
+    const rule = installs[0].addRules![0];
+    const headerNames = rule.action.requestHeaders.map((h: any) => h.header);
+    expect(headerNames).toEqual(['origin']);
+  });
+
+  it('strips a caller-supplied URL fragment from the wire URL', async () => {
+    const { fetchUrl } = await dispatch(
+      { 'X-Proxy-Origin': 'https://my.app' },
+      'https://api.example.com/path#caller-supplied'
+    );
+    expect(fetchUrl).not.toContain('caller-supplied');
+    expect(fetchUrl).toMatch(/^https:\/\/api\.example\.com\/path#slicc-req-/);
+  });
+
+  it('falls back to a no-op when chrome.declarativeNetRequest is unavailable', async () => {
+    delete (globalThis as any).chrome;
+    const { fetchUrl, headersOnFetch } = await dispatch({
+      'X-Proxy-Origin': 'https://my.app',
+      'X-Proxy-Cookie': 'sid=abc',
+    });
+    // No fragment appended — fetch sees the original URL.
+    expect(fetchUrl).toBe('https://api.example.com/path');
+    // Forbidden headers still passed under their real names so unit tests
+    // that mock `fetch` can capture them. Real Chrome strips them; that's
+    // the fallback-no-fix mode the helper documents.
+    expect(headersOnFetch.origin).toBe('https://my.app');
+    expect(headersOnFetch.cookie).toBe('sid=abc');
   });
 });
