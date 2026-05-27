@@ -382,7 +382,7 @@ jobs:
             E2B_API_KEY
         env:
           CLOUDFLARE_TURN_API_TOKEN: ${{ secrets.CLOUDFLARE_TURN_API_TOKEN }}
-          GITHUB_CLIENT_SECRET: ${{ secrets.OAUTH_GITHUB_SECRET }}
+          GITHUB_CLIENT_SECRET: ${{ secrets.OAUTH_GITHUB_SECRET_STAGING }}
           E2B_API_KEY: ${{ secrets.E2B_API_KEY }}
       - name: Wait before staging deploy retry 2
         if: steps.deploy_attempt_1.outcome == 'failure'
@@ -404,7 +404,7 @@ jobs:
             E2B_API_KEY
         env:
           CLOUDFLARE_TURN_API_TOKEN: ${{ secrets.CLOUDFLARE_TURN_API_TOKEN }}
-          GITHUB_CLIENT_SECRET: ${{ secrets.OAUTH_GITHUB_SECRET }}
+          GITHUB_CLIENT_SECRET: ${{ secrets.OAUTH_GITHUB_SECRET_STAGING }}
           E2B_API_KEY: ${{ secrets.E2B_API_KEY }}
       - name: Wait before staging deploy retry 3
         if: steps.deploy_attempt_1.outcome == 'failure' && steps.deploy_attempt_2.outcome == 'failure'
@@ -426,7 +426,7 @@ jobs:
             E2B_API_KEY
         env:
           CLOUDFLARE_TURN_API_TOKEN: ${{ secrets.CLOUDFLARE_TURN_API_TOKEN }}
-          GITHUB_CLIENT_SECRET: ${{ secrets.OAUTH_GITHUB_SECRET }}
+          GITHUB_CLIENT_SECRET: ${{ secrets.OAUTH_GITHUB_SECRET_STAGING }}
           E2B_API_KEY: ${{ secrets.E2B_API_KEY }}
       - name: Finalize staging deploy
         id: deploy
