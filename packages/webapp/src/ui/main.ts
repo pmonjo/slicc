@@ -1355,6 +1355,15 @@ async function mainExtension(app: HTMLElement, options?: { detached?: boolean })
         layout.addSprinkle(name, title, element, zone as 'primary' | 'drawer' | undefined, options),
       removeSprinkle: (name) => layout.removeSprinkle(name),
       minimizeSprinkle: (name) => layout.minimizeSprinkle(name),
+      registerSprinkle: (name, title, opts) =>
+        layout.registerSprinkle(
+          name,
+          title,
+          opts?.icon,
+          opts?.zone as 'primary' | 'drawer' | undefined
+        ),
+      unregisterSprinkle: (name) => layout.unregisterSprinkle(name),
+      closeSprinkleContent: (name) => layout.closeSprinkleContent(name),
     },
     () => {
       const cone = client.getScoops().find((s) => s.isCone);
@@ -1369,6 +1378,7 @@ async function mainExtension(app: HTMLElement, options?: { detached?: boolean })
       autoOpenBehavior: 'attention',
       onAttachImage: (base64, name, mimeType) =>
         layout.panels.chat.addImageAttachment(base64, name, mimeType),
+      inlineSprinkles: INLINE_DIP_SPRINKLES,
     }
   );
   (window as unknown as Record<string, unknown>).__slicc_sprinkleManager = sprinkleManager;
@@ -1446,14 +1456,16 @@ async function mainExtension(app: HTMLElement, options?: { detached?: boolean })
 
   await sprinkleManager.refresh();
   layout.onSprinkleClose = (name) => sprinkleManager.close(name);
-  layout.onSprinkleActivate = (name) => sprinkleManager.markActivated(name);
-  layout.getAvailableSprinkles = () => {
-    const opened = new Set(sprinkleManager.opened());
-    return sprinkleManager
-      .available()
-      .filter((p) => !opened.has(p.name) && !INLINE_DIP_SPRINKLES.has(p.name))
-      .map((p) => ({ name: p.name, title: p.title }));
+  // Rail-icon clicks: the manager routes attention-mode promotions
+  // and registered-but-closed opens through a single entry point so
+  // launcher-style icons reuse the existing activation channel.
+  layout.onSprinkleActivate = (name) => {
+    void sprinkleManager.activate(name);
   };
+  // Every sprinkle now lives in the rail from boot — the [+] picker
+  // has nothing left to surface for sprinkles. Returning an empty
+  // list keeps the picker shell available for other panel types.
+  layout.getAvailableSprinkles = () => [];
   layout.onOpenSprinkle = (name, zone) => sprinkleManager.open(name, zone);
   layout.resolveSprinkleIcon = (spec) => resolveSprinkleIconHtml(spec, localFs);
   layout.updateAddButtons();
@@ -2444,6 +2456,15 @@ async function mainStandaloneWorker(app: HTMLElement, runtimeMode: UiRuntimeMode
         layout.addSprinkle(name, title, element, zone as 'primary' | 'drawer' | undefined, options),
       removeSprinkle: (name) => layout.removeSprinkle(name),
       minimizeSprinkle: (name) => layout.minimizeSprinkle(name),
+      registerSprinkle: (name, title, opts) =>
+        layout.registerSprinkle(
+          name,
+          title,
+          opts?.icon,
+          opts?.zone as 'primary' | 'drawer' | undefined
+        ),
+      unregisterSprinkle: (name) => layout.unregisterSprinkle(name),
+      closeSprinkleContent: (name) => layout.closeSprinkleContent(name),
     },
     () => {
       const cone = client.getScoops().find((s) => s.isCone);
@@ -2452,6 +2473,7 @@ async function mainStandaloneWorker(app: HTMLElement, runtimeMode: UiRuntimeMode
     {
       onAttachImage: (base64, name, mimeType) =>
         layout.panels.chat.addImageAttachment(base64, name, mimeType),
+      inlineSprinkles: INLINE_DIP_SPRINKLES,
     }
   );
   (window as unknown as Record<string, unknown>).__slicc_sprinkleManager = sprinkleManager;
@@ -2642,7 +2664,15 @@ async function mainStandaloneWorker(app: HTMLElement, runtimeMode: UiRuntimeMode
 
   await sprinkleManager.refresh();
   layout.onSprinkleClose = (name) => sprinkleManager.close(name);
+  // Rail-icon clicks route to `activate`: promotes attention-mode
+  // entries, opens registered-but-closed entries, no-ops otherwise.
+  layout.onSprinkleActivate = (name) => {
+    void sprinkleManager.activate(name);
+  };
+  layout.getAvailableSprinkles = () => [];
+  layout.onOpenSprinkle = (name, zone) => sprinkleManager.open(name, zone);
   layout.resolveSprinkleIcon = (spec) => resolveSprinkleIconHtml(spec, localFs);
+  layout.updateAddButtons();
   await sprinkleManager.restoreOpenSprinkles().catch((err) => {
     log.warn('Failed to restore open sprinkles', err);
   });

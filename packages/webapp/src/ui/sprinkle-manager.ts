@@ -47,6 +47,29 @@ export interface SprinkleManagerCallbacks {
   removeSprinkle(name: string): void;
   /** Called to collapse the rail content panel without destroying the sprinkle. */
   minimizeSprinkle(name: string): void;
+  /**
+   * Called when a sprinkle is discovered in the VFS so its rail icon
+   * can be added independently of `open()`. The layout treats the
+   * icon as a launcher — clicking it routes back through the
+   * activation callback. Optional for back-compat with callers that
+   * don't surface always-visible rail icons (e.g. the follower
+   * controller, which is told what to render by the leader).
+   */
+  registerSprinkle?(name: string, title: string, options?: { icon?: string; zone?: string }): void;
+  /**
+   * Called when a sprinkle disappears from the VFS so the layout
+   * can remove its rail icon. Optional for back-compat.
+   */
+  unregisterSprinkle?(name: string): void;
+  /**
+   * Called when a sprinkle is closed but its rail icon should stay
+   * (it's still in `availableSprinkles`). The layout clears the
+   * panel content and collapses the rail panel without removing
+   * the icon. Falls back to `removeSprinkle` when unset, preserving
+   * the legacy "close → icon gone" behavior for callers that
+   * haven't opted into always-visible icons.
+   */
+  closeSprinkleContent?(name: string): void;
 }
 
 const OPEN_SPRINKLES_KEY = 'slicc-open-sprinkles';
@@ -167,6 +190,14 @@ export interface SprinkleManagerOptions {
   onSendToSprinkle?: (name: string, data: unknown) => void;
   /** Called when a sprinkle pushes an image into the chat input via slicc.attachImage(). */
   onAttachImage?: (base64: string, name?: string, mimeType?: string) => void;
+  /**
+   * Sprinkle names whose `.shtml` file should NEVER surface a rail
+   * icon (they back inline dips rendered elsewhere, e.g. the welcome
+   * sprinkle). Matched by basename against discovered sprinkles
+   * before `registerSprinkle` is invoked. Empty/unset means every
+   * discovered sprinkle gets a rail icon.
+   */
+  inlineSprinkles?: ReadonlySet<string>;
 }
 
 /**
@@ -210,6 +241,15 @@ export class SprinkleManager {
   private lastRefreshAt = 0;
   private autoOpenBehavior: 'activate' | 'attention';
   private onSendToSprinkle?: (name: string, data: unknown) => void;
+  /**
+   * Names whose rail icons have been pushed to the layout via
+   * `callbacks.registerSprinkle`. Used to diff against the next
+   * `refresh()` discovery and surface install/uninstall as icon
+   * register/unregister events. Empty when the callback is unset
+   * (legacy callers that don't surface always-visible icons).
+   */
+  private registeredSprinkles = new Set<string>();
+  private readonly inlineSprinkles: ReadonlySet<string>;
   private readonly changeListeners = new Set<() => void>();
   private changeNotifyScheduled = false;
   /**
@@ -240,6 +280,7 @@ export class SprinkleManager {
     this.callbacks = callbacks;
     this.autoOpenBehavior = options.autoOpenBehavior ?? 'activate';
     this.onSendToSprinkle = options.onSendToSprinkle;
+    this.inlineSprinkles = options.inlineSprinkles ?? new Set();
   }
 
   /**
@@ -552,7 +593,56 @@ export class SprinkleManager {
   async refresh(): Promise<void> {
     this.availableSprinkles = await discoverSprinkles(this.fs);
     log.info('Discovered sprinkles', { count: this.availableSprinkles.size });
+    this.syncRegisteredIcons();
     this.notifyChange();
+  }
+
+  /**
+   * Diff `availableSprinkles` against the layout's registered rail
+   * icons and surface install/uninstall as register/unregister
+   * callbacks. No-op when `callbacks.registerSprinkle` is unset
+   * (legacy callers that don't surface always-visible icons).
+   *
+   * `inlineSprinkles` are filtered out so dip-only sprinkles never
+   * leak into the rail. An open sprinkle that has disappeared from
+   * the VFS is closed first so its content unmounts before the icon
+   * is dropped.
+   */
+  private syncRegisteredIcons(): void {
+    if (!this.callbacks.registerSprinkle) return;
+    const next = new Set<string>();
+    for (const sprinkle of this.availableSprinkles.values()) {
+      if (this.inlineSprinkles.has(sprinkle.name)) continue;
+      next.add(sprinkle.name);
+    }
+    for (const sprinkle of this.availableSprinkles.values()) {
+      if (!next.has(sprinkle.name)) continue;
+      if (this.registeredSprinkles.has(sprinkle.name)) continue;
+      try {
+        this.callbacks.registerSprinkle(sprinkle.name, sprinkle.title, {
+          icon: sprinkle.icon,
+        });
+        this.registeredSprinkles.add(sprinkle.name);
+      } catch (err) {
+        log.warn('registerSprinkle callback threw', {
+          name: sprinkle.name,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+    for (const name of [...this.registeredSprinkles]) {
+      if (next.has(name)) continue;
+      if (this.openSprinkles.has(name)) this.close(name);
+      try {
+        this.callbacks.unregisterSprinkle?.(name);
+      } catch (err) {
+        log.warn('unregisterSprinkle callback threw', {
+          name,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+      this.registeredSprinkles.delete(name);
+    }
   }
 
   /**
@@ -658,6 +748,31 @@ export class SprinkleManager {
     this.notifyChange();
   }
 
+  /**
+   * Route a rail-icon click to the right action based on current
+   * state. When the sprinkle was surfaced in attention mode, promote
+   * it to user-opened (`markActivated`). When it has a registered
+   * rail icon but no content yet, open it. Already-open user-driven
+   * entries get no extra work — the rail-zone toggle has already
+   * shown the panel.
+   */
+  async activate(name: string, zone?: string): Promise<void> {
+    if (this.attentionOnly.has(name)) {
+      this.markActivated(name);
+      return;
+    }
+    if (!this.openSprinkles.has(name)) {
+      try {
+        await this.open(name, zone);
+      } catch (err) {
+        log.warn('Failed to open sprinkle from rail-icon click', {
+          name,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+  }
+
   /** Close a sprinkle by name. */
   close(name: string): void {
     const entry = this.openSprinkles.get(name);
@@ -668,7 +783,17 @@ export class SprinkleManager {
     this.bridge.removeSprinkle(name);
     this.openSprinkles.delete(name);
     this.attentionOnly.delete(name);
-    this.callbacks.removeSprinkle(name);
+    // Prefer `closeSprinkleContent` so the rail icon survives the
+    // close — the sprinkle is still in `availableSprinkles` and
+    // clicking the icon should reopen it. Fall back to the legacy
+    // `removeSprinkle` for callers that haven't opted into
+    // always-visible icons (back-compat for tests and any caller
+    // wired before the split).
+    if (this.callbacks.closeSprinkleContent) {
+      this.callbacks.closeSprinkleContent(name);
+    } else {
+      this.callbacks.removeSprinkle(name);
+    }
     this.persistOpenSprinkles();
     log.info('Sprinkle closed', { name });
     this.notifyChange();
