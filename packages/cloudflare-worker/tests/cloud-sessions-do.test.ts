@@ -26,6 +26,8 @@ class FakeSubstrate implements SandboxSubstrate {
   readonly id = 'e2b' as const;
   readonly sandboxes = new Map<string, FakeSandbox>();
   private nextId = 1;
+  /** If set, connect() will throw this error. Used to test rollback logic. */
+  connectError?: Error;
 
   seedSandbox(
     id: string,
@@ -60,6 +62,7 @@ class FakeSubstrate implements SandboxSubstrate {
   }
 
   async connect(sandboxId: string): Promise<SandboxHandle> {
+    if (this.connectError) throw this.connectError;
     const s = this.sandboxes.get(sandboxId);
     if (!s) throw new Error(`unknown sandbox ${sandboxId}`);
     if (s.state === 'paused') s.state = 'running';
@@ -360,5 +363,44 @@ describe('CloudSessionsDurableObject — lifecycle endpoints', () => {
     ]);
     const statuses = [res1.status, res2.status].sort();
     expect(statuses).toEqual([200, 403]); // one succeeds, one CAP_EXCEEDED
+  });
+
+  it('resume-cone rolls back to original state on failure', async () => {
+    // Setup: paused cone, but substrate.connect will fail after state flip.
+    const substrate = new FakeSubstrate();
+    substrate.seedSandbox('s-fail', { metadata: { userId: 'u1', name: 'fail' }, state: 'paused' });
+    // Configure substrate to throw on connect (after the reserved flip)
+    substrate.connectError = new Error('Substrate connect failed');
+    const { state } = makeFakeState();
+    const do_ = new CloudSessionsDurableObject(state as any, makeDoEnv(substrate));
+
+    // Pre-populate registry with paused entry so listCones doesn't fail
+    const registryKey = await state.storage.get<string[]>('cloud-sessions-list');
+    const entry = {
+      sandboxId: 's-fail',
+      substrate: 'e2b',
+      name: 'fail',
+      createdAt: new Date().toISOString(),
+      lastSeen: new Date().toISOString(),
+      state: 'paused' as const,
+      joinUrl: 'https://w/join/s-fail',
+      metadata: { userId: 'u1', name: 'fail' },
+    };
+    await state.storage.put('cloud-sessions-list', [entry.sandboxId]);
+    await state.storage.put(`cloud-sessions:s-fail`, entry);
+
+    const res = await call(do_, '/resume-cone', {
+      bearer: 'b',
+      sandboxId: 's-fail',
+      localSliccVersion: 'v',
+      userId: 'u1',
+    });
+
+    // Should fail with substrate error
+    expect(res.status).toBe(500);
+
+    // Check that registry entry rolled back to 'paused', not stuck in 'reserved'
+    const finalEntry = await state.storage.get<typeof entry>('cloud-sessions:s-fail');
+    expect(finalEntry?.state).toBe('paused');
   });
 });

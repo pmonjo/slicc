@@ -78,6 +78,19 @@ describe('handleStart', () => {
     expect(body.error).toBe('CAP_EXCEEDED');
   });
 
+  it('maps DO stub throw to 503 DO_UNREACHABLE', async () => {
+    const env = makeCloudEnv();
+    setMockResponse(() => {
+      throw new Error('Durable Object eviction or network error');
+    });
+    const req = await authedRequest('https://w/start', {});
+    const res = await handleStart(req, env);
+    expect(res.status).toBe(503);
+    const body = (await res.json()) as { error: string; message: string };
+    expect(body.error).toBe('DO_UNREACHABLE');
+    expect(body.message).toContain('Durable Object');
+  });
+
   it('returns 429 after 30 start requests in the same window', async () => {
     const env = makeCloudEnv();
     for (let i = 0; i < 30; i++) {
