@@ -205,4 +205,39 @@ describe('resumeCone', () => {
     );
     expect(result.trayRebuilt).toBe(false);
   });
+
+  it('rejects an older /tmp/slicc-join.json on resume (stale file)', async () => {
+    const registry = new MemRegistry();
+    const baselineUpdatedAt = '2026-05-01T12:00:00.000Z';
+    const olderUpdatedAt = '2026-05-01T11:00:00.000Z'; // 1 hour earlier
+    await registry.append({
+      sandboxId: 'sbx-1',
+      substrate: 'e2b',
+      createdAt: '',
+      joinUrl: 'https://w/join/old',
+      lastSeen: '',
+      state: 'paused',
+      lastJoinUpdatedAt: baselineUpdatedAt,
+    });
+    const substrate = makeFakeSubstrate({
+      handle: makeResumeTestHandle({
+        joinJson: JSON.stringify({
+          joinUrl: 'https://w/join/stale',
+          trayId: 't-stale',
+          updatedAt: olderUpdatedAt,
+        }),
+      }),
+    });
+    await expect(
+      resumeCone(
+        { substrate, registry },
+        {
+          query: 'sbx-1',
+          localSliccVersion: 'test',
+          pollTimeoutMs: 200,
+          pollIntervalMs: 50,
+        }
+      )
+    ).rejects.toMatchObject({ name: 'CloudError', code: 'LEADER_NOT_READY' });
+  });
 });

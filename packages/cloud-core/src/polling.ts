@@ -68,7 +68,7 @@ export async function pollForRefreshedStatus(
         // If we have no baseline (first-time resume of an externally-created
         // sandbox), accept any well-formed read.
         if (!baselineUpdatedAt) return parsed;
-        if (parsed.updatedAt && parsed.updatedAt !== baselineUpdatedAt) {
+        if (parsed.updatedAt && parsed.updatedAt > baselineUpdatedAt) {
           return parsed;
         }
         // File exists, joinUrl present, but updatedAt unchanged — capture for
