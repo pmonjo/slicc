@@ -31,6 +31,7 @@ import { discoverLinks } from '../../net/discover-links.js';
 import { extractHandoff } from '../../net/handoff-link.js';
 import { parseLinkHeader } from '../../net/link-header.js';
 import { createProxiedFetch } from '../proxied-fetch.js';
+import { normalizeHeadersInit } from '../proxy-headers.js';
 
 /**
  * Wrap a `SecureFetch` so it can stand in for the Web Fetch API. Used to
@@ -50,7 +51,7 @@ export function asWebFetch(secureFetch: SecureFetch): typeof fetch {
   const adapter = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
     const url =
       typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
-    const headers = normalizeHeaders(init?.headers);
+    const headers = normalizeHeadersInit(init?.headers);
     const result = await secureFetch(url, {
       method: init?.method ?? 'GET',
       ...(headers ? { headers } : {}),
@@ -62,29 +63,6 @@ export function asWebFetch(secureFetch: SecureFetch): typeof fetch {
     });
   };
   return adapter as typeof fetch;
-}
-
-/**
- * Convert any `HeadersInit` shape to a plain `Record<string, string>` so the
- * forbidden-header encoder in `proxied-fetch` can read it. Returns `undefined`
- * when no headers are present so the adapter can omit the field entirely.
- */
-function normalizeHeaders(headers: HeadersInit | undefined): Record<string, string> | undefined {
-  if (!headers) return undefined;
-  if (headers instanceof Headers) {
-    const rec: Record<string, string> = {};
-    headers.forEach((v, k) => {
-      rec[k] = v;
-    });
-    return Object.keys(rec).length === 0 ? undefined : rec;
-  }
-  if (Array.isArray(headers)) {
-    const rec: Record<string, string> = {};
-    for (const [k, v] of headers) rec[k] = v;
-    return Object.keys(rec).length === 0 ? undefined : rec;
-  }
-  const rec = { ...(headers as Record<string, string>) };
-  return Object.keys(rec).length === 0 ? undefined : rec;
 }
 
 function helpText(): string {

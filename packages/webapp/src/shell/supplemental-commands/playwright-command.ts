@@ -19,6 +19,7 @@ import { discoverLinks } from '../../net/discover-links.js';
 import { extractHandoff, type HandoffMatch } from '../../net/handoff-link.js';
 import { parseLinkHeader, type ParsedLink } from '../../net/link-header.js';
 import { createProxiedFetch } from '../proxied-fetch.js';
+import { normalizeHeadersInit } from '../proxy-headers.js';
 import {
   fetchBrowseShCatalog,
   normalizeHostname,
@@ -1684,31 +1685,6 @@ export function asWebFetch(secureFetch: SecureFetch): typeof fetch {
     });
   };
   return adapter as typeof fetch;
-}
-
-/**
- * Coerce any `HeadersInit` shape to a plain record so it can ride on
- * `SecureFetchOptions.headers`. Returns `undefined` when empty so the
- * adapter can omit the field entirely.
- */
-function normalizeHeadersInit(
-  headers: HeadersInit | undefined
-): Record<string, string> | undefined {
-  if (!headers) return undefined;
-  if (headers instanceof Headers) {
-    const rec: Record<string, string> = {};
-    headers.forEach((v, k) => {
-      rec[k] = v;
-    });
-    return Object.keys(rec).length === 0 ? undefined : rec;
-  }
-  if (Array.isArray(headers)) {
-    const rec: Record<string, string> = {};
-    for (const [k, v] of headers) rec[k] = v;
-    return Object.keys(rec).length === 0 ? undefined : rec;
-  }
-  const rec = { ...(headers as Record<string, string>) };
-  return Object.keys(rec).length === 0 ? undefined : rec;
 }
 
 /** One browse.sh catalog match for the destination hostname. */

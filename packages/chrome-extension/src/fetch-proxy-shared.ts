@@ -6,7 +6,7 @@ export const REQUEST_BODY_CAP = 32 * 1024 * 1024;
 /**
  * Extract `Set-Cookie` values from upstream response headers as a list.
  * `Headers.forEach` joins multi-value `set-cookie` entries with a comma
- * (per WHATWG fetch — undef behavior for set-cookie), so use the dedicated
+ * (per WHATWG fetch — undefined behavior for set-cookie), so use the dedicated
  * `getSetCookie()` accessor when available. Falls back to a single
  * comma-joined string for older runtimes that don't implement it.
  */

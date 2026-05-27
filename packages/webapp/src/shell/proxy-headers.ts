@@ -104,3 +104,31 @@ export function headersToRecord(
   }
   return headers;
 }
+
+/**
+ * Coerce any `HeadersInit` shape (Headers / record / [k,v][] array) to a
+ * plain record so it can ride on `SecureFetchOptions.headers`. Returns
+ * `undefined` when no headers are present (or the result would be empty)
+ * so callers can omit the field entirely — preserving the "no empty
+ * object leak" contract verified by the `asWebFetch` Origin-propagation
+ * tests.
+ */
+export function normalizeHeadersInit(
+  headers: HeadersInit | undefined
+): Record<string, string> | undefined {
+  if (!headers) return undefined;
+  if (headers instanceof Headers) {
+    const rec: Record<string, string> = {};
+    headers.forEach((v, k) => {
+      rec[k] = v;
+    });
+    return Object.keys(rec).length === 0 ? undefined : rec;
+  }
+  if (Array.isArray(headers)) {
+    const rec: Record<string, string> = {};
+    for (const [k, v] of headers) rec[k] = v;
+    return Object.keys(rec).length === 0 ? undefined : rec;
+  }
+  const rec = { ...(headers as Record<string, string>) };
+  return Object.keys(rec).length === 0 ? undefined : rec;
+}
