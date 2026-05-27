@@ -73,10 +73,11 @@ class FakeSubstrate implements SandboxSubstrate {
       name: s.name,
     }));
     // Filter by metadata if provided (mimics e2b server-side filtering)
-    if (!opts?.metadata) return all;
+    const meta = opts?.metadata;
+    if (!meta) return all;
     return all.filter((s) => {
       if (!s.metadata) return false;
-      for (const [k, v] of Object.entries(opts.metadata)) {
+      for (const [k, v] of Object.entries(meta)) {
         if (s.metadata[k] !== v) return false;
       }
       return true;
