@@ -99,46 +99,77 @@ interface ResizedImage {
   nativeHeight: number;
 }
 
+// OffscreenCanvas.convertToBlob only reliably encodes image/png, image/webp,
+// and image/jpeg. image/apng (and anything else with alpha) must be normalized
+// to image/png on the alpha-preserving path.
+const CANVAS_ALPHA_MIMES = new Set(['image/png', 'image/webp']);
+
+function copyToFreshBuffer(sourceBytes: Uint8Array): Uint8Array<ArrayBuffer> {
+  // Copy to a fresh buffer so the Blob can't outlive the original
+  // (the VFS read buffer is reused across calls).
+  const buf = new ArrayBuffer(sourceBytes.byteLength);
+  const safeBytes = new Uint8Array(buf);
+  safeBytes.set(sourceBytes);
+  return safeBytes;
+}
+
+async function decodeDimensions(
+  sourceBytes: Uint8Array,
+  sourceMime: string
+): Promise<{ width: number; height: number }> {
+  const safeBytes = copyToFreshBuffer(sourceBytes);
+  const blob = new Blob([safeBytes], { type: sourceMime });
+  const bitmap = await createImageBitmap(blob);
+  try {
+    return { width: bitmap.width, height: bitmap.height };
+  } finally {
+    bitmap.close?.();
+  }
+}
+
 async function decodeAndResize(
   sourceBytes: Uint8Array,
   sourceMime: string,
   maxW: number,
   maxH: number
 ): Promise<ResizedImage> {
-  // Copy to a fresh buffer so the Blob can't outlive the original
-  // (the VFS read buffer is reused across calls).
-  const safeBytes = new Uint8Array(sourceBytes.byteLength);
-  safeBytes.set(sourceBytes);
-  const blob = new Blob([safeBytes.buffer], { type: sourceMime });
+  const safeBytes = copyToFreshBuffer(sourceBytes);
+  const blob = new Blob([safeBytes], { type: sourceMime });
   const bitmap = await createImageBitmap(blob);
-  const nativeWidth = bitmap.width;
-  const nativeHeight = bitmap.height;
-  // Never upscale — scale is capped at 1.
-  const scale = Math.min(maxW / nativeWidth, maxH / nativeHeight, 1);
-  const targetW = Math.max(1, Math.round(nativeWidth * scale));
-  const targetH = Math.max(1, Math.round(nativeHeight * scale));
-  const canvas = new OffscreenCanvas(targetW, targetH);
-  const ctx = canvas.getContext('2d');
-  if (!ctx) {
+  try {
+    const nativeWidth = bitmap.width;
+    const nativeHeight = bitmap.height;
+    // Never upscale — scale is capped at 1.
+    const scale = Math.min(maxW / nativeWidth, maxH / nativeHeight, 1);
+    const targetW = Math.max(1, Math.round(nativeWidth * scale));
+    const targetH = Math.max(1, Math.round(nativeHeight * scale));
+    const canvas = new OffscreenCanvas(targetW, targetH);
+    const ctx = canvas.getContext('2d');
+    if (!ctx) {
+      throw new Error('failed to acquire 2d context for resize');
+    }
+    ctx.drawImage(bitmap, 0, 0, targetW, targetH);
+    const preserveAlpha = sourceHasAlpha(sourceBytes, sourceMime);
+    const outMime = preserveAlpha
+      ? CANVAS_ALPHA_MIMES.has(sourceMime)
+        ? sourceMime
+        : 'image/png'
+      : 'image/jpeg';
+    const blobOut = await canvas.convertToBlob(
+      outMime === 'image/jpeg' ? { type: 'image/jpeg', quality: 0.85 } : { type: outMime }
+    );
+    const outBytes = new Uint8Array(await blobOut.arrayBuffer());
+    return {
+      bytes: outBytes,
+      mime: outMime,
+      width: targetW,
+      height: targetH,
+      nativeWidth,
+      nativeHeight,
+    };
+  } finally {
     bitmap.close?.();
-    throw new Error('failed to acquire 2d context for resize');
   }
-  ctx.drawImage(bitmap, 0, 0, targetW, targetH);
-  const preserveAlpha = sourceHasAlpha(sourceBytes, sourceMime);
-  const outMime = preserveAlpha ? sourceMime : 'image/jpeg';
-  const blobOut = await canvas.convertToBlob(
-    outMime === 'image/jpeg' ? { type: 'image/jpeg', quality: 0.85 } : { type: outMime }
-  );
-  bitmap.close?.();
-  const outBytes = new Uint8Array(await blobOut.arrayBuffer());
-  return {
-    bytes: outBytes,
-    mime: outMime,
-    width: targetW,
-    height: targetH,
-    nativeWidth,
-    nativeHeight,
-  };
 }
 
 interface ParsedArgs {
@@ -322,9 +353,8 @@ export function createOpenCommand(): Command {
       if (view) {
         // --view: read file, decode as image, and return the resized
         // image as an <img:> tag for agent vision. Without --size we
-        // refuse to inline the original bytes — the original
-        // implementation gave the agent no way to bound how much
-        // context a single open call consumed (see spec PR 1).
+        // refuse to inline raw bytes — a single un-bounded image can
+        // blow the tool-result token budget.
         let stat;
         try {
           stat = await ctx.fs.stat(path);
@@ -369,17 +399,41 @@ export function createOpenCommand(): Command {
           }
         }
 
+        if (!parsedSize) {
+          // No --size: only the native dimensions are needed for the
+          // usage hint. Skip the canvas/convertToBlob round-trip so a
+          // missing --size doesn't allocate an OffscreenCanvas at
+          // native resolution and re-encode the full image.
+          let dims;
+          try {
+            dims = await decodeDimensions(sourceBytes, sourceMime);
+          } catch (err) {
+            return {
+              stdout: '',
+              stderr:
+                `open: not an image or failed to decode: ${target} ` +
+                `(${err instanceof Error ? err.message : String(err)})\n`,
+              exitCode: 1,
+            };
+          }
+          const kb = Math.round(sourceBytes.byteLength / 1024);
+          return {
+            stdout: '',
+            stderr:
+              `open --view: ${path} is ${dims.width}x${dims.height} ` +
+              `(${kb} KB, ${sourceMime})\n` +
+              sizeUsageHint(),
+            exitCode: 1,
+          };
+        }
+
         let resized: ResizedImage;
         try {
-          // Decode happens up front so the no-size branch can still
-          // print native dimensions; resize is only meaningful when
-          // --size is supplied (otherwise the box is infinite and the
-          // scale is clamped to 1, so the resize is a no-op).
           resized = await decodeAndResize(
             sourceBytes,
             sourceMime,
-            parsedSize ? parsedSize.maxW : Number.POSITIVE_INFINITY,
-            parsedSize ? parsedSize.maxH : Number.POSITIVE_INFINITY
+            parsedSize.maxW,
+            parsedSize.maxH
           );
         } catch (err) {
           return {
@@ -387,18 +441,6 @@ export function createOpenCommand(): Command {
             stderr:
               `open: not an image or failed to decode: ${target} ` +
               `(${err instanceof Error ? err.message : String(err)})\n`,
-            exitCode: 1,
-          };
-        }
-
-        if (!parsedSize) {
-          const kb = Math.round(sourceBytes.byteLength / 1024);
-          return {
-            stdout: '',
-            stderr:
-              `open --view: ${path} is ${resized.nativeWidth}x${resized.nativeHeight} ` +
-              `(${kb} KB, ${sourceMime})\n` +
-              sizeUsageHint(),
             exitCode: 1,
           };
         }

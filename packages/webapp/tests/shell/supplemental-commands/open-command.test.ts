@@ -52,7 +52,9 @@ interface MockResize {
   createImageBitmap: ReturnType<typeof vi.fn>;
   canvasArgs: { width: number; height: number }[];
   convertCalls: { type: string; quality?: number }[];
+  bitmapCloseSpies: ReturnType<typeof vi.fn>[];
   outputBytes: Uint8Array;
+  convertToBlobOverride?: (opts: { type: string; quality?: number }) => Promise<Blob>;
 }
 
 function installImageMocks(
@@ -64,13 +66,14 @@ function installImageMocks(
     createImageBitmap: vi.fn(),
     canvasArgs: [],
     convertCalls: [],
+    bitmapCloseSpies: [],
     outputBytes,
   };
-  state.createImageBitmap.mockImplementation(async () => ({
-    width: bitmapWidth,
-    height: bitmapHeight,
-    close: vi.fn(),
-  }));
+  state.createImageBitmap.mockImplementation(async () => {
+    const close = vi.fn();
+    state.bitmapCloseSpies.push(close);
+    return { width: bitmapWidth, height: bitmapHeight, close };
+  });
   (globalThis as any).createImageBitmap = state.createImageBitmap;
   (globalThis as any).OffscreenCanvas = class {
     width: number;
@@ -86,6 +89,7 @@ function installImageMocks(
     }
     async convertToBlob(opts: { type: string; quality?: number }) {
       state.convertCalls.push({ type: opts.type, quality: opts.quality });
+      if (state.convertToBlobOverride) return state.convertToBlobOverride(opts);
       return new Blob([state.outputBytes], { type: opts.type });
     }
   };
@@ -293,7 +297,7 @@ describe('open command', () => {
 
     it('without --size prints dimensions + mime + size hint and exits 1', async () => {
       const png = pngWithAlphaBytes();
-      installImageMocks(1024, 768);
+      const mocks = installImageMocks(1024, 768);
       const cmd = createOpenCommand();
       const ctx = createMockCtx({ files: { '/workspace/image.png': png } });
       const result = await cmd.execute(['--view', '/workspace/image.png'], ctx as any);
@@ -307,6 +311,47 @@ describe('open command', () => {
       expect(result.stderr).toContain('high');
       expect(result.stderr).toContain('WxH');
       expect(result.stdout).not.toContain('<img:data:');
+      // No --size: must not allocate a canvas or invoke convertToBlob.
+      expect(mocks.canvasArgs).toEqual([]);
+      expect(mocks.convertCalls).toEqual([]);
+      // The bitmap acquired for dimension-only decode must still be released.
+      expect(mocks.bitmapCloseSpies).toHaveLength(1);
+      expect(mocks.bitmapCloseSpies[0]).toHaveBeenCalledTimes(1);
+    });
+
+    it('APNG input is re-encoded as image/png (canvas does not support image/apng)', async () => {
+      // pngWithAlphaBytes() produces bytes whose IHDR color_type = 6, so
+      // sourceHasAlpha() returns true. The .apng extension drives
+      // detectMimeType → 'image/apng'.
+      const apng = pngWithAlphaBytes();
+      const mocks = installImageMocks(500, 500);
+      const cmd = createOpenCommand();
+      const ctx = createMockCtx({ files: { '/workspace/anim.apng': apng } });
+      const result = await cmd.execute(
+        ['--view', '--size', '256x256', '/workspace/anim.apng'],
+        ctx as any
+      );
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout).toContain('<img:data:image/png;base64,');
+      expect(mocks.convertCalls[0]).toEqual({ type: 'image/png', quality: undefined });
+    });
+
+    it('releases the bitmap when convertToBlob rejects', async () => {
+      const png = pngWithAlphaBytes();
+      const mocks = installImageMocks(500, 500);
+      mocks.convertToBlobOverride = async () => {
+        throw new Error('encode failed');
+      };
+      const cmd = createOpenCommand();
+      const ctx = createMockCtx({ files: { '/workspace/image.png': png } });
+      const result = await cmd.execute(
+        ['--view', '--size', '256x256', '/workspace/image.png'],
+        ctx as any
+      );
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr).toContain('encode failed');
+      expect(mocks.bitmapCloseSpies).toHaveLength(1);
+      expect(mocks.bitmapCloseSpies[0]).toHaveBeenCalledTimes(1);
     });
 
     it('with --size WxH inlines only the resized image (image/jpeg for opaque source)', async () => {
