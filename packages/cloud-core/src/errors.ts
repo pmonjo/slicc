@@ -14,6 +14,7 @@ export type CloudErrorCode =
   | 'SANDBOX_NOT_READY'
   | 'CDP_NOT_READY'
   | 'CDP_ERROR'
+  | 'DO_UNREACHABLE'
   | 'INTERNAL';
 
 export class CloudError extends Error {

@@ -304,6 +304,8 @@ function errCodeToStatus(code: string): number {
     SANDBOX_NOT_READY: 503,
     CDP_NOT_READY: 503,
     CDP_ERROR: 500,
+    DO_UNREACHABLE: 503,
+    UPSTREAM_UNAVAILABLE: 503,
     INTERNAL: 500,
   };
   return map[code] ?? 500;

@@ -1,4 +1,4 @@
-import { createRemoteJWKSet, jwtVerify } from 'jose';
+import { createRemoteJWKSet, jwtVerify, errors } from 'jose';
 import { getProxyConfig } from './proxy-config.js';
 
 const JWKS_URLS: Record<string, string> = {
@@ -39,7 +39,11 @@ export interface AuthResult {
 
 export class AuthError extends Error {
   constructor(
-    public readonly code: 'MISSING_TOKEN' | 'INVALID_TOKEN' | 'NOT_ALLOWED',
+    public readonly code:
+      | 'MISSING_TOKEN'
+      | 'INVALID_TOKEN'
+      | 'NOT_ALLOWED'
+      | 'UPSTREAM_UNAVAILABLE',
     message: string
   ) {
     super(message);
@@ -101,10 +105,22 @@ export async function validateBearer(token: string, env: ValidateBearerEnv): Pro
     const { payload: p } = await jwtVerify(token, jwks);
     payload = p as JWTPayload;
   } catch (err) {
-    throw new AuthError(
-      'INVALID_TOKEN',
-      `JWT verification failed: ${err instanceof Error ? err.message : String(err)}`
-    );
+    // Discriminate upstream failures (JWKS fetch issues) from token validity issues.
+    // JWKS errors → 503 UPSTREAM_UNAVAILABLE (transient, retry later).
+    // Token errors → 401 INVALID_TOKEN (client must re-authenticate).
+    if (err instanceof errors.JWKSTimeout || err instanceof errors.JWKSNoMatchingKey) {
+      throw new AuthError(
+        'UPSTREAM_UNAVAILABLE',
+        `JWKS service unavailable: ${err instanceof Error ? err.message : String(err)}`
+      );
+    }
+    // Check for fetch errors from jose's createRemoteJWKSet (network issues).
+    const msg = err instanceof Error ? err.message : String(err);
+    if (/fetch failed|network|ECONNREFUSED|ETIMEDOUT/i.test(msg)) {
+      throw new AuthError('UPSTREAM_UNAVAILABLE', `IMS JWKS unreachable: ${msg}`);
+    }
+    // Token validity errors → INVALID_TOKEN.
+    throw new AuthError('INVALID_TOKEN', `JWT verification failed: ${msg}`);
   }
 
   if (payload.iss && payload.iss !== expectedIssuer) {

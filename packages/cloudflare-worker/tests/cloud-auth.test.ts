@@ -140,6 +140,47 @@ describe('validateBearer', () => {
     });
     await expect(validateBearer(token, ENV)).rejects.toMatchObject({ code: 'INVALID_TOKEN' });
   });
+
+  it('throws UPSTREAM_UNAVAILABLE when JWKS fetch fails', async () => {
+    // Clear proxy config cache to force a fresh fetch
+    clearProxyConfigCache();
+
+    // Mock fetch to fail for the IMS keys URL. The JWKS cache from earlier
+    // tests has already cached keys, so we need to use a *different*
+    // environment to force jose to make a new JWKS fetch that will fail.
+    fetchSpy.mockImplementation(async (input: RequestInfo | URL) => {
+      const url =
+        typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+      if (url.includes('/v1/config')) {
+        return new Response(
+          JSON.stringify({
+            clientId: 'test-client',
+            scopes: 'openid',
+            imsEnvironment: 'stg1', // <-- different env to bypass JWKS cache
+          }),
+          { status: 200, headers: { 'content-type': 'application/json' } }
+        );
+      }
+      if (url.includes('/ims/keys')) {
+        throw new Error('network error: ECONNREFUSED');
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+
+    // Token for stg1 environment (different issuer)
+    const token = await makeToken({
+      iss: 'https://ims-na1-stg1.adobelogin.com',
+      sub: 'usr-6',
+      client_id: 'test-client',
+      type: 'access_token',
+      email: 'test@adobe.com',
+    });
+
+    await expect(validateBearer(token, ENV)).rejects.toMatchObject({
+      name: 'AuthError',
+      code: 'UPSTREAM_UNAVAILABLE',
+    });
+  });
 });
 
 describe('extractBearer', () => {

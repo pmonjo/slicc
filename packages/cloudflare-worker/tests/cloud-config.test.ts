@@ -41,6 +41,25 @@ describe('GET /api/cloud/config', () => {
     expect(body.error).toBe('PROXY_CONFIG_UNAVAILABLE');
   });
 
+  it('returns 500 PROXY_CONFIG_INVALID when proxy returns malformed config', async () => {
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+      const url =
+        typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+      if (url.includes('/v1/config')) {
+        // Return 200 but missing required fields
+        return new Response(JSON.stringify({}), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+    const res = await handleCloudConfig(new Request('https://w/api/cloud/config'), {});
+    expect(res.status).toBe(500);
+    const body = (await res.json()) as { error: string };
+    expect(body.error).toBe('PROXY_CONFIG_INVALID');
+  });
+
   it('honors ADOBE_PROXY_ENDPOINT override', async () => {
     let calledUrl = '';
     vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {

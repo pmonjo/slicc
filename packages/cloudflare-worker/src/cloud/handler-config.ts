@@ -30,12 +30,20 @@ export async function handleCloudConfig(_req: Request, env: ConfigEnv): Promise<
       imsReceivePath: RECEIVE_PATH,
     });
   } catch (err) {
+    // Discriminate network/HTTP errors (transient, 502) from shape errors (config bug, 500).
+    const isShapeError =
+      err instanceof Error &&
+      err.name === 'ProxyConfigError' &&
+      'code' in err &&
+      err.code === 'PROXY_SHAPE_ERROR';
+    const errorCode = isShapeError ? 'PROXY_CONFIG_INVALID' : 'PROXY_CONFIG_UNAVAILABLE';
+    const status = isShapeError ? 500 : 502;
     return Response.json(
       {
-        error: 'PROXY_CONFIG_UNAVAILABLE',
+        error: errorCode,
         message: err instanceof Error ? err.message : String(err),
       },
-      { status: 502 }
+      { status }
     );
   }
 }

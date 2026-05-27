@@ -114,6 +114,15 @@ describe('handlePause', () => {
     expect(getRecordedCalls()[0]!.endpoint).toBe('/pause-cone');
     expect(getRecordedCalls()[0]!.body).toEqual({ sandboxId: 'sbx-1' });
   });
+
+  it('returns 400 BAD_REQUEST when sandboxId is missing', async () => {
+    const env = makeCloudEnv();
+    const req = await authedRequest('https://w/pause', {});
+    const res = await handlePause(req, env);
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error: string };
+    expect(body.error).toBe('BAD_REQUEST');
+  });
 });
 
 describe('handleResume', () => {
@@ -131,6 +140,15 @@ describe('handleResume', () => {
     });
     expect(typeof call.body.localSliccVersion).toBe('string');
   });
+
+  it('returns 400 BAD_REQUEST when sandboxId is missing', async () => {
+    const env = makeCloudEnv();
+    const req = await authedRequest('https://w/resume', {});
+    const res = await handleResume(req, env);
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error: string };
+    expect(body.error).toBe('BAD_REQUEST');
+  });
 });
 
 describe('handleKill', () => {
@@ -141,6 +159,15 @@ describe('handleKill', () => {
     expect(res.status).toBe(200);
     expect(getRecordedCalls()[0]!.endpoint).toBe('/kill-cone');
     expect(getRecordedCalls()[0]!.body).toEqual({ sandboxId: 'sbx-1' });
+  });
+
+  it('returns 400 BAD_REQUEST when sandboxId is missing', async () => {
+    const env = makeCloudEnv();
+    const req = await authedRequest('https://w/kill', {});
+    const res = await handleKill(req, env);
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error: string };
+    expect(body.error).toBe('BAD_REQUEST');
   });
 });
 

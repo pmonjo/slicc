@@ -36,11 +36,16 @@ async function forwardToDo(
   endpoint: string,
   body: Record<string, unknown>
 ): Promise<Response> {
-  return await stub.fetch(`https://do${endpoint}`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify(body),
-  });
+  try {
+    return await stub.fetch(`https://do${endpoint}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+  } catch (err) {
+    console.error('[cloud] DO RPC failed:', endpoint, err);
+    return errorResponse(503, 'DO_UNREACHABLE', err instanceof Error ? err.message : String(err));
+  }
 }
 
 export async function handleStart(request: Request, env: CloudEnv): Promise<Response> {
@@ -85,7 +90,10 @@ export async function handlePause(request: Request, env: CloudEnv): Promise<Resp
       retryAfterSec: rate.retryAfterSec,
     });
   }
-  const body = (await request.json()) as { sandboxId: string };
+  const body = (await request.json().catch(() => ({}))) as { sandboxId?: string };
+  if (!body.sandboxId) {
+    return errorResponse(400, 'BAD_REQUEST', 'sandboxId is required');
+  }
   const stub = getDoStub(env, auth.userId);
   return forwardToDo(stub, '/pause-cone', { sandboxId: body.sandboxId });
 }
@@ -100,7 +108,10 @@ export async function handleResume(request: Request, env: CloudEnv): Promise<Res
     });
   }
   const bearer = request.headers.get('Authorization')!.slice(7);
-  const body = (await request.json()) as { sandboxId: string };
+  const body = (await request.json().catch(() => ({}))) as { sandboxId?: string };
+  if (!body.sandboxId) {
+    return errorResponse(400, 'BAD_REQUEST', 'sandboxId is required');
+  }
   const stub = getDoStub(env, auth.userId);
   return forwardToDo(stub, '/resume-cone', {
     bearer,
@@ -119,7 +130,10 @@ export async function handleKill(request: Request, env: CloudEnv): Promise<Respo
       retryAfterSec: rate.retryAfterSec,
     });
   }
-  const body = (await request.json()) as { sandboxId: string };
+  const body = (await request.json().catch(() => ({}))) as { sandboxId?: string };
+  if (!body.sandboxId) {
+    return errorResponse(400, 'BAD_REQUEST', 'sandboxId is required');
+  }
   const stub = getDoStub(env, auth.userId);
   return forwardToDo(stub, '/kill-cone', { sandboxId: body.sandboxId });
 }
