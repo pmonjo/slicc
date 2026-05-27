@@ -337,9 +337,10 @@ function approxContentBytes(content: unknown): number {
   return total;
 }
 
-function buildElisionStub(approxBytes: number): string {
+function buildElisionStub(approxBytes: number, role: 'toolResult' | 'assistant'): string {
   const kb = Math.max(1, Math.round(approxBytes / 1024));
-  return `[Tool result elided: ${kb} KB, exceeds half the context window. Re-run with smaller arguments — e.g. open --view --size low.]`;
+  const prefix = role === 'assistant' ? 'Assistant message elided' : 'Tool result elided';
+  return `[${prefix}: ${kb} KB, exceeds half the context window. Re-run with smaller arguments — e.g. open --view --size low.]`;
 }
 
 /**
@@ -348,8 +349,15 @@ function buildElisionStub(approxBytes: number): string {
  * `(contextWindow - reserveTokens) / 2` with a short stub.
  *
  * - Message ordering, role, `toolCallId`, and `toolName` are preserved.
- * - For assistant messages, `toolCall` content blocks are kept intact so
- *   the agent loop's tool-call/tool-result pairing stays valid.
+ * - For assistant messages, `toolCall` content blocks are kept (with `id`,
+ *   `name`, and `type` intact) so the agent loop's tool-call/tool-result
+ *   pairing stays valid. Each block's `arguments` payload is rewritten to
+ *   a small `{ elided: true, originalBytes: <n> }` stub so multi-megabyte
+ *   `write_file`-style argument blobs don't survive elision and re-trigger
+ *   the hopeless branch on the next turn.
+ * - Assistant messages without any `toolCall` block are passed through
+ *   unchanged — only assistant turns that actually carry tool calls
+ *   participate in this elision, matching the JSDoc invariant.
  */
 function elideHopelessMessages(
   messages: AgentMessage[],
@@ -368,29 +376,52 @@ function elideHopelessMessages(
 
     const m = msg as { content?: unknown };
     const bytes = approxContentBytes(m.content);
-    const stub = buildElisionStub(bytes);
 
     if (role === 'toolResult') {
       elidedCount++;
       elidedBytes += bytes;
       return {
         ...(msg as object),
-        content: [{ type: 'text', text: stub }],
+        content: [{ type: 'text', text: buildElisionStub(bytes, 'toolResult') }],
       } as AgentMessage;
     }
 
-    // Assistant: drop text/thinking/image blocks but keep `toolCall`
-    // blocks so the following `toolResult` messages still have a
-    // matching `id` to pair against.
+    // Assistant branch: only elide turns that actually carry tool calls.
     const content = Array.isArray(m.content) ? m.content : [];
-    const toolCalls = content.filter(
-      (b) => (b as { type?: string }).type === 'toolCall'
-    ) as unknown[];
+    const toolCalls = content.filter((b) => (b as { type?: string }).type === 'toolCall') as Array<{
+      type: string;
+      id?: string;
+      name?: string;
+      arguments?: unknown;
+    }>;
+    if (toolCalls.length === 0) return msg;
+
+    // Rewrite each toolCall's `arguments` to a small stub while preserving
+    // `type`, `id`, and `name`. This drops multi-megabyte argument payloads
+    // (e.g. a large `write_file` `content` field) that would otherwise
+    // survive elision and keep the conversation over the hopeless threshold.
+    const elidedToolCalls = toolCalls.map((tc) => {
+      let argBytes = 0;
+      if (tc.arguments !== undefined) {
+        try {
+          argBytes = JSON.stringify(tc.arguments).length;
+        } catch {
+          // unserializable arguments — best-effort, treat as 0 bytes
+        }
+      }
+      return {
+        type: tc.type,
+        id: tc.id,
+        name: tc.name,
+        arguments: { elided: true, originalBytes: argBytes },
+      };
+    });
+
     elidedCount++;
     elidedBytes += bytes;
     return {
       ...(msg as object),
-      content: [{ type: 'text', text: stub }, ...toolCalls],
+      content: [{ type: 'text', text: buildElisionStub(bytes, 'assistant') }, ...elidedToolCalls],
     } as AgentMessage;
   });
 

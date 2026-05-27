@@ -1,7 +1,12 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import type { AgentMessage } from '@earendil-works/pi-agent-core';
 import type { Api, Model } from '@earendil-works/pi-ai';
-import { setLogLevel, LogLevel } from '../../src/core/logger.js';
+import {
+  setLogLevel,
+  getLogLevel,
+  LogLevel,
+  resetLoggerDedupForTests,
+} from '../../src/core/logger.js';
 
 /** Structural views used in test helpers and assertions to avoid `any`. */
 type TestContentBlock = {
@@ -725,11 +730,21 @@ describe('createCompactContext hopeless branch', () => {
     contextWindow: 200000,
   };
 
+  let prevLogLevel: LogLevel;
+
   beforeEach(() => {
     mockCompleteSimple.mockReset();
     mockCompleteSimple.mockResolvedValue(llmResponse('## Goal\nstub'));
-    // Ensure WARN-level lines actually reach console.warn under vitest.
+    // Preserve and restore the global log level so this describe block
+    // doesn't leak WARN-level logging into other tests.
+    prevLogLevel = getLogLevel();
     setLogLevel(LogLevel.WARN);
+    // The logger's DedupBuffer is module-global and survives across tests
+    // — a prior test logging the same "Compaction hopeless branch" warn
+    // leaves that fingerprint live for 60s of `Date.now()`, which under
+    // shuffled order can suppress this test's call. Reset every dedup
+    // buffer so each test observes its own structured warn deterministically.
+    resetLoggerDedupForTests();
     vi.spyOn(console, 'warn').mockImplementation(() => {});
     vi.spyOn(console, 'info').mockImplementation(() => {});
     vi.spyOn(console, 'error').mockImplementation(() => {});
@@ -737,12 +752,9 @@ describe('createCompactContext hopeless branch', () => {
 
   afterEach(() => {
     vi.restoreAllMocks();
+    setLogLevel(prevLogLevel);
   });
 
-  // This test MUST run before any other hopeless-triggering test in the
-  // file: the logger's dedup buffer suppresses repeats of an identical
-  // structured warn within a 60s window, so only the first call is
-  // observable to the spy.
   it(
     'skips LLM, elides oversized toolResult, emits structured warn, ' +
       'and returns under the soft threshold',
@@ -848,10 +860,82 @@ describe('createCompactContext hopeless branch', () => {
       expect(found).toBe(true);
     }
 
-    // Both elided messages must still carry the stub text.
-    const stubs = result.filter((m) => firstText(m).includes('Tool result elided'));
-    expect(stubs.length).toBe(2);
+    // Both elided messages must still carry a role-specific stub.
+    const toolResultStubs = result.filter((m) => firstText(m).includes('Tool result elided'));
+    const assistantStubs = result.filter((m) => firstText(m).includes('Assistant message elided'));
+    expect(toolResultStubs.length).toBe(1);
+    expect(assistantStubs.length).toBe(1);
   });
+
+  it(
+    'rewrites oversized toolCall arguments to a stub while preserving id/name ' +
+      'and keeping the following toolResult pairing valid',
+    async () => {
+      // 4 MB of JSON-stringifiable text in `arguments.content` — the kind
+      // of payload `write_file` carries. estimateTokens (mocked) only
+      // counts text-block characters, so we wrap the assistant turn with
+      // a large preamble too in order to push it over the per-message
+      // threshold and into the assistant elision branch.
+      const hugeArgValue = 'x'.repeat(4_000_000);
+      const hugePreamble = 'p'.repeat(4_000_000);
+      const assistantMsg = {
+        role: 'assistant',
+        content: [
+          { type: 'text', text: hugePreamble },
+          {
+            type: 'toolCall',
+            id: 'tc-huge',
+            name: 'write_file',
+            arguments: { path: '/workspace/huge.txt', content: hugeArgValue },
+          },
+        ],
+        timestamp: 0,
+      } as unknown as AgentMessage;
+
+      const messages: AgentMessage[] = [
+        createMessage('user', 'please write the file'),
+        assistantMsg,
+        createToolResult('ok', 'tc-huge'),
+        createMessage('user', 'thanks'),
+      ];
+
+      const compact = createCompactContext(mockConfig);
+      const result = await compact(messages);
+
+      // Hopeless branch — no LLM call.
+      expect(mockCompleteSimple).not.toHaveBeenCalled();
+
+      // Locate the elided assistant message in the result.
+      const elidedAssistant = result.find((m) => {
+        const tm = asTestMessage(m);
+        return (
+          tm.role === 'assistant' &&
+          Array.isArray(tm.content) &&
+          tm.content.some((b) => b.type === 'text' && b.text?.includes('Assistant message elided'))
+        );
+      });
+      expect(elidedAssistant).toBeDefined();
+      const content = asTestMessage(elidedAssistant!).content as TestContentBlock[];
+      const elidedToolCall = content.find((b) => b.type === 'toolCall');
+      expect(elidedToolCall).toBeDefined();
+      // Identity preserved.
+      expect(elidedToolCall!.id).toBe('tc-huge');
+      expect(elidedToolCall!.name).toBe('write_file');
+      // Arguments rewritten to the stub shape — original payload is gone.
+      expect(elidedToolCall!.arguments).toEqual({
+        elided: true,
+        originalBytes: expect.any(Number),
+      });
+      expect(
+        (elidedToolCall!.arguments as { originalBytes: number }).originalBytes
+      ).toBeGreaterThan(1_000_000);
+
+      // The following toolResult must still match the elided toolCall id.
+      const tr = result.find((m) => asTestMessage(m).role === 'toolResult');
+      expect(tr).toBeDefined();
+      expect(asTestMessage(tr!).toolCallId).toBe('tc-huge');
+    }
+  );
 
   it('honors a custom hopelessMultiplier', async () => {
     // Push the hopeless threshold up to 10 × contextWindow = 2_000_000
