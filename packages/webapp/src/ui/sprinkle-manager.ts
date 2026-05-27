@@ -58,6 +58,17 @@ const OPEN_SPRINKLES_KEY = 'slicc-open-sprinkles';
  * in attention mode so the rail icon shows up.
  */
 const KNOWN_SPRINKLES_KEY = 'slicc-known-sprinkles';
+/**
+ * One-shot consumption ledger for `data-sprinkle-autoopen` sprinkles.
+ * Once a sprinkle has been auto-opened (via the first-run
+ * `restoreOpenSprinkles` branch, `surfaceUnseenSprinkles`, or the
+ * post-install `runOpenNewAutoOpenSprinkles` path), its name lands
+ * here and the three auto-open paths skip it forever after. The user
+ * closing the panel won't resurrect it, and an unrelated reset of the
+ * known-sprinkles ledger won't either. User-driven opens (rail icon,
+ * picker) bypass this ledger entirely.
+ */
+const AUTOOPENED_ONCE_KEY = 'slicc-autoopened-once';
 
 export interface SprinkleManagerOptions {
   /**
@@ -212,15 +223,19 @@ export class SprinkleManager {
         // (legacy behavior). The non-autoopen ones get a rail
         // icon via `surfaceUnseenSprinkles()` below.
         const attention = this.autoOpenBehavior === 'attention';
+        const autoOpenedOnce = this.loadAutoOpenedOnce();
+        const consumed = new Set<string>();
         for (const sprinkle of this.availableSprinkles.values()) {
-          if (sprinkle.autoOpen) {
-            try {
-              await this.open(sprinkle.name, undefined, { attention });
-            } catch {
-              log.warn('Failed to auto-open sprinkle', { name: sprinkle.name });
-            }
+          if (!sprinkle.autoOpen) continue;
+          if (autoOpenedOnce.has(sprinkle.name)) continue;
+          try {
+            await this.open(sprinkle.name, undefined, { attention });
+            consumed.add(sprinkle.name);
+          } catch {
+            log.warn('Failed to auto-open sprinkle', { name: sprinkle.name });
           }
         }
+        if (consumed.size > 0) this.persistAutoOpenedOnce(consumed);
       }
     } catch {
       /* corrupt localStorage, ignore */
@@ -237,20 +252,28 @@ export class SprinkleManager {
    */
   private async surfaceUnseenSprinkles(): Promise<void> {
     const known = this.loadKnownSprinkles();
+    const autoOpenedOnce = this.loadAutoOpenedOnce();
     const attentionForAutoOpen = this.autoOpenBehavior === 'attention';
+    const consumed = new Set<string>();
     for (const sprinkle of this.availableSprinkles.values()) {
       if (known.has(sprinkle.name)) continue;
       if (this.openSprinkles.has(sprinkle.name)) continue;
+      // Auto-open sprinkles are one-shot: if we've already consumed
+      // this one in a prior session, skip it entirely even though
+      // the known-sprinkles ledger doesn't list it.
+      if (sprinkle.autoOpen && autoOpenedOnce.has(sprinkle.name)) continue;
       try {
         await this.open(sprinkle.name, undefined, {
           attention: sprinkle.autoOpen ? attentionForAutoOpen : true,
         });
+        if (sprinkle.autoOpen) consumed.add(sprinkle.name);
         log.info('Surfaced previously-unseen sprinkle', { name: sprinkle.name });
       } catch {
         log.warn('Failed to surface unseen sprinkle', { name: sprinkle.name });
       }
     }
     this.persistKnownSprinkles(new Set(this.availableSprinkles.keys()));
+    if (consumed.size > 0) this.persistAutoOpenedOnce(consumed);
   }
 
   private loadKnownSprinkles(): Set<string> {
@@ -275,6 +298,34 @@ export class SprinkleManager {
     try {
       const merged = new Set<string>([...this.loadKnownSprinkles(), ...names]);
       localStorage.setItem(KNOWN_SPRINKLES_KEY, JSON.stringify([...merged]));
+    } catch {
+      /* localStorage full, ignore */
+    }
+  }
+
+  private loadAutoOpenedOnce(): Set<string> {
+    try {
+      const raw = localStorage.getItem(AUTOOPENED_ONCE_KEY);
+      if (!raw) return new Set();
+      const arr = JSON.parse(raw);
+      return Array.isArray(arr) ? new Set(arr.filter((x) => typeof x === 'string')) : new Set();
+    } catch {
+      return new Set();
+    }
+  }
+
+  /**
+   * Union the given names into the persistent one-shot ledger. Like
+   * `persistKnownSprinkles`, the merge is monotonic — once a
+   * `data-sprinkle-autoopen` sprinkle has been auto-opened, the
+   * ledger entry stays even if the sprinkle disappears from the VFS
+   * (uninstall, branch checkout, mount unavailable) so a later
+   * reappearance does NOT re-trigger the welcome flow.
+   */
+  private persistAutoOpenedOnce(names: Set<string>): void {
+    try {
+      const merged = new Set<string>([...this.loadAutoOpenedOnce(), ...names]);
+      localStorage.setItem(AUTOOPENED_ONCE_KEY, JSON.stringify([...merged]));
     } catch {
       /* localStorage full, ignore */
     }
@@ -329,6 +380,8 @@ export class SprinkleManager {
     const previouslyKnown = new Set(this.availableSprinkles.keys());
     await this.refresh();
     const attentionForAutoOpen = this.autoOpenBehavior === 'attention';
+    const autoOpenedOnce = this.loadAutoOpenedOnce();
+    const consumedAutoOpen = new Set<string>();
     let changed = false;
     for (const sprinkle of this.availableSprinkles.values()) {
       if (this.openSprinkles.has(sprinkle.name)) continue;
@@ -336,8 +389,18 @@ export class SprinkleManager {
       if (!isNew) continue;
       changed = true;
       if (sprinkle.autoOpen) {
+        // Already consumed in a prior session — never auto-open
+        // again, even if the known-sprinkles ledger has been reset
+        // or the sprinkle was uninstalled and reappeared.
+        if (autoOpenedOnce.has(sprinkle.name)) {
+          log.info('Skipped one-shot auto-open for previously-consumed sprinkle', {
+            name: sprinkle.name,
+          });
+          continue;
+        }
         try {
           await this.open(sprinkle.name, undefined, { attention: attentionForAutoOpen });
+          consumedAutoOpen.add(sprinkle.name);
           log.info('Auto-opened new sprinkle after install', {
             name: sprinkle.name,
             attention: attentionForAutoOpen,
@@ -356,6 +419,9 @@ export class SprinkleManager {
     }
     if (changed) {
       this.persistKnownSprinkles(new Set(this.availableSprinkles.keys()));
+    }
+    if (consumedAutoOpen.size > 0) {
+      this.persistAutoOpenedOnce(consumedAutoOpen);
     }
   }
 

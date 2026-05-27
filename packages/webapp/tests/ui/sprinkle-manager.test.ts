@@ -466,6 +466,131 @@ describe('SprinkleManager', () => {
     });
   });
 
+  describe('one-shot auto-open consumption ledger (slicc-autoopened-once)', () => {
+    it('first-run restoreOpenSprinkles auto-opens and records the autoopen sprinkle', async () => {
+      await vfs.writeFile(
+        '/shared/sprinkles/intro/intro.shtml',
+        '<title>Intro</title><div data-sprinkle-autoopen>hi</div>'
+      );
+      await mgr.refresh();
+      await mgr.restoreOpenSprinkles();
+
+      expect(mgr.opened()).toContain('intro');
+      const ledger = JSON.parse(localStorage.getItem('slicc-autoopened-once') ?? '[]');
+      expect(ledger).toContain('intro');
+    });
+
+    it('second restoreOpenSprinkles does NOT auto-open a previously-consumed sprinkle after user closes it', async () => {
+      await vfs.writeFile(
+        '/shared/sprinkles/intro/intro.shtml',
+        '<title>Intro</title><div data-sprinkle-autoopen>hi</div>'
+      );
+      await mgr.refresh();
+      await mgr.restoreOpenSprinkles();
+      expect(mgr.opened()).toContain('intro');
+
+      // User closes the intro panel. close() persists the now-empty
+      // open set, so the next restore will hit the no-localStorage-entry
+      // branch again (well, an empty-array branch — verify both shapes).
+      mgr.close('intro');
+      localStorage.removeItem('slicc-open-sprinkles');
+
+      // Fresh manager simulating a reload: same VFS, same localStorage,
+      // ledger should keep the auto-open from firing again.
+      const addSprinkle2 = vi.fn();
+      const mgr2 = new SprinkleManager(
+        vfs,
+        lickHandler,
+        {
+          addSprinkle: addSprinkle2 as unknown as (
+            name: string,
+            title: string,
+            element: HTMLElement
+          ) => void,
+          removeSprinkle: vi.fn() as unknown as (name: string) => void,
+          minimizeSprinkle: vi.fn() as unknown as (name: string) => void,
+        },
+        vi.fn()
+      );
+      await mgr2.refresh();
+      await mgr2.restoreOpenSprinkles();
+
+      expect(mgr2.opened()).not.toContain('intro');
+      const names = addSprinkle2.mock.calls.map((c) => c[0]);
+      expect(names).not.toContain('intro');
+    });
+
+    it('surfaceUnseenSprinkles skips an autoopen sprinkle already in the ledger even when known-sprinkles is empty', async () => {
+      // Pre-seed the consumption ledger as if a prior session had
+      // already auto-opened it; leave known-sprinkles empty to force
+      // the unseen branch.
+      localStorage.setItem('slicc-autoopened-once', JSON.stringify(['hello']));
+      await vfs.writeFile(
+        '/shared/sprinkles/hello/hello.shtml',
+        '<title>Hello</title><div data-sprinkle-autoopen>hi</div>'
+      );
+      // Also put an empty open-sprinkles entry so restoreOpenSprinkles
+      // takes the localStorage-present branch and only surfaceUnseenSprinkles
+      // is exercised for hello.
+      localStorage.setItem('slicc-open-sprinkles', JSON.stringify([]));
+      await mgr.refresh();
+      await mgr.restoreOpenSprinkles();
+
+      expect(mgr.opened()).not.toContain('hello');
+    });
+
+    it('non-auto-open sprinkles are not added to the consumption ledger', async () => {
+      await vfs.writeFile(
+        '/shared/sprinkles/plain/plain.shtml',
+        '<title>Plain</title><div>hi</div>'
+      );
+      await mgr.refresh();
+      await mgr.restoreOpenSprinkles();
+
+      const ledger = JSON.parse(localStorage.getItem('slicc-autoopened-once') ?? '[]');
+      expect(ledger).not.toContain('plain');
+    });
+
+    it('runOpenNewAutoOpenSprinkles records a freshly-installed autoopen sprinkle and skips it on a second install burst', async () => {
+      // Seed an existing sprinkle so the known-sprinkles ledger is
+      // non-empty and the new one is genuinely "isNew".
+      await vfs.writeFile('/shared/sprinkles/seed/seed.shtml', '<title>Seed</title><div>hi</div>');
+      await mgr.refresh();
+      await mgr.restoreOpenSprinkles();
+      addSprinkle.mockClear();
+
+      // New autoopen sprinkle lands — should auto-open and consume.
+      await vfs.writeFile(
+        '/shared/sprinkles/onboard/onboard.shtml',
+        '<title>Onboard</title><div data-sprinkle-autoopen>hi</div>'
+      );
+      await mgr.openNewAutoOpenSprinkles();
+      expect(mgr.opened()).toContain('onboard');
+      const ledger = JSON.parse(localStorage.getItem('slicc-autoopened-once') ?? '[]');
+      expect(ledger).toContain('onboard');
+
+      // Simulate user closing it, then a fresh install burst (e.g.
+      // uninstall + reinstall via upskill) — the sprinkle is no
+      // longer in availableSprinkles, then reappears as "new".
+      mgr.close('onboard');
+      await vfs.rm('/shared/sprinkles/onboard/onboard.shtml');
+      // Force the cooldown to elapse so the next call doesn't no-op.
+      await new Promise((r) => setTimeout(r, 260));
+      await mgr.openNewAutoOpenSprinkles();
+      addSprinkle.mockClear();
+
+      await vfs.writeFile(
+        '/shared/sprinkles/onboard/onboard.shtml',
+        '<title>Onboard</title><div data-sprinkle-autoopen>hi</div>'
+      );
+      await new Promise((r) => setTimeout(r, 260));
+      await mgr.openNewAutoOpenSprinkles();
+
+      // Ledger keeps it from re-auto-opening.
+      expect(mgr.opened()).not.toContain('onboard');
+    });
+  });
+
   it('open forwards the declared icon spec to the addSprinkle callback', async () => {
     // Custom icon contract: a sprinkle declaring <link rel="icon">
     // must surface the raw spec in the addSprinkle options so the
