@@ -53,12 +53,15 @@ export async function listCones(
     // Stale reservations are from crashed operations that never completed or rolled back.
     if (entry.state === 'reserved') {
       const STALE_MS = 10 * 60 * 1000;
-      if (entry.reservedAt && Date.now() - new Date(entry.reservedAt).getTime() > STALE_MS) {
-        // Reclaim stale reservation
+      // Reclaim if stale OR if reservedAt is missing (legacy/malformed entry
+      // from before commit e9011ba6 — could otherwise wedge cap forever).
+      const isStale =
+        !entry.reservedAt || Date.now() - new Date(entry.reservedAt).getTime() > STALE_MS;
+      if (isStale) {
         await deps.registry.remove(entry.sandboxId);
         console.warn('[cloud-core] reclaimed stale reservation', {
           sandboxId: entry.sandboxId,
-          reservedAt: entry.reservedAt,
+          reservedAt: entry.reservedAt ?? '(missing)',
         });
         continue;
       }
