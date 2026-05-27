@@ -46,12 +46,14 @@ export interface WorkerEnv {
   ADMIN_USER_IDS?: string;
   CONE_CAP_RUNNING?: string;
   CONE_CAP_PAUSED?: string;
+  ALLOWED_CLOUD_DASHBOARD_ORIGINS?: string;
 }
 
 function serveSPA(request: Request, env: WorkerEnv): Promise<Response> {
   return env.ASSETS.fetch(request);
 }
-const OAUTH_RELAY_HTML = `<!DOCTYPE html>
+const OAUTH_RELAY_HTML = (allowedOrigins: string): string =>
+  `<!DOCTYPE html>
 <html><head><title>Redirecting to SLICC...</title></head>
 <body>
 <p id="msg">Redirecting to SLICC...</p>
@@ -82,6 +84,19 @@ try {
     var extensionId = state.extensionId || '';
     if (!/^[a-p]{32}$/.test(extensionId)) throw new Error('Invalid extensionId');
     target = 'https://' + extensionId + '.chromiumapp.org' + path + query;
+  } else if (source === 'remote') {
+    // Remote origin (staging / preview / deployed dashboards).
+    var origin = state.origin || '';
+    // Origin must be a strict https origin (no path, no userinfo, no invalid port).
+    if (!/^https:\\/\\/[a-z0-9.-]+(:[0-9]{1,5})?$/i.test(origin)) {
+      throw new Error('Invalid origin: ' + origin);
+    }
+    // Allowlist enforced server-side via the inlined ALLOWED_ORIGINS array.
+    var allowed = ${JSON.stringify('PLACEHOLDER')};
+    if (allowed.indexOf(origin) === -1) {
+      throw new Error('Origin not in ALLOWED_CLOUD_DASHBOARD_ORIGINS: ' + origin);
+    }
+    target = origin + path + query;
   } else {
     throw new Error('Unknown source: ' + source);
   }
@@ -90,7 +105,15 @@ try {
   document.getElementById('msg').textContent = 'OAuth redirect failed: ' + e.message + '. Close this window and try again.';
 }
 </script>
-</body></html>`;
+</body></html>`.replace(
+    JSON.stringify('PLACEHOLDER'),
+    JSON.stringify(
+      allowedOrigins
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean)
+    )
+  );
 
 export async function handleWorkerRequest(
   request: Request,
@@ -182,7 +205,8 @@ export async function handleWorkerRequest(
   // OAuth callback relay — serves a static HTML page that reads the OAuth state
   // parameter and redirects to the correct localhost port. Provider-agnostic.
   if (url.pathname === '/auth/callback') {
-    return new Response(OAUTH_RELAY_HTML, {
+    const html = OAUTH_RELAY_HTML(env.ALLOWED_CLOUD_DASHBOARD_ORIGINS ?? '');
+    return new Response(html, {
       status: 200,
       headers: { 'Content-Type': 'text/html; charset=utf-8' },
     });

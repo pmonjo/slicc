@@ -1773,6 +1773,38 @@ describe('generic OAuth token broker', () => {
   });
 });
 
+describe('OAuth relay (/auth/callback)', () => {
+  it('returns HTML with allowlist injected from env var', async () => {
+    const { env } = createTestHarness();
+    const testEnv = {
+      ...env,
+      ALLOWED_CLOUD_DASHBOARD_ORIGINS: 'https://example.com,https://staging.example.com',
+    };
+    const req = new Request('https://www.sliccy.ai/auth/callback');
+    const res = await handleWorkerRequest(req, testEnv);
+
+    expect(res.status).toBe(200);
+    expect(res.headers.get('content-type')).toBe('text/html; charset=utf-8');
+
+    const html = await res.text();
+    // Verify the allowlist is inlined in the script
+    expect(html).toContain('["https://example.com","https://staging.example.com"]');
+    // Verify remote source branch exists
+    expect(html).toContain("source === 'remote'");
+  });
+
+  it('accepts empty ALLOWED_CLOUD_DASHBOARD_ORIGINS', async () => {
+    const { env } = createTestHarness();
+    const req = new Request('https://www.sliccy.ai/auth/callback');
+    const res = await handleWorkerRequest(req, env);
+
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    // Empty allowlist should be []
+    expect(html).toMatch(/var allowed = \[\];/);
+  });
+});
+
 describe('API routes', () => {
   it('returns runtime config with worker base URL and OAuth client IDs', async () => {
     const env = { ...createTestHarness().env, GITHUB_CLIENT_ID: 'test-gh-id' };

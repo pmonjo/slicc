@@ -29,6 +29,8 @@
     // Cloud cone concurrency caps
     "CONE_CAP_RUNNING": "1",
     "CONE_CAP_PAUSED": "5",
+    // OAuth relay allowlist for remote origins (staging/preview deploys)
+    "ALLOWED_CLOUD_DASHBOARD_ORIGINS": "https://www.sliccy.ai",
   },
   // Secrets must be set via: npx wrangler secret put <SECRET_NAME>
   // - CLOUDFLARE_TURN_API_TOKEN
@@ -79,6 +81,8 @@
         // Cloud cone concurrency caps
         "CONE_CAP_RUNNING": "1",
         "CONE_CAP_PAUSED": "5",
+        // OAuth relay allowlist for remote origins (staging/preview deploys)
+        "ALLOWED_CLOUD_DASHBOARD_ORIGINS": "https://slicc-tray-hub-staging.kpauls177.workers.dev,https://www.sliccy.ai",
       },
       "durable_objects": {
         "bindings": [

@@ -52,25 +52,38 @@ function setSignedOut() {
 
 async function startImsPopup() {
   const config = await loadConfig();
-  const isOnRelayOrigin = new URL(config.imsRelayUrl).host === window.location.host;
+  const relayHost = new URL(config.imsRelayUrl).host;
+  const isOnRelayOrigin = relayHost === window.location.host;
+  const isLocalhost = /^(localhost|127\.0\.0\.1)$/.test(window.location.hostname);
   const nonce = crypto.randomUUID();
 
   let redirectUri;
   let state;
   if (isOnRelayOrigin) {
-    // Production: dashboard is on the same origin as the relay. Direct redirect.
+    // Dashboard is on the relay host (production). Direct same-origin redirect.
     redirectUri = window.location.origin + config.imsReceivePath;
     state = nonce;
-  } else {
-    // Dev (localhost or other origin): bounce via sliccy.ai/auth/callback.
-    // The relay reads state, decodes { source, port, path, nonce }, and
-    // redirects to http://localhost:<port>/auth/cloud-callback?nonce=<nonce>#<original-hash>.
+  } else if (isLocalhost) {
+    // Local dev: bounce through the relay using source:'local'.
     redirectUri = config.imsRelayUrl;
     const port = Number(window.location.port) || (window.location.protocol === 'https:' ? 443 : 80);
     state = btoa(
       JSON.stringify({
         source: 'local',
         port,
+        path: config.imsReceivePath,
+        nonce,
+      })
+    );
+  } else {
+    // Other deployed origin (staging / preview / etc): bounce through the relay
+    // using source:'remote'. The relay validates the origin against an
+    // allowlist before redirecting.
+    redirectUri = config.imsRelayUrl;
+    state = btoa(
+      JSON.stringify({
+        source: 'remote',
+        origin: window.location.origin,
         path: config.imsReceivePath,
         nonce,
       })

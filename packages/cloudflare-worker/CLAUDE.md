@@ -33,7 +33,7 @@ The worker provides tray session coordination, capability-token routing, TURN cr
 - `GET|POST /join/:token` — follower join and bootstrap polling flow
 - `GET|POST /controller/:token` — leader attach flow and leader WebSocket upgrade
 - `POST /webhook/:token/:webhookId` — forward webhook events into the live leader
-- `GET /auth/callback` — OAuth callback relay page (decodes `state` param with port/path/nonce, redirects to localhost)
+- `GET /auth/callback` — OAuth callback relay page (decodes `state` param with source/port/path/nonce, redirects to localhost for `source:'local'`, extension for `source:'extension'`, or allowlisted remote origin for `source:'remote'`)
 
 ### Signaling model
 
