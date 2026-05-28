@@ -32,6 +32,7 @@ const GITHUB_GLOBAL_DB = GLOBAL_FS_DB_NAME;
 const GITHUB_TOKEN_PATH = '/workspace/.git/github-token';
 const GITHUB_API_ACCEPT = 'application/vnd.github.v3+json';
 const SKILL_CATALOG_URL = 'https://www.sliccy.com/skills/catalog.json';
+const SKILL_CATALOG_BASE_URL = 'https://www.sliccy.com/skills/';
 
 interface TesslSkillAttributes {
   name: string;
@@ -131,6 +132,10 @@ interface UserProfile {
   tasks: string[];
   apps: string[];
   name: string;
+  /** Optional company / organization, collected by the welcome sprinkle. When
+   *  set, recommendations also pull `/skills/<slug>.json` so company-specific
+   *  skills can be pushed alongside the global catalog. */
+  company?: string;
 }
 
 interface RemoteCatalogRow {
@@ -1468,7 +1473,57 @@ function normalizeProfile(profile: Partial<UserProfile>): UserProfile {
     tasks: Array.isArray(profile.tasks) ? profile.tasks : [],
     apps: Array.isArray(profile.apps) ? profile.apps : [],
     name: profile.name ?? '',
+    company: typeof profile.company === 'string' ? profile.company : undefined,
   };
+}
+
+/**
+ * Slugify a company name for use as a catalog filename component, e.g.
+ * `"Adobe"` → `"adobe"`, `"Acme Inc."` → `"acme-inc"`. Returns `null` when
+ * the input slugs to an empty string so callers can skip the fetch.
+ */
+function slugifyCompany(company: string | undefined | null): string | null {
+  if (!company) return null;
+  const slug = company
+    .toLowerCase()
+    .trim()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/(^-+|-+$)/g, '');
+  return slug || null;
+}
+
+/**
+ * Fetch the per-company skill catalog (`/skills/<slug>.json`). Returns `[]`
+ * on any failure — a missing or broken company catalog must not block the
+ * primary recommendation flow.
+ */
+async function fetchCompanyCatalog(
+  fetchFn: SecureFetch,
+  company: string | undefined | null
+): Promise<CatalogSkill[]> {
+  const slug = slugifyCompany(company);
+  if (!slug) return [];
+  try {
+    const response = await fetchFn(`${SKILL_CATALOG_BASE_URL}${slug}.json`, {
+      headers: { Accept: 'application/json' },
+    });
+    if (response.status !== 200) return [];
+    const data = parseFetchJson<{ data: RemoteCatalogRow[] }>(response.body);
+    return parseRemoteCatalog(data.data);
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Merge a base catalog with a company-specific catalog, deduping by skill
+ * name. Company-specific entries take precedence so a company can override
+ * affinity / priority of a globally-listed skill.
+ */
+function mergeCatalogs(base: CatalogSkill[], company: CatalogSkill[]): CatalogSkill[] {
+  if (company.length === 0) return base;
+  const companyNames = new Set(company.map((s) => s.name));
+  return [...base.filter((s) => !companyNames.has(s.name)), ...company];
 }
 
 /**
@@ -1556,11 +1611,14 @@ export async function installRecommendedSkills(
 
   if (!profile) return empty('no-profile');
 
-  // Fetch catalog and installed names in parallel
+  // Fetch catalog, optional company catalog, and installed names in parallel.
+  // The company catalog (when profile.company is set) is best-effort — its
+  // failure is silently ignored so an unrecognized company never blocks
+  // recommendations from the global catalog.
   let catalogSkills: CatalogSkill[];
   let installed: Set<string>;
   try {
-    const [catalogResult, installedResult] = await Promise.all([
+    const [catalogResult, companyResult, installedResult] = await Promise.all([
       (async () => {
         const response = await fetchFn(SKILL_CATALOG_URL, {
           headers: { Accept: 'application/json' },
@@ -1571,9 +1629,10 @@ export async function installRecommendedSkills(
         const data = parseFetchJson<{ data: RemoteCatalogRow[] }>(response.body);
         return parseRemoteCatalog(data.data);
       })(),
+      fetchCompanyCatalog(fetchFn, profile.company),
       getInstalledSkillNames(fs),
     ]);
-    catalogSkills = catalogResult;
+    catalogSkills = mergeCatalogs(catalogResult, companyResult);
     installed = installedResult;
   } catch (err) {
     return empty('catalog-fetch', [
@@ -2163,7 +2222,7 @@ async function handleRecommendations(
   let catalogSkills: CatalogSkill[];
   let installed: Set<string>;
   try {
-    const [catalogResult, installedResult] = await Promise.all([
+    const [catalogResult, companyResult, installedResult] = await Promise.all([
       (async () => {
         const response = await fetchFn(SKILL_CATALOG_URL, {
           headers: { Accept: 'application/json' },
@@ -2174,9 +2233,10 @@ async function handleRecommendations(
         const data = parseFetchJson<{ data: RemoteCatalogRow[] }>(response.body);
         return parseRemoteCatalog(data.data);
       })(),
+      fetchCompanyCatalog(fetchFn, profile.company),
       getInstalledSkillNames(fs),
     ]);
-    catalogSkills = catalogResult;
+    catalogSkills = mergeCatalogs(catalogResult, companyResult);
     installed = installedResult;
   } catch (err) {
     return {
