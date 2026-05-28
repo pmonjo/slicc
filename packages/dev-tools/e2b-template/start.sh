@@ -5,8 +5,14 @@ set -e
 # would default to ~/.slicc/secrets.env (the laptop CLI path) inside the
 # sandbox, where nothing exists. CHROME_USER_DATA_DIR matches the --hosted
 # default and is belt-and-suspenders.
+#
+# SLICC_CDP_LAUNCH_TIMEOUT_MS: chromium cold-starts on every new sandbox
+# (template snapshot has no running processes — see template.ts setStartCmd
+# waitForFile). 15s default is too tight for a cold microVM; 60s gives
+# generous headroom without making real failures wait too long.
 export SLICC_SECRETS_FILE=/slicc/secrets.env
 export CHROME_USER_DATA_DIR=/data/profile
+export SLICC_CDP_LAUNCH_TIMEOUT_MS=60000
 
 # Bootstrap secrets.env from sandbox env vars when present. Both the laptop CLI
 # (Plan B) and the Cloudflare worker (Plan D) inject ADOBE_IMS_TOKEN via
