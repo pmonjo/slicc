@@ -26,6 +26,14 @@ import {
   withTimeout,
 } from './require-guards.js';
 import { createSkillGlobal } from './skill-global.js';
+import {
+  attachArgvParseFlags,
+  createCli,
+  createColor,
+  fmt,
+  pool,
+  time,
+} from './js-realm-helpers.js';
 
 const NODE_BUILTINS_UNAVAILABLE = new Set([
   'http',
@@ -155,8 +163,16 @@ export async function runJsRealm(
     },
   };
 
+  // `process.argv` carries a non-enumerable `parseFlags()` method so the
+  // per-skill argv-loop reinvention (~25 LoC × every skill) collapses to a
+  // single call. See `js-realm-helpers.ts` for the spec.
+  const argvWithParseFlags = attachArgvParseFlags(init.argv);
+  // `stdout.isTTY` matches the shell's TTY policy: realm output is captured
+  // and replayed verbatim, so we treat stdout as a TTY unless `NO_COLOR` is
+  // explicitly set in the realm env. The `c` global also honors `NO_COLOR`.
+  const noColor = !!init.env?.NO_COLOR;
   const processShim = {
-    argv: init.argv,
+    argv: argvWithParseFlags,
     env: init.env,
     cwd: () => init.cwd,
     exit: (codeValue?: number) => {
@@ -164,9 +180,21 @@ export async function runJsRealm(
       throw new NodeExitError(normalized);
     },
     stdin: stdinShim,
-    stdout: { write: writeStdout },
-    stderr: { write: writeStderr },
+    stdout: { write: writeStdout, isTTY: !noColor },
+    stderr: { write: writeStderr, isTTY: !noColor },
   };
+
+  // `c` / `cli` are constructed together so cli.die/warn can call into c
+  // without skills having to wire their own colorizer.
+  const colorApi = createColor({ isTTY: !noColor, noColor });
+  const cliApi = createCli({
+    writeStdout,
+    writeStderr,
+    exit: (code: number): never => {
+      throw new NodeExitError(code);
+    },
+    color: colorApi,
+  });
 
   const rpc = new RealmRpcClient(port);
 
@@ -327,7 +355,12 @@ export async function runJsRealm(
       exports: Record<string, unknown>,
       exec: typeof execBridge,
       fetch: typeof realmFetch,
-      skill: typeof skillGlobal
+      skill: typeof skillGlobal,
+      cli: typeof cliApi,
+      c: typeof colorApi,
+      timeApi: typeof time,
+      fmtApi: typeof fmt,
+      poolApi: typeof pool
     ) => Promise<unknown>;
     const fn = new AsyncFn(
       'fs',
@@ -339,6 +372,11 @@ export async function runJsRealm(
       'exec',
       'fetch',
       'skill',
+      'cli',
+      'c',
+      'time',
+      'fmt',
+      'pool',
       `"use strict";\n${init.code}`
     );
     await fn(
@@ -350,7 +388,12 @@ export async function runJsRealm(
       moduleShim.exports,
       execBridge,
       realmFetch,
-      skillGlobal
+      skillGlobal,
+      cliApi,
+      colorApi,
+      time,
+      fmt,
+      pool
     );
   } catch (err: unknown) {
     if (err instanceof NodeExitError) {

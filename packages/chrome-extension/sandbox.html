@@ -345,8 +345,50 @@ async function runRealm(init, port, pending, nextIdFn, NODE_BUILTINS_UNAVAILABLE
       };
     },
   };
+  // Pure-JS runtime helpers — mirror of kernel/realm/js-realm-helpers.ts.
+  // Keep this block in lockstep with the canonical TS implementation
+  // (parity asserted by tests/kernel/realm/js-realm-helpers.test.ts).
+  function parseFlagsImpl(argv) {
+    const positional = [];
+    const flags = {};
+    const passthrough = [];
+    const setFlag = (key, value) => {
+      if (key in flags) {
+        const prev = flags[key];
+        if (Array.isArray(prev)) prev.push(String(value));
+        else flags[key] = [String(prev), String(value)];
+      } else flags[key] = value;
+    };
+    let i = 2;
+    while (i < argv.length) {
+      const arg = argv[i];
+      if (arg === '--') { passthrough.push(...argv.slice(i + 1)); break; }
+      if (arg.startsWith('--')) {
+        const body = arg.slice(2);
+        const eq = body.indexOf('=');
+        if (eq !== -1) { setFlag(body.slice(0, eq), body.slice(eq + 1)); i++; continue; }
+        const next = argv[i + 1];
+        if (next !== undefined && !next.startsWith('-')) { setFlag(body, next); i += 2; continue; }
+        setFlag(body, true); i++; continue;
+      }
+      if (arg.startsWith('-') && arg.length > 1) {
+        for (const ch of arg.slice(1)) setFlag(ch, true);
+        i++; continue;
+      }
+      positional.push(arg); i++;
+    }
+    const subcommand = positional.length > 0 && /^[a-z][\w-]*$/i.test(positional[0]) ? positional[0] : null;
+    return { positional, flags, subcommand, passthrough };
+  }
+  function attachArgvParseFlagsImpl(argv) {
+    const copy = [...argv];
+    Object.defineProperty(copy, 'parseFlags', { value: () => parseFlagsImpl(copy), enumerable: false, writable: false, configurable: false });
+    return copy;
+  }
+  const argvWithParseFlags = attachArgvParseFlagsImpl(init.argv);
+  const noColor = !!(init.env && init.env.NO_COLOR);
   const processShim = {
-    argv: init.argv,
+    argv: argvWithParseFlags,
     env: init.env,
     cwd: () => init.cwd,
     exit: (code) => {
@@ -355,9 +397,146 @@ async function runRealm(init, port, pending, nextIdFn, NODE_BUILTINS_UNAVAILABLE
       throw e;
     },
     stdin: stdinShim,
-    stdout: { write: writeStdout },
-    stderr: { write: writeStderr },
+    stdout: { write: writeStdout, isTTY: !noColor },
+    stderr: { write: writeStderr, isTTY: !noColor },
   };
+
+  // `c` (color) + `cli` globals — mirror of js-realm-helpers.ts.
+  const ANSI_CODES = { reset: '\u001b[0m', green: '\u001b[32m', red: '\u001b[31m', yellow: '\u001b[33m', gray: '\u001b[90m', bold: '\u001b[1m', cyan: '\u001b[36m', dim: '\u001b[2m' };
+  const colorEnabled = !noColor;
+  const wrapAnsi = (code) => (s) => colorEnabled ? code + s + ANSI_CODES.reset : String(s);
+  const colorApi = {
+    enabled: colorEnabled,
+    green: wrapAnsi(ANSI_CODES.green),
+    red: wrapAnsi(ANSI_CODES.red),
+    yellow: wrapAnsi(ANSI_CODES.yellow),
+    gray: wrapAnsi(ANSI_CODES.gray),
+    bold: wrapAnsi(ANSI_CODES.bold),
+    cyan: wrapAnsi(ANSI_CODES.cyan),
+    dim: wrapAnsi(ANSI_CODES.dim),
+  };
+  const toCliLine = (v) => {
+    if (typeof v === 'string') return v;
+    if (v instanceof Error) return v.message;
+    if (v === null || v === undefined) return String(v);
+    try { return JSON.stringify(v); } catch { return String(v); }
+  };
+  const cliExit = (code) => {
+    const e = new Error('Process exited with code ' + (code || 0));
+    e[NODE_EXIT] = Number.isFinite(code) ? Number(code) : 0;
+    throw e;
+  };
+  const cliApi = {
+    die(msg, exitCode) {
+      writeStderr(colorApi.red('Error:') + ' ' + toCliLine(msg) + '\n');
+      cliExit(exitCode === undefined ? 1 : exitCode);
+    },
+    out(value) {
+      if (typeof value === 'string') {
+        writeStdout(value.endsWith('\n') ? value : value + '\n');
+        return;
+      }
+      try { writeStdout(JSON.stringify(value, null, 2) + '\n'); }
+      catch { writeStdout(String(value) + '\n'); }
+    },
+    warn(msg) { writeStderr(colorApi.yellow('Warning:') + ' ' + toCliLine(msg) + '\n'); },
+    help(text) { writeStdout(text.endsWith('\n') ? text : text + '\n'); cliExit(0); },
+  };
+
+  // `time` — duration/date helpers. Unit set: ms|s|m|h|d|w|M|y. `m` is
+  // minutes; months use `M`. Mirror of js-realm-helpers.ts.
+  const DURATION_UNITS_MS = { ms: 1, s: 1000, m: 60000, h: 3600000, d: 86400000, w: 604800000, M: 2629800000, y: 31557600000 };
+  function parseDurationImpl(spec) {
+    if (typeof spec === 'number' && Number.isFinite(spec)) return Math.trunc(spec);
+    if (typeof spec !== 'string') throw new TypeError('time.parseDuration: spec must be string or number');
+    const m = /^([0-9]+(?:\.[0-9]+)?)\s*(ms|s|m|h|d|w|M|y)?$/.exec(spec.trim());
+    if (!m) throw new RangeError('time.parseDuration: unrecognized spec "' + spec + '"');
+    const unit = m[2] || 'ms';
+    return Math.trunc(Number(m[1]) * DURATION_UNITS_MS[unit]);
+  }
+  function pad2Impl(n) { return n < 10 ? '0' + n : String(n); }
+  const time = {
+    parseDuration: parseDurationImpl,
+    ago(spec, from) { from = from || new Date(); return new Date(from.getTime() - parseDurationImpl(spec)); },
+    range(spec, from) { from = from || new Date(); const end = new Date(from.getTime()); return { start: new Date(end.getTime() - parseDurationImpl(spec)), end }; },
+    future(spec, from) { from = from || new Date(); const start = new Date(from.getTime()); return { start, end: new Date(start.getTime() + parseDurationImpl(spec)) }; },
+    gmailDate(spec, from) { from = from || new Date(); const d = new Date(from.getTime() - parseDurationImpl(spec)); return d.getFullYear() + '/' + pad2Impl(d.getMonth() + 1) + '/' + pad2Impl(d.getDate()); },
+  };
+
+  // `fmt` — ANSI-aware formatting. Mirror of js-realm-helpers.ts.
+  const ANSI_STRIP_RE = /\u001b\[[0-9;]*m/g;
+  const stripAnsiImpl = (s) => s.replace(ANSI_STRIP_RE, '');
+  const visibleLenImpl = (s) => stripAnsiImpl(s).length;
+  function truncImpl(s, n) {
+    const text = String(s == null ? '' : s);
+    if (n <= 0) return '';
+    if (visibleLenImpl(text) <= n) return text;
+    if (n <= 1) return text.slice(0, n);
+    return stripAnsiImpl(text).slice(0, n - 1) + '…';
+  }
+  function colImpl(s, width) {
+    const text = String(s == null ? '' : s);
+    const vis = visibleLenImpl(text);
+    if (vis === width) return text;
+    if (vis > width) return truncImpl(text, width);
+    return text + ' '.repeat(width - vis);
+  }
+  function tableImpl(rows, widths) {
+    if (!rows.length) return '';
+    const colCount = Math.max(...rows.map((r) => r.length));
+    const computed = [];
+    for (let i = 0; i < colCount; i++) {
+      if (widths && widths[i] !== undefined) computed[i] = widths[i];
+      else {
+        let max = 0;
+        for (const r of rows) {
+          const cell = i < r.length ? String(r[i] == null ? '' : r[i]) : '';
+          if (visibleLenImpl(cell) > max) max = visibleLenImpl(cell);
+        }
+        computed[i] = max;
+      }
+    }
+    return rows.map((r) => computed.map((w, i) => colImpl(i < r.length ? String(r[i] == null ? '' : r[i]) : '', w)).join('  ').replace(/\s+$/, '')).join('\n');
+  }
+  function dateImpl(value, style) {
+    style = style || 'short';
+    const d = value instanceof Date ? value : new Date(value);
+    if (Number.isNaN(d.getTime())) return String(value);
+    if (style === 'iso') return d.toISOString();
+    if (style === 'human') {
+      const diff = Date.now() - d.getTime();
+      const abs = Math.abs(diff);
+      if (abs < 60000) return diff >= 0 ? 'just now' : 'in a moment';
+      const tense = (n, u) => diff >= 0 ? n + ' ' + u + (n === 1 ? '' : 's') + ' ago' : 'in ' + n + ' ' + u + (n === 1 ? '' : 's');
+      if (abs < 3600000) return tense(Math.round(abs / 60000), 'minute');
+      if (abs < 86400000) return tense(Math.round(abs / 3600000), 'hour');
+      if (abs < 2629800000) return tense(Math.round(abs / 86400000), 'day');
+      if (abs < 31557600000) return tense(Math.round(abs / 2629800000), 'month');
+      return tense(Math.round(abs / 31557600000), 'year');
+    }
+    return d.getFullYear() + '-' + pad2Impl(d.getMonth() + 1) + '-' + pad2Impl(d.getDate());
+  }
+  const fmt = { trunc: truncImpl, col: colImpl, table: tableImpl, date: dateImpl };
+
+  // `pool` — bounded concurrency runner. Mirror of js-realm-helpers.ts.
+  async function pool(concurrency, items, fn) {
+    const n = Math.max(1, Math.trunc(concurrency) || 1);
+    const results = new Array(items.length);
+    let next = 0;
+    const worker = async () => {
+      while (true) {
+        const i = next++;
+        if (i >= items.length) return;
+        results[i] = await fn(items[i], i);
+      }
+    };
+    const workers = [];
+    for (let w = 0; w < Math.min(n, items.length); w++) workers.push(worker());
+    await Promise.all(workers);
+    return results;
+  }
+
+
 
   function rpcCall(channel, op, args) {
     const id = nextIdFn();
@@ -551,9 +730,10 @@ async function runRealm(init, port, pending, nextIdFn, NODE_BUILTINS_UNAVAILABLE
     const AsyncFunction = Object.getPrototypeOf(async function(){}).constructor;
     const fn = new AsyncFunction(
       'fs', 'process', 'console', 'require', 'module', 'exports', 'exec', 'fetch', 'skill',
+      'cli', 'c', 'time', 'fmt', 'pool',
       '"use strict";\n' + init.code
     );
-    await fn(fsBridge, processShim, consoleShim, requireShim, moduleShim, moduleShim.exports, execBridge, realmFetch, skillGlobal);
+    await fn(fsBridge, processShim, consoleShim, requireShim, moduleShim, moduleShim.exports, execBridge, realmFetch, skillGlobal, cliApi, colorApi, time, fmt, pool);
   } catch (err) {
     if (err && typeof err === 'object' && NODE_EXIT in err) {
       exitCode = err[NODE_EXIT];
