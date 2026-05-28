@@ -133,6 +133,18 @@ const LEGACY_KEYS = [
   'bedrock_region',
 ] as const;
 
+// Provider ids that used to expose LLM models but no longer do — `selected-model`
+// entries pointing at any of these are stale after the upgrade and must be
+// cleared, otherwise `resolveCurrentModel()` falls through to its Anthropic
+// default while `getApiKey()` still returns the unrelated OAuth token (e.g.
+// GitHub PAT) and the next cone turn fails with an opaque auth error.
+//
+// We migrate eagerly on module load — `ensureModelSelected()` in layout.ts
+// also catches the broader "stored selection no longer resolves" case, but
+// it only runs on the page boot path; the worker context can `import` this
+// module first and call `resolveCurrentModel()` before layout has booted.
+const LEGACY_AUTH_ONLY_PROVIDERS = new Set(['github']);
+
 // Account entry in the slicc_accounts array
 export interface Account {
   providerId: string;
@@ -160,6 +172,33 @@ function cleanLegacyKeys(): void {
     } catch {
       /* noop */
     }
+  }
+  migrateLegacyAuthOnlySelection();
+}
+
+/**
+ * Clear `selected-model` when it points at a provider that used to expose
+ * LLM models but no longer does (currently: `github`, after the 3.13.0
+ * Copilot split). Idempotent; never throws.
+ *
+ * Exported only for tests — the production path runs this through
+ * `cleanLegacyKeys()` so the migration fires on the first call to
+ * `getAccounts()` in both the panel and worker contexts.
+ */
+export function migrateLegacyAuthOnlySelection(): void {
+  try {
+    const raw = localStorage.getItem(MODEL_KEY);
+    if (!raw) return;
+    const sep = raw.indexOf(':');
+    if (sep <= 0) return;
+    const provider = raw.slice(0, sep);
+    if (LEGACY_AUTH_ONLY_PROVIDERS.has(provider)) {
+      localStorage.removeItem(MODEL_KEY);
+    }
+  } catch {
+    /* localStorage may be unavailable in some contexts — leave the
+       selection alone; layout.ts:ensureModelSelected() will catch
+       the mismatch on the next boot. */
   }
 }
 
