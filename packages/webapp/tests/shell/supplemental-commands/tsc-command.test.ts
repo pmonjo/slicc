@@ -68,6 +68,12 @@ describe('parseTscArgs', () => {
     expect(() => parseTscArgs(['--bogus'])).toThrow(/unknown option/);
     expect(() => parseTscArgs(['--outDir'])).toThrow(/--outDir requires a value/);
   });
+
+  it('rejects a flag-shaped next token as the --outDir value', () => {
+    expect(() => parseTscArgs(['--outDir', '--noEmit', 'foo.ts'])).toThrow(
+      /--outDir requires a value/
+    );
+  });
 });
 
 describe('deriveOutputPath', () => {

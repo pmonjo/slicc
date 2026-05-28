@@ -103,6 +103,16 @@ describe('parseEsbuildArgs', () => {
   it('throws when --outfile is missing its value', () => {
     expect(() => parseEsbuildArgs(['--outfile'])).toThrow(/requires a value/);
   });
+
+  it('rejects flag-shaped next tokens as option values', () => {
+    expect(() => parseEsbuildArgs(['--outfile', '--minify'])).toThrow(/requires a value/);
+  });
+
+  it('accepts --sourcemap <value> when next token is a valid enum', () => {
+    const parsed = parseEsbuildArgs(['--sourcemap', 'inline', 'a.js']);
+    expect(parsed.sourcemap).toBe('inline');
+    expect(parsed.entries).toEqual(['a.js']);
+  });
 });
 
 describe('inferLoader', () => {
@@ -313,6 +323,13 @@ describe('createEsbuildCommand routing', () => {
     const result = await cmd.execute(['--frobnicate'], createMockCtx());
     expect(result.exitCode).toBe(2);
     expect(result.stderr).toMatch(/unknown option/);
+  });
+
+  it('errors on multiple entry points without --bundle (exit 2, no WASM load)', async () => {
+    const cmd = createEsbuildCommand();
+    const result = await cmd.execute(['a.js', 'b.js'], createMockCtx());
+    expect(result.exitCode).toBe(2);
+    expect(result.stderr).toMatch(/--bundle/);
   });
 });
 

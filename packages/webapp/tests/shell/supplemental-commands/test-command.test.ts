@@ -195,6 +195,26 @@ test('spec mode', ({ ok }) => ok(true));
     expect(result.stdout).toContain('# pass 1');
   }, 20_000);
 
+  it('resolves local imports (./add.js) from the entry test file', async () => {
+    _resetTstHarnessForTests();
+    const cmd = createTestCommand();
+    const ctx = createMockCtx();
+    await ctx.fs.writeFile('/workspace/add.js', `module.exports.add = (a, b) => a + b;\n`);
+    await ctx.fs.writeFile(
+      '/workspace/local.test.js',
+      `import test from 'tst';
+const { add } = require('./add.js');
+test('uses local add', ({ is }) => {
+  is(add(2, 3), 5);
+});
+`
+    );
+    const result = await cmd.execute([], ctx);
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain('ok 1 - uses local add');
+    expect(result.stdout).toContain('# pass 1');
+  }, 20_000);
+
   it('returns exit 1 when no test files match', async () => {
     const cmd = createTestCommand();
     const ctx = createMockCtx();

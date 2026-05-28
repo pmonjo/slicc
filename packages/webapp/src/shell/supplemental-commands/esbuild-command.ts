@@ -111,10 +111,6 @@ export function parseEsbuildArgs(args: string[]): ParsedEsbuildArgs {
       out.minify = true;
       continue;
     }
-    if (arg === '--sourcemap') {
-      out.sourcemap = true;
-      continue;
-    }
     const eq = arg.indexOf('=');
     const isLongOpt = arg.startsWith('--');
     const key = isLongOpt && eq > 0 ? arg.slice(0, eq) : arg;
@@ -122,7 +118,9 @@ export function parseEsbuildArgs(args: string[]): ParsedEsbuildArgs {
     const consumeValue = (): string => {
       if (inlineValue !== null) return inlineValue;
       const next = args[i + 1];
-      if (typeof next !== 'string') throw new Error(`esbuild: ${key} requires a value`);
+      if (typeof next !== 'string' || next.startsWith('-')) {
+        throw new Error(`esbuild: ${key} requires a value`);
+      }
       i += 1;
       return next;
     };
@@ -139,13 +137,29 @@ export function parseEsbuildArgs(args: string[]): ParsedEsbuildArgs {
       out.format = v as 'iife' | 'cjs' | 'esm';
       continue;
     }
-    if (key === '--sourcemap' && inlineValue !== null) {
-      if (!VALID_SOURCEMAPS.has(inlineValue)) {
-        throw new Error(
-          `esbuild: --sourcemap value must be one of linked|inline|external|both (got "${inlineValue}")`
-        );
+    if (key === '--sourcemap') {
+      // Three accepted forms:
+      //   --sourcemap                    → boolean true
+      //   --sourcemap=<value>            → enum (inline value)
+      //   --sourcemap <value>            → enum (separate token,
+      //                                    only when the next token
+      //                                    matches the enum)
+      if (inlineValue !== null) {
+        if (!VALID_SOURCEMAPS.has(inlineValue)) {
+          throw new Error(
+            `esbuild: --sourcemap value must be one of linked|inline|external|both (got "${inlineValue}")`
+          );
+        }
+        out.sourcemap = inlineValue as BuildOptions['sourcemap'];
+        continue;
       }
-      out.sourcemap = inlineValue as BuildOptions['sourcemap'];
+      const next = args[i + 1];
+      if (typeof next === 'string' && VALID_SOURCEMAPS.has(next)) {
+        out.sourcemap = next as BuildOptions['sourcemap'];
+        i += 1;
+        continue;
+      }
+      out.sourcemap = true;
       continue;
     }
     if (key === '--target') {
@@ -364,6 +378,21 @@ export function createEsbuildCommand(): Command {
       return { stdout: HELP_TEXT, stderr: '', exitCode: 0 };
     }
 
+    // Cheap routing validation before the heavy WASM load.
+    // Multiple positional entries without `--bundle` is an error —
+    // upstream esbuild's CLI runs a per-file transform for each
+    // entry in that case, but the single-output transform branch
+    // here can only handle one source at a time and silently
+    // falling through to bundle mode was misleading.
+    if (!parsed.transform && !parsed.bundle && parsed.entries.length > 1) {
+      return {
+        stdout: '',
+        stderr:
+          'esbuild: multiple entry points require --bundle (transform mode accepts at most one entry)\n',
+        exitCode: 2,
+      };
+    }
+
     let esbuildMod: typeof import('esbuild-wasm');
     try {
       esbuildMod = await getEsbuild();
@@ -425,6 +454,14 @@ async function runTransform(
     if (parsed.outfile) {
       const outPath = ctx.fs.resolvePath(ctx.cwd, parsed.outfile);
       await ctx.fs.writeFile(outPath, result.code);
+      // For `external` / `linked` / `both` sourcemap modes,
+      // `transform()` returns the map separately as `result.map`.
+      // Write it next to outfile so the linked/external pragma in
+      // the emitted code resolves. `inline` maps are embedded in
+      // `result.code` and need no sidecar.
+      if (result.map && parsed.sourcemap && parsed.sourcemap !== 'inline') {
+        await ctx.fs.writeFile(`${outPath}.map`, result.map);
+      }
       return { stdout: '', stderr: warningsText, exitCode: 0 };
     }
     return { stdout: result.code, stderr: warningsText, exitCode: 0 };

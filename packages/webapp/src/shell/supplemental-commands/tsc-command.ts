@@ -74,7 +74,7 @@ export function parseTscArgs(args: string[]): ParsedTscArgs {
     }
     if (arg === '--outDir') {
       const value = args[i + 1];
-      if (typeof value !== 'string') {
+      if (typeof value !== 'string' || value.startsWith('-')) {
         throw new Error('tsc: --outDir requires a value');
       }
       outDir = value;
