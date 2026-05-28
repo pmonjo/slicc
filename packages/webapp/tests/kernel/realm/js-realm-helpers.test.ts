@@ -255,7 +255,7 @@ describe('sandbox.html mirror parity', () => {
       'utf-8'
     );
     // Surfaces the realm wires into AsyncFunction's named parameters.
-    for (const id of ['cli', 'c', 'time', 'fmt', 'pool', 'skill']) {
+    for (const id of ['cli', 'c', 'time', 'fmt', 'pool', 'skill', 'http']) {
       expect(sandbox).toContain(`'${id}'`);
     }
     // Symbols whose presence we want pinned so a refactor removing

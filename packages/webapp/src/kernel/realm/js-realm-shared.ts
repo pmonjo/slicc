@@ -18,7 +18,12 @@
  */
 
 import { RealmRpcClient, type RealmPortLike } from './realm-rpc.js';
-import type { RealmDoneMsg, RealmInitMsg, SerializedFetchResponse } from './realm-types.js';
+import type {
+  RealmDoneMsg,
+  RealmInitMsg,
+  SerializedFetchResponse,
+  TabHandle,
+} from './realm-types.js';
 import {
   LOAD_MODULE_TIMEOUT_MS,
   NODE_NATIVE_PACKAGES,
@@ -26,6 +31,7 @@ import {
   withTimeout,
 } from './require-guards.js';
 import { createSkillGlobal } from './skill-global.js';
+import { createHttpGlobal } from './http-global.js';
 import {
   attachArgvParseFlags,
   createCli,
@@ -238,6 +244,34 @@ export async function runJsRealm(
   // store; see `skill-global.ts` for the surface and rationale.
   const skillGlobal = createSkillGlobal({ argv: init.argv, fs: fsBridge, exec: execBridge });
 
+  // `browser` is the kernel-side CDP bridge — wraps the same
+  // BrowserAPI playwright-cli uses, so standalone and extension
+  // floats share one realm surface. Accepts a `TabHandle` (from
+  // `findTab` / `ensureTab`) or a bare `targetId` string for ops
+  // that don't need a fresh listPages round-trip. `eval` / `evalAsync`
+  // serialize functions to a string call expression so realm code
+  // can pass a closure as ergonomically as a string.
+  const browserBridge = {
+    findTab: (query: { domain?: string; urlMatch?: string | RegExp }): Promise<TabHandle | null> =>
+      rpc.call('browser', 'findTab', [normalizeUrlMatchQuery(query)]),
+    ensureTab: (url: string, options: { matchUrl?: string | RegExp } = {}): Promise<TabHandle> =>
+      rpc.call('browser', 'ensureTab', [url, normalizeMatchUrl(options)]),
+    eval: (tab: TabHandle | string, fnOrCode: ((..._args: unknown[]) => unknown) | string) =>
+      rpc.call('browser', 'eval', [resolveTargetId(tab), serializeEvalSource(fnOrCode, false)]),
+    evalAsync: (tab: TabHandle | string, fnOrCode: ((..._args: unknown[]) => unknown) | string) =>
+      rpc.call('browser', 'evalAsync', [resolveTargetId(tab), serializeEvalSource(fnOrCode, true)]),
+    cookie: (tab: TabHandle | string, name: string): Promise<string | null> =>
+      rpc.call('browser', 'cookie', [resolveTargetId(tab), name]),
+    localStorage: (tab: TabHandle | string, key: string): Promise<string | null> =>
+      rpc.call('browser', 'localStorage', [resolveTargetId(tab), key]),
+  };
+
+  // `http` is the standard API-client builder; see `http-global.ts`. It
+  // wraps `realmFetch` so it inherits the kernel-side fetch-proxy + the
+  // secret masking that goes with it. The realm needs only one instance:
+  // `http.client(config)` is what builds the per-API surface.
+  const httpGlobal = createHttpGlobal({ fetch: realmFetch });
+
   async function realmFetch(input: string | URL | Request, opts?: RequestInit): Promise<Response> {
     const url =
       input instanceof Request
@@ -356,6 +390,8 @@ export async function runJsRealm(
       exec: typeof execBridge,
       fetch: typeof realmFetch,
       skill: typeof skillGlobal,
+      http: typeof httpGlobal,
+      browser: typeof browserBridge,
       cli: typeof cliApi,
       c: typeof colorApi,
       timeApi: typeof time,
@@ -372,6 +408,8 @@ export async function runJsRealm(
       'exec',
       'fetch',
       'skill',
+      'http',
+      'browser',
       'cli',
       'c',
       'time',
@@ -389,6 +427,8 @@ export async function runJsRealm(
       execBridge,
       realmFetch,
       skillGlobal,
+      httpGlobal,
+      browserBridge,
       cliApi,
       colorApi,
       time,
@@ -447,4 +487,60 @@ function serializeRequestInit(
 
 async function defaultLoadModule(id: string): Promise<Record<string, unknown>> {
   return (await import(/* @vite-ignore */ 'https://esm.sh/' + id)) as Record<string, unknown>;
+}
+
+// ---------------------------------------------------------------------------
+// `browser` global helpers
+// ---------------------------------------------------------------------------
+
+/** Accept either a `TabHandle` (from `findTab`/`ensureTab`) or a bare targetId. */
+function resolveTargetId(tab: TabHandle | string): string {
+  if (typeof tab === 'string') return tab;
+  if (tab && typeof tab === 'object' && typeof tab.targetId === 'string') return tab.targetId;
+  throw new TypeError('browser: expected a tab handle or targetId string');
+}
+
+/**
+ * Serialize a function or string into a self-calling expression
+ * suitable for `Runtime.evaluate`. For functions we emit
+ * `(<fn.toString()>)()` so the page sees an IIFE; for strings we
+ * pass them through verbatim so user-authored snippets keep working.
+ * `awaitPromise` is purely a CDP-side flag — the source string is
+ * the same either way, but we keep the parameter explicit so a
+ * future tweak to wrap async function bodies has a hook.
+ */
+function serializeEvalSource(
+  source: ((..._args: unknown[]) => unknown) | string,
+  _awaitPromise: boolean
+): string {
+  if (typeof source === 'function') {
+    return `(${source.toString()})()`;
+  }
+  if (typeof source === 'string') return source;
+  throw new TypeError('browser.eval/evalAsync: source must be a function or string');
+}
+
+/**
+ * Coerce the realm-side `urlMatch` (RegExp or string) into the
+ * pattern source the host expects. Allowing both lets realm code
+ * write the natural literal-RegExp form without losing the
+ * structured-clone safety of a string crossing the port.
+ */
+function normalizeUrlMatchQuery(query: { domain?: string; urlMatch?: string | RegExp }): {
+  domain?: string;
+  urlMatch?: string;
+} {
+  const out: { domain?: string; urlMatch?: string } = {};
+  if (query.domain !== undefined) out.domain = query.domain;
+  if (query.urlMatch !== undefined) {
+    out.urlMatch = query.urlMatch instanceof RegExp ? query.urlMatch.source : query.urlMatch;
+  }
+  return out;
+}
+
+function normalizeMatchUrl(options: { matchUrl?: string | RegExp }): { matchUrl?: string } {
+  if (options.matchUrl === undefined) return {};
+  return {
+    matchUrl: options.matchUrl instanceof RegExp ? options.matchUrl.source : options.matchUrl,
+  };
 }

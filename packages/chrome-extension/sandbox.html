@@ -620,6 +620,140 @@ async function runRealm(init, port, pending, nextIdFn, NODE_BUILTINS_UNAVAILABLE
     }
     return Object.freeze({ dir, refs, assets, config, token });
   })();
+
+  // `http` global — mirrors kernel/realm/http-global.ts (the canonical
+  // TS implementation). Standardizes the build-URL → merge-headers →
+  // resolve-auth → fetch → unwrap-JSON → throw-on-!ok pipeline plus
+  // 429/503 Retry-After backoff. Keep in sync with http-global.ts.
+  const httpGlobal = (() => {
+    const DEFAULT_BACKOFF_BASE_MS = 500;
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+    function buildUrl(baseUrl, path, params) {
+      let url;
+      if (/^[a-z][a-z0-9+.-]*:\/\//i.test(path)) url = path;
+      else if (baseUrl) {
+        const base = baseUrl.endsWith('/') ? baseUrl.slice(0, -1) : baseUrl;
+        const rel = path.startsWith('/') ? path : '/' + path;
+        url = base + rel;
+      } else url = path;
+      if (!params) return url;
+      const qs = [];
+      for (const [k, v] of Object.entries(params)) {
+        if (v === undefined || v === null) continue;
+        if (Array.isArray(v)) {
+          for (const item of v) {
+            if (item === undefined || item === null) continue;
+            qs.push(encodeURIComponent(k) + '=' + encodeURIComponent(String(item)));
+          }
+        } else qs.push(encodeURIComponent(k) + '=' + encodeURIComponent(String(v)));
+      }
+      if (qs.length === 0) return url;
+      return url + (url.includes('?') ? '&' : '?') + qs.join('&');
+    }
+    function mergeHeaders(base, perCall) {
+      const out = {};
+      if (base) for (const [k, v] of Object.entries(base)) out[k] = v;
+      if (perCall) for (const [k, v] of Object.entries(perCall)) out[k] = v;
+      return out;
+    }
+    function isJsonContentType(ct) {
+      if (!ct) return false;
+      const lower = ct.toLowerCase();
+      return lower.startsWith('application/json') || /[+/]json(;|$|\s)/.test(lower);
+    }
+    function parseRetryAfter(value) {
+      if (!value) return null;
+      const trimmed = String(value).trim();
+      if (!trimmed) return null;
+      if (/^\d+(\.\d+)?$/.test(trimmed)) {
+        const seconds = Number(trimmed);
+        if (Number.isFinite(seconds) && seconds >= 0) return Math.round(seconds * 1000);
+      }
+      const date = Date.parse(trimmed);
+      if (Number.isFinite(date)) {
+        const delta = date - Date.now();
+        return delta > 0 ? delta : 0;
+      }
+      return null;
+    }
+    async function readBody(resp) {
+      const ct = resp.headers.get('content-type');
+      if (isJsonContentType(ct)) {
+        const text = await resp.text();
+        if (!text) return null;
+        try { return JSON.parse(text); } catch { return text; }
+      }
+      return resp.text();
+    }
+    function serializeBody(body, headers) {
+      if (body === undefined || body === null) return undefined;
+      if (typeof body === 'string') return body;
+      if (body instanceof ArrayBuffer || ArrayBuffer.isView(body) ||
+          (typeof Blob !== 'undefined' && body instanceof Blob) ||
+          (typeof FormData !== 'undefined' && body instanceof FormData)) {
+        return body;
+      }
+      if (typeof body === 'object') {
+        if (!Object.keys(headers).some((k) => k.toLowerCase() === 'content-type')) {
+          headers['Content-Type'] = 'application/json';
+        }
+        return JSON.stringify(body);
+      }
+      return String(body);
+    }
+    function makeClient(config) {
+      const retryOn = new Set((config.retry && config.retry.on) || []);
+      const maxAttempts = Math.max(1, Math.trunc((config.retry && config.retry.maxAttempts) || 1));
+      async function request(method, path, opts) {
+        opts = opts || {};
+        const url = buildUrl(config.baseUrl, path, opts.params);
+        const headers = mergeHeaders(config.headers, opts.headers);
+        if (config.token) {
+          const tok = await config.token();
+          if (tok) {
+            const hasAuth = Object.keys(headers).some((k) => k.toLowerCase() === 'authorization');
+            if (!hasAuth) headers['Authorization'] = 'Bearer ' + tok;
+          }
+        }
+        const body = serializeBody(opts.body, headers);
+        const init = { method, headers };
+        if (body !== undefined) init.body = body;
+        let lastResponse = null;
+        for (let attempt = 0; attempt < maxAttempts; attempt++) {
+          const resp = await realmFetch(url, init);
+          lastResponse = resp;
+          if (resp.ok) return readBody(resp);
+          const willRetry = attempt + 1 < maxAttempts && retryOn.has(resp.status);
+          if (!willRetry) {
+            const errBody = await readBody(resp).catch(() => null);
+            const e = new Error('HTTP ' + resp.status + ' ' + resp.statusText + ' ' + url);
+            e.name = 'HttpError';
+            e.status = resp.status; e.statusText = resp.statusText; e.url = url; e.body = errBody;
+            throw e;
+          }
+          const retryAfter = parseRetryAfter(resp.headers.get('retry-after'));
+          const exp = DEFAULT_BACKOFF_BASE_MS * Math.pow(2, attempt);
+          await sleep(retryAfter !== null ? retryAfter : exp);
+        }
+        if (lastResponse) {
+          const errBody = await readBody(lastResponse).catch(() => null);
+          const e = new Error('HTTP ' + lastResponse.status + ' ' + lastResponse.statusText + ' ' + url);
+          e.name = 'HttpError';
+          e.status = lastResponse.status; e.statusText = lastResponse.statusText; e.url = url; e.body = errBody;
+          throw e;
+        }
+        throw new Error('http: no attempts made for ' + method + ' ' + url);
+      }
+      return Object.freeze({
+        get: (p, o) => request('GET', p, o),
+        post: (p, o) => request('POST', p, o),
+        put: (p, o) => request('PUT', p, o),
+        delete: (p, o) => request('DELETE', p, o),
+      });
+    }
+    return Object.freeze({ client: makeClient });
+  })();
+
   async function realmFetch(input, init2) {
     const url = input instanceof Request
       ? input.url
@@ -729,11 +863,11 @@ async function runRealm(init, port, pending, nextIdFn, NODE_BUILTINS_UNAVAILABLE
   try {
     const AsyncFunction = Object.getPrototypeOf(async function(){}).constructor;
     const fn = new AsyncFunction(
-      'fs', 'process', 'console', 'require', 'module', 'exports', 'exec', 'fetch', 'skill',
+      'fs', 'process', 'console', 'require', 'module', 'exports', 'exec', 'fetch', 'skill', 'http',
       'cli', 'c', 'time', 'fmt', 'pool',
       '"use strict";\n' + init.code
     );
-    await fn(fsBridge, processShim, consoleShim, requireShim, moduleShim, moduleShim.exports, execBridge, realmFetch, skillGlobal, cliApi, colorApi, time, fmt, pool);
+    await fn(fsBridge, processShim, consoleShim, requireShim, moduleShim, moduleShim.exports, execBridge, realmFetch, skillGlobal, httpGlobal, cliApi, colorApi, time, fmt, pool);
   } catch (err) {
     if (err && typeof err === 'object' && NODE_EXIT in err) {
       exitCode = err[NODE_EXIT];
