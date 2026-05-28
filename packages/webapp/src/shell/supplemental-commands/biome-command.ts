@@ -393,7 +393,6 @@ async function processFile(
     summary.warningCount += diagText.warnings;
     if (effectiveWrite && fmt.content !== current) {
       await writer(fmt.content);
-      current = fmt.content;
       summary.changedCount += 1;
     } else if (effectiveWrite && fmt.content === current && current !== source) {
       // Format didn't change anything but lint --apply did; persist
