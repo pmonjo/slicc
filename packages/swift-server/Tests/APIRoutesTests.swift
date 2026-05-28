@@ -195,15 +195,14 @@ final class APIRoutesTests: XCTestCase {
 
     // The fetch proxy must accept WebDAV (RFC 4918) and CalDAV (RFC 4791)
     // verbs in addition to the standard HTTP methods so the agent can
-    // talk to CalDAV / WebDAV servers from the Sliccstart float. These two
-    // round-trip tests cover the new method set by exercising PROPFIND and
-    // REPORT end-to-end: the proxy must register the route, forward the
-    // verb / body / DAV-specific request header unchanged, and let the
-    // upstream's 207 Multi-Status response flow back to the client.
-    //
-    // The remaining seven verbs (PROPPATCH, MKCOL, MKCALENDAR, COPY, MOVE,
-    // LOCK, UNLOCK) share the exact same code path, so two tests are
-    // sufficient.
+    // talk to CalDAV / WebDAV servers from the Sliccstart float. The four
+    // round-trip tests below cover the new method set end-to-end against
+    // the representative verbs called out in the spec's Acceptance
+    // Criterion #3 (PROPFIND, REPORT, MKCALENDAR, LOCK): the proxy must
+    // register the route, forward the verb / body / DAV-specific request
+    // header unchanged, and let the upstream's response flow back to the
+    // client. The remaining five verbs (PROPPATCH, MKCOL, COPY, MOVE,
+    // UNLOCK) share the exact same code path.
 
     func testFetchProxyForwardsPropfindWithBodyAndDavHeaders() async throws {
         try await self.runDavRoundTripTest(
@@ -232,6 +231,40 @@ final class APIRoutesTests: XCTestCase {
         )
     }
 
+    func testFetchProxyForwardsMkcalendarWithoutBody() async throws {
+        // MKCALENDAR (RFC 4791 § 5.3.1) is the CalDAV verb for creating a
+        // calendar collection; the request body is optional and frequently
+        // omitted. This test exercises the no-body path and asserts the
+        // verb passes through to the upstream and the upstream's response
+        // status flows back unchanged.
+        try await self.runDavRoundTripTest(
+            method: "MKCALENDAR",
+            davHeaderName: nil,
+            davHeaderValue: nil,
+            requestBody: ""
+        )
+    }
+
+    func testFetchProxyForwardsLockWithBodyAndTimeoutHeader() async throws {
+        // LOCK (RFC 4918 § 9.10) carries both an XML body (lockinfo) and
+        // the WebDAV-specific `Timeout` request header. This test asserts
+        // that the verb, body, and `Timeout: Second-300` header all reach
+        // the upstream unchanged.
+        try await self.runDavRoundTripTest(
+            method: "LOCK",
+            davHeaderName: "Timeout",
+            davHeaderValue: "Second-300",
+            requestBody: """
+                <?xml version="1.0" encoding="utf-8"?>
+                <D:lockinfo xmlns:D="DAV:">
+                  <D:lockscope><D:exclusive/></D:lockscope>
+                  <D:locktype><D:write/></D:locktype>
+                  <D:owner><D:href>mailto:agent@example.com</D:href></D:owner>
+                </D:lockinfo>
+                """
+        )
+    }
+
     /// Round-trip helper: stands up a live Hummingbird server hosting an
     /// upstream stub route, registers the API routes (including
     /// `/api/fetch-proxy`) on a separate router used in `.router` (in-memory)
@@ -252,12 +285,15 @@ final class APIRoutesTests: XCTestCase {
     ///   proxy handler directly without depending on a second listener.
     private func runDavRoundTripTest(
         method: String,
-        davHeaderName: String,
-        davHeaderValue: String,
+        davHeaderName: String?,
+        davHeaderValue: String?,
         requestBody: String
     ) async throws {
         let httpMethod = try XCTUnwrap(HTTPRequest.Method(rawValue: method))
-        let davHeader = try XCTUnwrap(HTTPField.Name(davHeaderName))
+        let davHeader: HTTPField.Name? = try {
+            guard let davHeaderName else { return nil }
+            return try XCTUnwrap(HTTPField.Name(davHeaderName))
+        }()
         let captured = CapturedRequestBox()
 
         // Build the upstream stub on its own router/app.
@@ -266,7 +302,7 @@ final class APIRoutesTests: XCTestCase {
             let body = try await request.body.collect(upTo: 1 * 1024 * 1024)
             await captured.record(
                 method: request.method.rawValue,
-                davHeader: request.headers[davHeader],
+                davHeader: davHeader.flatMap { request.headers[$0] },
                 body: String(buffer: body)
             )
             return Response(
@@ -306,14 +342,20 @@ final class APIRoutesTests: XCTestCase {
 
         let snapshot = await captured.snapshot()
         XCTAssertEqual(snapshot.method, method, "\(method) verb must reach upstream unchanged")
-        XCTAssertEqual(snapshot.davHeader, davHeaderValue, "\(davHeaderName) header must reach upstream unchanged")
+        if let davHeaderName, let davHeaderValue {
+            XCTAssertEqual(
+                snapshot.davHeader,
+                davHeaderValue,
+                "\(davHeaderName) header must reach upstream unchanged"
+            )
+        }
         XCTAssertEqual(snapshot.body, requestBody, "request body must reach upstream byte-for-byte")
     }
 
     private func executeDavRoundTrip(
         httpMethod: HTTPRequest.Method,
-        davHeader: HTTPField.Name,
-        davHeaderValue: String,
+        davHeader: HTTPField.Name?,
+        davHeaderValue: String?,
         requestBody: String,
         upstreamPort: Int,
         httpClient: HTTPClient
@@ -327,15 +369,19 @@ final class APIRoutesTests: XCTestCase {
         )
         let proxyApp = Application(responder: proxyRouter.buildResponder())
 
+        var headers: HTTPFields = [
+            HTTPField.Name("X-Target-URL")!: "http://localhost:\(upstreamPort)/upstream",
+            .contentType: "application/xml; charset=utf-8",
+        ]
+        if let davHeader, let davHeaderValue {
+            headers[davHeader] = davHeaderValue
+        }
+
         try await proxyApp.test(.router) { proxyClient in
             try await proxyClient.execute(
                 uri: "/api/fetch-proxy",
                 method: httpMethod,
-                headers: [
-                    HTTPField.Name("X-Target-URL")!: "http://localhost:\(upstreamPort)/upstream",
-                    davHeader: davHeaderValue,
-                    .contentType: "application/xml; charset=utf-8",
-                ],
+                headers: headers,
                 body: ByteBuffer(string: requestBody)
             ) { response in
                 XCTAssertEqual(response.status.code, 207, "207 Multi-Status must flow back to the client")
