@@ -62,6 +62,7 @@ Deep reference: `docs/kernel/process-model.md`.
 - `wasm-shell.ts` hosts the just-bash runtime.
 - `script-catalog.ts` is the shared `.jsh`/`.bsh` discovery service; it caches behind `FsWatcher` invalidation and bypasses cache for mounted trees where external changes are invisible to the watcher.
 - `supplemental-commands/` contains built-in commands, including `supplemental-commands/agent-command.ts` which forwards `ctx.cwd` as `invokingCwd` and validates `<cwd>` writability via `ctx.fs.canWrite` to prevent nested-scoop sandbox escape.
+- `supplemental-commands/tsc-command.ts` is the `tsc` single-file TypeScript transpiler. It uses the lazy `getTypeScript()` singleton in `supplemental-commands/shared.ts` (the bundled `typescript` npm dependency, same shape as `getSqlJs`) so the heavy module only loads on first call and is shared with the upcoming `test` command. Supports `tsc [files...]`, `--noEmit`, `--outDir`, stdin → stdout, and walks up from `ctx.cwd` to merge `tsconfig.json`'s `compilerOptions` over the `ES2022`/`ESNext` defaults; cross-file program-level type checking is not wired up.
 - `jsh-discovery.ts` and `bsh-discovery.ts` provide the raw scans used by the shared catalog.
 - `vfs-adapter.ts` bridges shell calls into the virtual filesystem and forwards `canWrite` (duck-typed so both `VirtualFS` and `RestrictedFS` back it without branching).
 

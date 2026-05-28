@@ -13,6 +13,7 @@ import { createPython3LikeCommand } from './python-command.js';
 import { createFfmpegCommand } from './ffmpeg-command.js';
 import { createServeCommand } from './serve-command.js';
 import { createSqliteCommand } from './sqlite-command.js';
+import { createTscCommand } from './tsc-command.js';
 import { createUnameCommand } from './uname-command.js';
 import { createManCommand } from './man-command.js';
 import { createUnzipCommand } from './unzip-command.js';
@@ -89,6 +90,7 @@ export function createSupplementalCommands(options: SupplementalCommandsConfig =
     createUnzipCommand(),
     createSqliteCommand('sqlite3'),
     createSqliteCommand('sqllite'),
+    createTscCommand(),
     createNodeCommand(),
     createPython3LikeCommand('python3'),
     createPython3LikeCommand('python'),
