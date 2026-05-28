@@ -228,4 +228,16 @@ describeHeavy('createBiomeCommand (live WASM)', () => {
     expect(result.exitCode).toBe(1);
     expect(result.stderr).toMatch(/not formatted/);
   }, 60_000);
+
+  it('lint --apply persists safe fixes without requiring --write', async () => {
+    resetBiomeForTests();
+    const cmd = createBiomeCommand();
+    const ctx = createMockCtx();
+    // `let x = 1` triggers Biome's `useConst` recommended rule, which
+    // is a safe fix that rewrites `let` → `const`.
+    await ctx.fs.writeFile('/workspace/fixme.ts', 'let x = 1;\nexport { x };\n');
+    await cmd.execute(['lint', '--apply', 'fixme.ts'], ctx);
+    const after = await ctx.fs.readFile('/workspace/fixme.ts');
+    expect(after).toMatch(/const x = 1/);
+  }, 60_000);
 });

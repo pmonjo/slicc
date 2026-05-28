@@ -364,6 +364,11 @@ async function processFile(
     : parsed.apply
       ? 'safeFixes'
       : undefined;
+  // `--apply` / `--apply-unsafe` are documented as mutating flags
+  // and match upstream Biome's deprecated-but-still-supported semantics
+  // where the flag itself implies writing back to disk. Treat them
+  // as equivalent to `--write` for any persistence decision below.
+  const effectiveWrite = parsed.write || fixMode !== undefined;
 
   if (wantsLint) {
     const lint = biome.lintContent(projectKey, current, {
@@ -386,13 +391,17 @@ async function processFile(
     summary.diagnostics += diagText.text;
     summary.errorCount += diagText.errors;
     summary.warningCount += diagText.warnings;
-    if (parsed.write && fmt.content !== current) {
+    if (effectiveWrite && fmt.content !== current) {
       await writer(fmt.content);
       current = fmt.content;
       summary.changedCount += 1;
-    } else if (!parsed.write && parsed.subcommand === 'format') {
+    } else if (effectiveWrite && fmt.content === current && current !== source) {
+      // Format didn't change anything but lint --apply did; persist
+      // the lint fix that's already sitting in `current`.
+      await writer(current);
+    } else if (!effectiveWrite && parsed.subcommand === 'format') {
       summary.stdoutChunks.push(fmt.content);
-    } else if (!parsed.write && fmt.content !== current) {
+    } else if (!effectiveWrite && fmt.content !== current) {
       // `check` / `ci` without `--write`: a file that would be
       // reformatted must surface as a failure, matching the upstream
       // Biome CLI. Record it as an error for `check` (non-zero exit)
@@ -402,8 +411,9 @@ async function processFile(
       if (parsed.subcommand === 'ci') summary.warningCount += 1;
       else summary.errorCount += 1;
     }
-  } else if (parsed.subcommand === 'lint' && parsed.write && fixMode && current !== source) {
-    // `lint --apply --write` persists the fixed content.
+  } else if (parsed.subcommand === 'lint' && fixMode && current !== source) {
+    // `lint --apply` / `--apply-unsafe`: persist the fixed content
+    // (mutating flags imply write, per the help text).
     await writer(current);
   }
 
