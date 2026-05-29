@@ -30,7 +30,7 @@ page) and is driven by the cone underneath.
   leader never routes a flow (teleport, tab-open, cookie ops) to a Cherry
   target that cannot satisfy it. See [Synthetic CDP session
   model](#synthetic-cdp-session-model) and [Target capability
-  metadata](#target-capability-metadata--the-slicc-cherry-runtime).
+  metadata](#target-capability-metadata).
 - **The driver is remote.** The embedded follower does not run the cone. A
   remote leader (cloud cone) issues CDP over the WebRTC tray data channel; the
   follower translates those CDP calls into operations on the host page via the
@@ -174,15 +174,52 @@ header/CSP change in `packages/cloudflare-worker/src/index.ts`, **not** a new
 route, so the routes-mirror rule does not apply — but it must be deliberate and
 tested.
 
+**The header must be applied with cache discipline, because the SPA is served
+unwrapped.** `serveSPA(request, env)` is just `return env.ASSETS.fetch(request)`
+(`index.ts:52`) — it returns the asset response directly, so there is no
+existing seam to attach a header and the same underlying asset backs both `/`
+and `/?cherry=1`. Cherry must:
+
+- **Clone the response** (`new Response(res.body, res)`) before mutating headers
+  — `ASSETS.fetch` responses have immutable headers.
+- **Branch on `?cherry=1`**: set `frame-ancestors <host origins>` only on the
+  Cherry variant; leave (or set) `frame-ancestors 'none'` for the bare app so a
+  cache bleed can never make the full app framable.
+- **Keep the two variants from sharing a cache entry.** The query string differs
+  (`/` vs `/?cherry=1`), but the CSP header now varies on a request property, so
+  set `Vary` / an explicit cache key (or `Cache-Control: no-store` on the Cherry
+  variant) so an edge/browser cache cannot serve the `'none'` body where the
+  `frame-ancestors <hosts>` body is required, or vice-versa. The worker framing
+  test must assert both variants independently.
+
 ## New & changed components
 
 ### New package: `packages/cherry/` (`@slicc/cherry`)
 
-The host-side SDK. New npm workspace (**must be added to root `workspaces` in
-`package.json` and to the CI path-filter buckets in
-`.github/workflows/ci.yml`** — otherwise it silently misses build/test gates).
-Ships a tiny, dependency-light ES module (plus an optional `html2canvas` lazy
-import). Entry point `mountSlicc()`.
+The host-side SDK. A new npm workspace ships a tiny, dependency-light ES module
+(plus an optional `html2canvas` lazy import) with entry point `mountSlicc()`.
+
+**Adding a workspace touches more than `workspaces` — every explicit list in the
+repo must be updated or the package silently misses a gate.** This repo does not
+rely on globs for its gates; the build, typecheck, and test wiring are all
+explicit enumerations (see the root `CLAUDE.md` build/typecheck commands and
+`vitest.config.ts` `projects`). Concretely, adding `packages/cherry` requires:
+
+1. **`package.json` `workspaces`** — add `packages/cherry`.
+2. **`package.json` `build` script** — the build is an explicit `-w` chain
+   (`shared-ts → … → cloudflare-worker → …`); insert `@slicc/cherry` at the
+   right point (after `shared-ts`, before anything that would consume it).
+3. **`package.json` `typecheck` script** — the explicit tsconfig list must gain
+   `packages/cherry/tsconfig.json` (a **new** tsconfig for the package).
+4. **`vitest.config.ts` `projects`** — add a `packages/cherry` project so its
+   tests actually run.
+5. **`package.json` `test:coverage:cherry` script** + a per-package **coverage
+   floor** and a **CI job** in `.github/workflows/ci.yml` (and the CI
+   path-filter buckets), mirroring how the other packages are gated.
+6. **`package-lock.json`** — regenerated via `npm install` so the new workspace
+   is locked.
+7. **`knip`** config (if the repo's dead-code check enumerates entry points) so
+   the SDK entry/exports are not flagged as unused.
 
 ```ts
 export interface MountSliccOptions {
@@ -303,6 +340,16 @@ The session id, frame id, and execution-context id are minted by the transport
 and kept stable for the life of the attachment (re-minted on navigation — see
 NodeId/world lifecycle in [open questions](#open-questions-to-settle-during-planning)).
 
+**Lifecycle events are mandatory, not optional.** `BrowserAPI.navigate()` sends
+`Page.navigate` and then **awaits `Page.loadEventFired`** before resolving
+(`browser-api.ts:415`). If the synthetic transport never emits that event, every
+navigation hangs forever. So after the host `navigate(url)` promise settles, the
+transport must synthesize the lifecycle: emit `Page.frameNavigated` then
+`Page.loadEventFired` (and, for `Runtime`/console consumers, re-mint the
+execution-context). The same applies to any other leader-side flow that blocks
+on a lifecycle event — the supported subset must each have a synthetic
+completion event or a documented timeout, never a silent hang.
+
 ### New: `packages/webapp/src/cdp/cherry-host-protocol.ts`
 
 The **inner** iframe↔host envelope types (distinct from the tray wire
@@ -320,6 +367,8 @@ protocol). Pure types + guards, no logic. Every envelope carries `channelId`
 
 Three changes here, all mirrored to iOS (see invariant below):
 
+<a id="target-capability-metadata"></a>
+
 **(a) Target capability metadata.** `RemoteTargetInfo` (today `targetId` /
 `title` / `url`) and `TrayTargetEntry` (today no `kind`/capabilities) gain a
 capability descriptor so the leader can reason about what a target supports:
@@ -332,12 +381,27 @@ interface RemoteTargetInfo {
   kind?: 'browser' | 'cherry'; // absent ⇒ 'browser' (back-compat)
   capabilities?: {
     navigate: boolean;
-    createTarget: boolean; // Cherry: always false in v1
     network: boolean; // Cherry: false
     screenshot: boolean;
   };
 }
 ```
+
+**Capability metadata must propagate end-to-end — three sites drop it today.**
+Adding fields to the wire type is necessary but not sufficient:
+
+1. `TrayTargetRegistry.getEntries()` (`tray-target-registry.ts:37`) builds
+   `TrayTargetEntry`s with a fixed field set and **drops unknown fields**. It
+   must carry `kind`/`capabilities` through.
+2. `BrowserAPI.listAllTargets()` (`browser-api.ts:176`) maps remote entries down
+   to `{ targetId, title, url }`. It must preserve `kind`/`capabilities` so the
+   leader's selection logic can read them.
+3. `createTarget` is **runtime-level, not target-level**:
+   `BrowserAPI.createRemotePage(runtimeId)` (`browser-api.ts:217`) opens a tab on
+   a _runtime_, not a specific target. So "can this create tabs?" belongs on the
+   runtime (the `slicc-cherry` runtime ⇒ no), derived from its targets — not on a
+   per-target boolean. The capabilities object above is therefore per-target
+   (`navigate`/`network`/`screenshot`); tab-creation is gated by runtime kind.
 
 **(b) Application events, addressed.** Carry runtime/mount/origin identity so
 they survive multi-follower topologies and the leader's broadcast-by-default
@@ -353,9 +417,21 @@ type LeaderToFollowerMessage =
   | { type: 'cherry.slicc_event'; runtimeId: string; name: string; data: unknown };
 ```
 
-**(c) Runtime type.** Cherry followers join as `runtime: 'slicc-cherry'` (today
-`page-follower-tray` hardcodes `'slicc-standalone'`), so leader-side selection
-can distinguish them.
+**(c) Runtime type + canonical runtime identity.** Cherry followers join as
+`runtime: 'slicc-cherry'` (today `page-follower-tray` hardcodes
+`'slicc-standalone'`), so leader-side selection can distinguish them.
+
+There is also a **latent identity bug to fix, not inherit**: the advertisement
+side builds `runtimeId = \`follower-${connection.bootstrapId}\``
+(`page-follower-tray.ts:161`) while the leader's bookkeeping stores the raw
+`bootstrapId` (`main.ts:2587`). For browser followers this inconsistency is
+mostly invisible; for Cherry it is load-bearing, because `cherry-emit --runtime
+<id>` and the `cherry.host_event`/`cherry.slicc_event` `runtimeId` field must
+address exactly one stable id. The spec mandates a **single canonical form**:
+the `follower-${bootstrapId}`advertisement id is authoritative, and the leader
+must key its runtime map on the same value (or both must be reconciled to the
+raw id) so`--runtime` resolves deterministically. This is enumerated as a
+concrete fix in the implementation plan, not assumed to already work.
 
 **Protocol mirror invariant (5-step checklist).** `tray-sync-protocol.ts` is
 mirrored by the iOS Swift follower; all three changes must be mirrored:
@@ -385,6 +461,31 @@ mirrored by the iOS Swift follower; all three changes must be mirrored:
 - **Application events:** route inbound `cherry.host_event` to the leader's
   LickManager (carrying `runtimeId`/`origin`), and emit `cherry.slicc_event`
   addressed to the originating runtime.
+
+### Changed: `lick-manager.ts` + `lick-formatting.ts` — the host-event lick
+
+Routing `cherry.host_event` "to the LickManager" is only real if a concrete
+lick shape exists. Today `LickEvent.type` is a fixed union
+(`webhook | cron | sprinkle | fswatch | session-reload | navigate | upgrade`,
+`lick-manager.ts:35`) and `formatLickEventForCone` has a per-type formatting
+chain with no Cherry path (`lick-formatting.ts:50`). So host → cone delivery
+needs:
+
+1. **New `LickEvent` type `'cherry'`** with fields `cherryEventName: string`,
+   `cherryRuntimeId: string`, `cherryOrigin: string`, and the payload in the
+   existing `body: unknown`.
+2. **Formatter path** in `formatLickEventForCone`: a human-readable label
+   (`eventName = cherryEventName`) and a body the cone can act on (event name +
+   origin + JSON payload). Add `'cherry'` to `EXTERNAL_LICK_CHANNELS` if the
+   cone should be able to address a scoop by this channel.
+3. **Target scoop behavior:** by default the host event lands on the cone (no
+   `targetScoop`), matching how `navigate` licks surface; the SKILL documents
+   how the cone reacts. (A future `cherry-emit`-style host→scoop addressing is
+   out of scope for v1.)
+4. **Tests** for the new type and its formatter output.
+
+Without this the host→cone leg is specified at the tray layer but not actually
+deliverable to the agent.
 
 ### createTarget: clean error + courtesy window.open as an app event
 
@@ -447,7 +548,7 @@ model](#synthetic-cdp-session-model)):
   - any cookie import/export flow.
 
 The leader uses the [target capability
-metadata](#target-capability-metadata--the-slicc-cherry-runtime) to refuse
+metadata](#target-capability-metadata) to refuse
 these against Cherry targets with a clear message rather than a confusing
 mid-flow CDP failure.
 
@@ -477,16 +578,40 @@ cone (leader) playwright-cli click
 - **Handshake gate.** No CDP or event traffic flows before
   `handshake.hello`/`handshake.welcome` completes, pinning origin/source,
   exchanging the nonce, and negotiating capabilities.
-- **Capability opt-in.** The host page decides what the agent may do.
-  `navigate`, `screenshot`, and `openUrl` are off unless wired. Sensitive verbs
-  pass through `onPermissionPrompt`.
+- **Capability defaults — mounting is the grant.** Cherry is a powerful
+  remote-control grant, not a read-only viewer: a host that calls `mountSlicc`
+  is handing the remote cone the ability to read and act on its page. Be precise
+  about what is on by default vs opt-in:
+  - **On the moment a mount handshake completes** (no extra wiring): DOM
+    read/inspect, `Runtime.evaluate` of JSON-able expressions, aria snapshots,
+    synthetic mouse/keyboard input, and best-effort `html2canvas` screenshots
+    (`screenshot` defaults to `'html2canvas'`). Set `screenshot: 'none'` to turn
+    screenshots into a clean unsupported error.
+  - **Off unless the host wires a handler:** `Page.navigate` (needs
+    `capabilities.navigate`) and the courtesy open-url app event (needs
+    `capabilities.openUrl`). Omitted ⇒ clean unsupported error / ignored.
+  - **Never available in v1:** `Network.*`, cookies, teleport, cross-origin
+    frames, driveable agent-opened tabs — capability-gated off regardless of
+    host wiring.
+  - Every sensitive verb (and, if the host wants, every verb) can still be
+    vetoed per-call through `onPermissionPrompt`, which is the host's runtime
+    kill-switch on top of the static capability set.
 - **Single target, single origin.** Cherry cannot reach cross-origin frames;
   the browser's same-origin policy is the backstop, not Cherry's good behaviour.
 - **Framing policy.** The Cherry boot response sets `frame-ancestors` to the
   configured host origins; the rest of the app stays `frame-ancestors 'none'`.
-- **No secrets in the browser.** The IMS bearer travels host→iframe over the
-  pinned channel and is used only for same-origin `/api/cloud/*` calls;
-  `E2B_API_KEY` stays worker-only. The cone runs remotely.
+- **Token handling (the IMS bearer _is_ browser-resident — be honest about
+  it).** This is not a "no secrets in the browser" design: the host already
+  holds an IMS access token and hands it to the iframe over the pinned channel.
+  What Cherry guarantees is narrower and must be stated as such:
+  - The token is used **only** for **same-origin** `/api/cloud/*` calls from the
+    iframe — it is never exposed to a third-party CORS surface and never reaches
+    E2B (`E2B_API_KEY` stays worker-only; the cone runs remotely).
+  - The SDK and iframe **do not persist** the token (no `localStorage` /
+    `IndexedDB` / cookie); it lives only in memory for the provisioning call.
+  - Hosts should pass **short-lived, narrowly-scoped** tokens and must **redact**
+    the bearer from any logging on both sides. The token must never appear in a
+    `postMessage` envelope that is logged, nor in CDP `Runtime.evaluate` output.
 - **Tray transport unchanged.** WebRTC + DTLS as today; Cherry adds no new
   network trust boundary beyond the host↔iframe `postMessage` channel.
 
