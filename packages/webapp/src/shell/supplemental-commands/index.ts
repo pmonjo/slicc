@@ -48,6 +48,8 @@ import { createDiscoverCommand } from './discover-command.js';
 import { createPsCommand } from './ps-command.js';
 import { createKillCommand } from './kill-command.js';
 import { createBiomeCommand } from './biome-command.js';
+import { createCherryEmitCommand } from './cherry-emit-command.js';
+import type { CherryRuntimeRegistry } from './cherry-emit-command.js';
 import type { BrowserAPI } from '../../cdp/index.js';
 import type { ScriptCatalog } from '../script-catalog.js';
 import type { ProcessManager } from '../../kernel/process-manager.js';
@@ -80,6 +82,8 @@ export interface SupplementalCommandsConfig extends ImgcatCommandOptions {
    * works with either.
    */
   processManager?: ProcessManager;
+  /** Leader-side cherry runtime registry (Task 6). Absent outside leader contexts. */
+  cherryRuntimeRegistry?: CherryRuntimeRegistry;
 }
 
 export function createSupplementalCommands(options: SupplementalCommandsConfig = {}): Command[] {
@@ -134,6 +138,7 @@ export function createSupplementalCommands(options: SupplementalCommandsConfig =
     createDiscoverCommand(),
     createPsCommand({ processManager: options.processManager }),
     createKillCommand({ processManager: options.processManager }),
+    createCherryEmitCommand({ registry: options.cherryRuntimeRegistry }),
   ];
 
   if (options.fs) {
