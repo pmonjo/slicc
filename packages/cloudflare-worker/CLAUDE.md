@@ -120,15 +120,24 @@ Web feature shipped via Plan D. Spec at `docs/superpowers/specs/2026-05-26-cloud
 - `GET  /cloud` — dashboard SPA (CSP-enforced)
 - `GET  /auth/cloud-callback` — IMS popup callback (HTML)
 - `GET  /auth/cloud-callback.js` — IMS popup callback (JS, served inline by worker)
-- `POST /api/cloud/start` — start a new cone (auth + cap-checked)
+- `POST /api/cloud/start` — start a new cone (auth + cap-checked); optional `coneConfig` bundle (see below)
 - `GET  /api/cloud/list` — per-user cone list (reconciled with e2b per call)
+- `GET  /api/cloud/cone-config` — `?sandboxId=<id>`: returns the cone's **names-only** config index (model + account providerIds + secret names; no values) so the dashboard can show provisioned keys while the cone is paused
 - `POST /api/cloud/pause` — pause a cone
-- `POST /api/cloud/resume` — resume a paused cone (refreshes IMS token in sandbox)
+- `POST /api/cloud/resume` — resume a paused cone (refreshes IMS token in sandbox); optional `coneConfigDelta` (see below)
 - `POST /api/cloud/kill` — kill a cone (idempotent)
 - `POST /api/cloud/sign-out` — invalidate the auth cache entry for the bearer
 - `GET  /api/cloud/admin/stats` — admin-gated by `ADMIN_USER_IDS`
 
 All `/api/cloud/*` require `Authorization: Bearer <ims-access-token>` and route to `env.CLOUD_SESSIONS.idFromName(userId)` for per-user state. Lifecycle business logic lives inside the DurableObject (atomic via `state.blockConcurrencyWhile`), not in worker handlers.
+
+### Cone configuration (model, secrets, provider logins)
+
+A `ConeConfig` bundle (`{ model, accounts[], secrets[] }`, types + helpers in the side-effect-free `@slicc/cloud-core/cone-config` subpath) lets users pick the cone's model, provide flat secrets, and provision provider logins (API-key and OAuth). `accounts` carry `kind: 'oauth' | 'apikey'`. Flow (`src/cloud/cone-config-bridge.ts`):
+
+- **start:** `coneConfig` is validated (`validateConeConfig` + narrow `assertModelHasAccount` — the model's provider must have an account unless auth-optional), then `bundleToFiles` splits it into `/slicc/secrets.env` (flat secrets, what `startCone` already writes) and `/slicc/cone-config.json` (`{model,accounts}`). No `coneConfig` ⇒ the worker synthesizes the Adobe default from the cloud bearer (back-compat with old dashboards that send only `{ name }`). Body size is capped at `MAX_CONE_CONFIG_BYTES`.
+- **resume:** `coneConfigDelta` (`{ model?, upsert{accounts,secrets}, delete{providerIds,secretNames} }`) is merged into both files in-sandbox (read-modify-write, preserving unchanged values), then node-server is reloaded via the ordered hook `POST /api/secrets/reload` → leader-restart `Page.reload`. Pre-feature cones (only `secrets.env`, no `cone-config.json`) get a degenerate bundle synthesized on first resume.
+- **DO index:** `CloudSessionsDurableObject` persists a **names-only** `coneConfigIndex` on each `ConeEntry` (model + providerIds + secret names; **never values**), surfaced by `GET /api/cloud/cone-config`. The worker is a transient relay — it never persists bundle values and never logs them.
 
 ### Wrangler config
 
