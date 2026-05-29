@@ -43,15 +43,20 @@ The workflow lives in `.github/workflows/rum-error-triage.yml`.
 - **Noise.** `isNoise()` drops Vite HMR frames and contentless errors. Extend
   `NOISE_PATTERNS` as new dev-only noise appears.
 
-## Required secrets (GitHub Actions)
+## Required secrets / variables (GitHub Actions)
 
-| Secret              | Purpose                                                                                  |
-| ------------------- | ---------------------------------------------------------------------------------------- |
-| `RUM_BQ_SA_KEY`     | GCP service-account JSON with **BigQuery Job User** + **Data Viewer** on `helix-225321`. |
-| `ANTHROPIC_API_KEY` | Key for `claude-code-action` (classification + issue/PR authoring).                      |
+| Name                       | Kind     | Purpose                                                                                                                                                                                                                     |
+| -------------------------- | -------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `RUM_BQ_SA_KEY`            | secret   | GCP service-account JSON for BigQuery. Provisioned: `rum-error-triage@helix-225321.iam.gserviceaccount.com` — `bigquery.jobUser` (project) + `bigquery.dataViewer` scoped by IAM condition to the `helix_rum` dataset only. |
+| `AWS_BEARER_TOKEN_BEDROCK` | secret   | Amazon Bedrock API key (the Adobe CAMP `ABSK...` bearer token) used by `claude-code-action` (`use_bedrock: true`).                                                                                                          |
+| `RUM_AWS_REGION`           | variable | Optional. Bedrock region for the CAMP key (default `us-east-1`).                                                                                                                                                            |
+| `RUM_BEDROCK_MODEL`        | variable | Optional. Bedrock model / inference profile (default `global.anthropic.claude-sonnet-4-6`).                                                                                                                                 |
+| `ANTHROPIC_API_KEY`        | secret   | Only if you switch off the Bedrock path (see the commented `anthropic_api_key` fallback in the workflow).                                                                                                                   |
 
-Workload Identity Federation is the preferred long-term replacement for the
-service-account key — see `google-github-actions/auth`.
+The BigQuery service account is intentionally minimal: read-only, single
+dataset (enforced by an IAM condition), single purpose. Workload Identity
+Federation is the preferred long-term replacement for the key — see
+`google-github-actions/auth`.
 
 ## Run it locally
 

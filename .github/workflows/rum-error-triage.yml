@@ -81,9 +81,22 @@ jobs:
       - name: Classify candidates and file issues
         if: steps.query.outputs.has_candidates == 'true' && github.event.inputs.dry_run != 'true'
         uses: anthropics/claude-code-action@787c5a0ce96a9a6cfb050ea0c8f4c05f2447c251 # v1
+        env:
+          # Bedrock path: authenticate with an Amazon Bedrock API key (the Adobe
+          # CAMP `ABSK...` bearer token). Set the AWS_BEARER_TOKEN_BEDROCK secret
+          # and, if needed, the RUM_AWS_REGION / RUM_BEDROCK_MODEL repo variables
+          # to match the region + inference profile your CAMP key can reach.
+          # (Bearer-token auth for Bedrock is newer in Claude Code — if a run
+          # fails on auth, fall back to `anthropic_api_key` below.)
+          AWS_BEARER_TOKEN_BEDROCK: ${{ secrets.AWS_BEARER_TOKEN_BEDROCK }}
+          AWS_REGION: ${{ vars.RUM_AWS_REGION || 'us-east-1' }}
         with:
-          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          use_bedrock: 'true'
+          # Anthropic-API fallback — uncomment and remove the Bedrock env above
+          # to use a direct Anthropic key instead:
+          # anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           claude_args: |
+            --model ${{ vars.RUM_BEDROCK_MODEL || 'global.anthropic.claude-sonnet-4-6' }}
             --allowedTools "Read,Grep,Glob,Bash(gh issue:*),Bash(gh pr:*),Bash(gh label:*),Bash(git:*),Edit,Write"
             --max-turns 40
           prompt: |
