@@ -1600,6 +1600,13 @@ git commit -m "test: restore coverage floor for follower lick forwarding"
 
 ---
 
+## Follow-ups
+
+Items deferred to avoid test infrastructure sprawl or production changes for testability:
+
+- **`onForwardingToggle` connect/detach test** — `page-follower-tray.ts` calls `onForwardingToggle(true)` on successful follower connection and `onForwardingToggle(false)` on detach/stop. Testing this edge requires driving a live WebRTC connection through `startFollowerWithAutoReconnect`, which in turn requires mocking the full tray-webrtc/signaling/RTCPeerConnection stack. No clean injection seam exists (the existing `_fetchImpl`/`_sleep` hooks prevent connection, not simulate it). Adding a test hook to production code for this single assertion was deemed overkill; deferred pending a live-connection test harness.
+- **`main.ts` forward-lick handler composition** — The glue in `main.ts` that sets `client.setForwardLickHandler((event) => pageFollowerTray?.currentSync?.forwardLick(event))` is untested. Testing it requires mocking `mainStandaloneWorker` internals. Not refactored for testability per guardrails.
+
 ## Self-review notes (for the implementer)
 
 - **Cross-package imports** (`LickEvent` into `messages.ts`; `ForwardLickMsg` into `offscreen-client.ts`; `formatLickEventForCone` into `offscreen-bridge.ts`) are the highest-risk typecheck points. Each task flags a structural-mirror or inline-cast fallback. Run `npm run typecheck` after Tasks 9–11 specifically.
