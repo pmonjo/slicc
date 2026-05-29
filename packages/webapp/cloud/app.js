@@ -1,3 +1,5 @@
+import { assembleBundle, validateModelHasAccount } from './cone-config-client.js';
+
 const TOKEN_KEY = 'cloud-ims-token';
 const TOKEN_EXP_KEY = 'cloud-ims-token-exp';
 
@@ -234,6 +236,82 @@ function renderCones(cones) {
   }
 }
 
+function renderCreateConfig() {
+  const accountListEl = document.getElementById('account-list');
+  const modelSelect = document.getElementById('cone-model');
+  if (!accountListEl || !modelSelect) return;
+
+  // Read accounts from localStorage
+  const accounts = JSON.parse(localStorage.getItem('slicc_accounts') || '[]');
+
+  // Render account checkboxes
+  accountListEl.replaceChildren();
+  for (const acc of accounts) {
+    const label = document.createElement('label');
+    const checkbox = document.createElement('input');
+    checkbox.type = 'checkbox';
+    checkbox.value = acc.providerId;
+    checkbox.className = 'account-checkbox';
+    label.appendChild(checkbox);
+    label.appendChild(document.createTextNode(' ' + acc.providerId));
+    accountListEl.appendChild(label);
+    accountListEl.appendChild(document.createElement('br'));
+  }
+
+  // Populate model dropdown with a static set
+  modelSelect.replaceChildren();
+  const defaultOption = document.createElement('option');
+  defaultOption.value = '';
+  defaultOption.textContent = 'Select model...';
+  modelSelect.appendChild(defaultOption);
+
+  const models = [
+    { value: 'adobe:claude-opus-4-6', label: 'Adobe: Claude Opus 4.6' },
+    { value: 'anthropic:claude-opus-4-6', label: 'Anthropic: Claude Opus 4.6' },
+    { value: 'openai:gpt-5', label: 'OpenAI: GPT-5' },
+  ];
+  for (const m of models) {
+    const opt = document.createElement('option');
+    opt.value = m.value;
+    opt.textContent = m.label;
+    modelSelect.appendChild(opt);
+  }
+}
+
+function addSecretRow() {
+  const container = document.getElementById('secret-rows');
+  if (!container) return;
+
+  const row = document.createElement('div');
+  row.className = 'secret-row';
+
+  const nameInput = document.createElement('input');
+  nameInput.type = 'text';
+  nameInput.className = 's-name';
+  nameInput.placeholder = 'SECRET_NAME';
+  nameInput.autocomplete = 'off';
+
+  const valueInput = document.createElement('input');
+  valueInput.type = 'password';
+  valueInput.className = 's-value';
+  valueInput.placeholder = 'value';
+  valueInput.autocomplete = 'off';
+
+  const domainsInput = document.createElement('input');
+  domainsInput.type = 'text';
+  domainsInput.className = 's-domains';
+  domainsInput.placeholder = 'domains (comma-separated)';
+  domainsInput.autocomplete = 'off';
+
+  row.appendChild(nameInput);
+  row.appendChild(document.createTextNode(' '));
+  row.appendChild(valueInput);
+  row.appendChild(document.createTextNode(' '));
+  row.appendChild(domainsInput);
+
+  container.appendChild(row);
+}
+
 async function refreshList() {
   try {
     const data = await api('/api/cloud/list');
@@ -292,6 +370,7 @@ document.getElementById('sign-in-btn').addEventListener('click', async () => {
   try {
     await startImsPopup();
     setSignedIn();
+    renderCreateConfig();
     await refreshList();
   } catch (err) {
     showToast('Sign-in failed: ' + err.message);
@@ -319,7 +398,38 @@ createBtn.addEventListener('click', async () => {
   if (createBtn.disabled) return; // already in flight
   const nameInput = document.getElementById('cone-name');
   const status = document.getElementById('create-status');
+  const modelSelect = document.getElementById('cone-model');
   const name = nameInput.value.trim() || undefined;
+
+  // Gather config
+  const model = modelSelect?.value;
+  if (!model) {
+    showToast('Please select a model.');
+    return;
+  }
+
+  const selectedProviderIds = Array.from(
+    document.querySelectorAll('#account-list input:checked')
+  ).map((el) => el.value);
+
+  const allAccounts = JSON.parse(localStorage.getItem('slicc_accounts') || '[]');
+
+  const secretRows = Array.from(document.querySelectorAll('#secret-rows .secret-row')).map(
+    (row) => ({
+      name: row.querySelector('.s-name')?.value || '',
+      value: row.querySelector('.s-value')?.value || '',
+      domains: row.querySelector('.s-domains')?.value || '',
+    })
+  );
+
+  // Validate model has account
+  if (!validateModelHasAccount(model, selectedProviderIds, ['local'])) {
+    showToast('Selected model needs a connected account for its provider.');
+    return;
+  }
+
+  const coneConfig = assembleBundle({ model, selectedProviderIds, allAccounts, secretRows });
+
   const originalLabel = createBtn.textContent;
   createBtn.disabled = true;
   createBtn.textContent = 'Starting…';
@@ -327,7 +437,7 @@ createBtn.addEventListener('click', async () => {
   try {
     const result = await api('/api/cloud/start', {
       method: 'POST',
-      body: JSON.stringify({ name }),
+      body: JSON.stringify({ name, coneConfig }),
     });
     status.textContent = 'ready';
     nameInput.value = '';
@@ -346,7 +456,16 @@ createBtn.addEventListener('click', async () => {
 });
 
 window.addEventListener('focus', () => {
-  if (getToken()) refreshList();
+  if (getToken()) {
+    refreshList();
+    renderCreateConfig(); // Refresh accounts in case user connected a new provider
+  }
+});
+
+document.getElementById('add-secret')?.addEventListener('click', addSecretRow);
+
+document.getElementById('connect-btn')?.addEventListener('click', () => {
+  window.open('/?connect=1', 'slicc-connect', 'width=520,height=720');
 });
 
 const signInBtn = document.getElementById('sign-in-btn');
@@ -358,6 +477,7 @@ loadConfig()
     signInBtn.textContent = 'Sign in with Adobe';
     if (getToken()) {
       setSignedIn();
+      renderCreateConfig();
       refreshList();
     } else {
       setSignedOut();
