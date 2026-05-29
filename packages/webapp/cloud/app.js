@@ -1,4 +1,4 @@
-import { assembleBundle, validateModelHasAccount } from './cone-config-client.js';
+import { assembleBundle, validateModelHasAccount, assembleDelta } from './cone-config-client.js';
 
 const TOKEN_KEY = 'cloud-ims-token';
 const TOKEN_EXP_KEY = 'cloud-ims-token-exp';
@@ -203,6 +203,10 @@ function renderCones(cones) {
       btn.textContent = 'Resume';
       btn.addEventListener('click', () => runConeAction(li, c.sandboxId, 'resume'));
       actions.appendChild(btn);
+      const manageBtn = document.createElement('button');
+      manageBtn.textContent = 'Manage';
+      manageBtn.addEventListener('click', () => showManagePanel(li, c.sandboxId));
+      actions.appendChild(manageBtn);
     }
     const killBtn = document.createElement('button');
     killBtn.textContent = 'Kill';
@@ -310,6 +314,208 @@ function addSecretRow() {
   row.appendChild(domainsInput);
 
   container.appendChild(row);
+}
+
+async function showManagePanel(li, sandboxId) {
+  try {
+    const data = await api('/api/cloud/cone-config?sandboxId=' + encodeURIComponent(sandboxId), {
+      method: 'GET',
+    });
+    const idx = data.coneConfigIndex;
+
+    // Remove existing manage panel if any
+    const existing = li.querySelector('.manage-panel');
+    if (existing) {
+      existing.remove();
+      return;
+    }
+
+    const panel = document.createElement('div');
+    panel.className = 'manage-panel';
+
+    // Model display
+    const modelLabel = document.createElement('div');
+    modelLabel.textContent = 'Current model: ' + (idx?.model || 'none');
+    panel.appendChild(modelLabel);
+
+    // Model selector
+    const modelSelect = document.createElement('select');
+    modelSelect.className = 'manage-model-select';
+    const defaultOption = document.createElement('option');
+    defaultOption.value = '';
+    defaultOption.textContent = 'Keep current model';
+    modelSelect.appendChild(defaultOption);
+    const models = [
+      { value: 'adobe:claude-opus-4-6', label: 'Adobe: Claude Opus 4.6' },
+      { value: 'anthropic:claude-opus-4-6', label: 'Anthropic: Claude Opus 4.6' },
+      { value: 'openai:gpt-5', label: 'OpenAI: GPT-5' },
+    ];
+    for (const m of models) {
+      const opt = document.createElement('option');
+      opt.value = m.value;
+      opt.textContent = m.label;
+      modelSelect.appendChild(opt);
+    }
+    panel.appendChild(modelSelect);
+
+    // Account list with delete toggles
+    if (idx?.accountProviderIds?.length) {
+      const accountsHeader = document.createElement('div');
+      accountsHeader.textContent = 'Connected accounts:';
+      accountsHeader.style.marginTop = '10px';
+      accountsHeader.style.fontWeight = 'bold';
+      panel.appendChild(accountsHeader);
+
+      for (const providerId of idx.accountProviderIds) {
+        const label = document.createElement('label');
+        const checkbox = document.createElement('input');
+        checkbox.type = 'checkbox';
+        checkbox.className = 'delete-account-checkbox';
+        checkbox.dataset.providerId = providerId;
+        label.appendChild(checkbox);
+        label.appendChild(document.createTextNode(' Delete ' + providerId));
+        panel.appendChild(label);
+        panel.appendChild(document.createElement('br'));
+      }
+    }
+
+    // Secrets list with delete toggles
+    if (idx?.secretNames?.length) {
+      const secretsHeader = document.createElement('div');
+      secretsHeader.textContent = 'Secrets:';
+      secretsHeader.style.marginTop = '10px';
+      secretsHeader.style.fontWeight = 'bold';
+      panel.appendChild(secretsHeader);
+
+      for (const name of idx.secretNames) {
+        const label = document.createElement('label');
+        const checkbox = document.createElement('input');
+        checkbox.type = 'checkbox';
+        checkbox.className = 'delete-secret-checkbox';
+        checkbox.dataset.secretName = name;
+        label.appendChild(checkbox);
+        label.appendChild(document.createTextNode(' Delete ' + name));
+        panel.appendChild(label);
+        panel.appendChild(document.createElement('br'));
+      }
+    }
+
+    // Add secret section
+    const addSecretHeader = document.createElement('div');
+    addSecretHeader.textContent = 'Add secret:';
+    addSecretHeader.style.marginTop = '10px';
+    addSecretHeader.style.fontWeight = 'bold';
+    panel.appendChild(addSecretHeader);
+
+    const addSecretContainer = document.createElement('div');
+    addSecretContainer.className = 'add-secret-rows';
+    panel.appendChild(addSecretContainer);
+
+    const addBtn = document.createElement('button');
+    addBtn.textContent = 'Add secret row';
+    addBtn.addEventListener('click', () => {
+      const row = document.createElement('div');
+      row.className = 'secret-row';
+
+      const nameInput = document.createElement('input');
+      nameInput.type = 'text';
+      nameInput.className = 's-name';
+      nameInput.placeholder = 'SECRET_NAME';
+
+      const valueInput = document.createElement('input');
+      valueInput.type = 'password';
+      valueInput.className = 's-value';
+      valueInput.placeholder = 'value';
+
+      const domainsInput = document.createElement('input');
+      domainsInput.type = 'text';
+      domainsInput.className = 's-domains';
+      domainsInput.placeholder = 'domains';
+
+      row.appendChild(nameInput);
+      row.appendChild(document.createTextNode(' '));
+      row.appendChild(valueInput);
+      row.appendChild(document.createTextNode(' '));
+      row.appendChild(domainsInput);
+      addSecretContainer.appendChild(row);
+    });
+    panel.appendChild(addBtn);
+
+    // Reconnect button
+    const reconnectBtn = document.createElement('button');
+    reconnectBtn.textContent = 'Reconnect / set model';
+    reconnectBtn.style.marginTop = '10px';
+    reconnectBtn.addEventListener('click', () => {
+      window.open('/?connect=1', 'slicc-connect', 'width=520,height=720');
+    });
+    panel.appendChild(reconnectBtn);
+
+    // Apply on resume button
+    const applyBtn = document.createElement('button');
+    applyBtn.textContent = 'Apply on resume';
+    applyBtn.style.marginTop = '10px';
+    applyBtn.addEventListener('click', async () => {
+      try {
+        const newModel = modelSelect.value || '';
+
+        // Gather delete sets
+        const deleteProviderIds = Array.from(
+          panel.querySelectorAll('.delete-account-checkbox:checked')
+        ).map((el) => el.dataset.providerId);
+
+        const deleteSecretNames = Array.from(
+          panel.querySelectorAll('.delete-secret-checkbox:checked')
+        ).map((el) => el.dataset.secretName);
+
+        // Gather new secret rows
+        const upsertSecretRows = Array.from(
+          panel.querySelectorAll('.add-secret-rows .secret-row')
+        ).map((row) => ({
+          name: row.querySelector('.s-name')?.value || '',
+          value: row.querySelector('.s-value')?.value || '',
+          domains: row.querySelector('.s-domains')?.value || '',
+        }));
+
+        // Read all accounts from localStorage and offer to re-send all of them
+        const allAccounts = JSON.parse(localStorage.getItem('slicc_accounts') || '[]');
+
+        // For simplicity, we'll let the user re-send all currently connected accounts
+        // In a more refined UX, we could show checkboxes for each account
+        const upsertAccounts = allAccounts;
+
+        const coneConfigDelta = assembleDelta({
+          model: newModel,
+          upsertAccounts,
+          upsertSecretRows,
+          deleteProviderIds,
+          deleteSecretNames,
+        });
+
+        await api('/api/cloud/resume', {
+          method: 'POST',
+          body: JSON.stringify({ sandboxId, coneConfigDelta }),
+        });
+
+        showToast('Configuration updated - will apply on next resume');
+        panel.remove();
+        await refreshList();
+      } catch (e) {
+        showToast('Apply failed: ' + e.message);
+      }
+    });
+    panel.appendChild(applyBtn);
+
+    // Close button
+    const closeBtn = document.createElement('button');
+    closeBtn.textContent = 'Close';
+    closeBtn.style.marginTop = '10px';
+    closeBtn.addEventListener('click', () => panel.remove());
+    panel.appendChild(closeBtn);
+
+    li.appendChild(panel);
+  } catch (e) {
+    showToast('Manage failed: ' + e.message);
+  }
 }
 
 async function refreshList() {

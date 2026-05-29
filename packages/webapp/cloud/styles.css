@@ -285,3 +285,55 @@ button:focus-visible {
     transform: translateY(0);
   }
 }
+
+.manage-panel {
+  margin-top: 12px;
+  padding: 16px;
+  background: var(--accent-soft);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+}
+
+.manage-panel .manage-model-select {
+  width: 100%;
+  margin-top: 8px;
+  margin-bottom: 8px;
+  padding: 8px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+  font: inherit;
+}
+
+.manage-panel label {
+  display: block;
+  margin: 4px 0;
+  font-size: 13px;
+}
+
+.manage-panel .add-secret-rows {
+  margin-top: 8px;
+  margin-bottom: 8px;
+}
+
+.manage-panel .secret-row {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.manage-panel .secret-row input {
+  flex: 1;
+  padding: 6px 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface);
+  font: inherit;
+  font-size: 12px;
+}
+
+.manage-panel button {
+  margin-right: 8px;
+  margin-bottom: 4px;
+}

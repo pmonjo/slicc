@@ -34,3 +34,29 @@ export function validateModelHasAccount(model, selectedProviderIds, authOptional
   if (authOptionalProviders.includes(provider)) return true;
   return selectedProviderIds.includes(provider);
 }
+
+export function assembleDelta({
+  model,
+  upsertAccounts,
+  upsertSecretRows,
+  deleteProviderIds,
+  deleteSecretNames,
+}) {
+  const { accounts, secrets } = assembleBundle({
+    model: model ?? '',
+    selectedProviderIds: upsertAccounts.map((a) => a.providerId),
+    allAccounts: upsertAccounts,
+    secretRows: upsertSecretRows,
+  });
+  const delta = {};
+  if (model) delta.model = model;
+  const upsert = {};
+  if (accounts.length) upsert.accounts = accounts;
+  if (secrets.length) upsert.secrets = secrets;
+  if (Object.keys(upsert).length) delta.upsert = upsert;
+  const del = {};
+  if (deleteProviderIds.length) del.providerIds = deleteProviderIds;
+  if (deleteSecretNames.length) del.secretNames = deleteSecretNames;
+  if (Object.keys(del).length) delta.delete = del;
+  return delta;
+}

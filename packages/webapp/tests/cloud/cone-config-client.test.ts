@@ -1,5 +1,9 @@
 import { describe, it, expect } from 'vitest';
-import { assembleBundle, validateModelHasAccount } from '../../cloud/cone-config-client.js';
+import {
+  assembleBundle,
+  validateModelHasAccount,
+  assembleDelta,
+} from '../../cloud/cone-config-client.js';
 
 describe('assembleBundle', () => {
   it('builds {model, accounts, secrets} from selected localStorage accounts + secret rows', () => {
@@ -27,5 +31,36 @@ describe('validateModelHasAccount (F6 strict)', () => {
   });
   it('passes for auth-optional providers', () => {
     expect(validateModelHasAccount('local:x', [], ['local'])).toBe(true);
+  });
+});
+
+describe('assembleDelta', () => {
+  it('produces upserts for new/changed and deletes for removed keys', () => {
+    const delta = assembleDelta({
+      model: 'openai:x',
+      upsertAccounts: [{ providerId: 'openai', apiKey: 'k', accessToken: '' }],
+      upsertSecretRows: [{ name: 'NEW', value: 'n', domains: 'x.com' }],
+      deleteProviderIds: ['adobe'],
+      deleteSecretNames: ['OLD'],
+    });
+    expect(delta).toEqual({
+      model: 'openai:x',
+      upsert: {
+        accounts: [{ providerId: 'openai', kind: 'apikey', apiKey: 'k' }],
+        secrets: [{ name: 'NEW', value: 'n', domains: ['x.com'] }],
+      },
+      delete: { providerIds: ['adobe'], secretNames: ['OLD'] },
+    });
+  });
+  it('omits empty sections', () => {
+    expect(
+      assembleDelta({
+        model: '',
+        upsertAccounts: [],
+        upsertSecretRows: [],
+        deleteProviderIds: [],
+        deleteSecretNames: [],
+      })
+    ).toEqual({});
   });
 });
