@@ -35,6 +35,7 @@ export interface CherryHostTransportOptions {
 const SYNTHETIC_SESSION = 'cherry-session';
 const SYNTHETIC_TARGET = 'cherry-target';
 const SYNTHETIC_FRAME = 'cherry-frame';
+const DEFAULT_TIMEOUT = 30000;
 
 export class CherryHostTransport implements CDPTransport {
   private opts: CherryHostTransportOptions;
@@ -47,6 +48,7 @@ export class CherryHostTransport implements CDPTransport {
   >();
   private listeners = new Map<string, Set<CDPEventListener>>();
   private connectResolve: (() => void) | null = null;
+  private connectTimer: ReturnType<typeof setTimeout> | null = null;
   private _joinUrl: string | null = null;
   private _provisioningAuth: {
     token: string;
@@ -82,7 +84,7 @@ export class CherryHostTransport implements CDPTransport {
     return this._provisioningAuth;
   }
 
-  async connect(_options?: CDPConnectOptions): Promise<void> {
+  async connect(options?: CDPConnectOptions): Promise<void> {
     if (this._state !== 'disconnected') {
       throw new Error(`Cannot connect: state is ${this._state}`);
     }
@@ -91,8 +93,19 @@ export class CherryHostTransport implements CDPTransport {
     if (typeof window !== 'undefined') {
       window.addEventListener('message', this.boundHandler);
     }
-    return new Promise<void>((resolve) => {
+    const timeoutMs = options?.timeout ?? DEFAULT_TIMEOUT;
+    return new Promise<void>((resolve, reject) => {
       this.connectResolve = resolve;
+      this.connectTimer = setTimeout(() => {
+        this.connectTimer = null;
+        if (typeof window !== 'undefined') {
+          window.removeEventListener('message', this.boundHandler);
+        }
+        this._state = 'disconnected';
+        this.channelId = null;
+        this.connectResolve = null;
+        reject(new Error(`Cherry handshake timed out after ${timeoutMs}ms`));
+      }, timeoutMs);
       this.post({
         cherry: CHERRY_PROTOCOL_VERSION,
         channelId: this.channelId!,
@@ -107,6 +120,10 @@ export class CherryHostTransport implements CDPTransport {
   }
 
   disconnect(): void {
+    if (this.connectTimer !== null) {
+      clearTimeout(this.connectTimer);
+      this.connectTimer = null;
+    }
     if (typeof window !== 'undefined') {
       window.removeEventListener('message', this.boundHandler);
     }
@@ -154,7 +171,7 @@ export class CherryHostTransport implements CDPTransport {
     });
 
     if (method === 'Page.navigate') {
-      this.synthesizeNavigationLifecycle(result);
+      this.synthesizeNavigationLifecycle(result, params?.url as string | undefined);
     }
     return result;
   }
@@ -262,9 +279,12 @@ export class CherryHostTransport implements CDPTransport {
     }
   }
 
-  private synthesizeNavigationLifecycle(navResult: Record<string, unknown>): void {
+  private synthesizeNavigationLifecycle(
+    navResult: Record<string, unknown>,
+    navigatedUrl?: string
+  ): void {
     const frameId = (navResult.frameId as string) ?? SYNTHETIC_FRAME;
-    const url = typeof location !== 'undefined' ? location.href : 'about:blank';
+    const url = navigatedUrl ?? (typeof location !== 'undefined' ? location.href : 'about:blank');
     this.emit('Page.frameNavigated', {
       frame: {
         id: frameId,
@@ -294,6 +314,10 @@ export class CherryHostTransport implements CDPTransport {
     const env = event.data as CherryEnvelope;
     switch (env.kind) {
       case 'handshake.welcome':
+        if (this.connectTimer !== null) {
+          clearTimeout(this.connectTimer);
+          this.connectTimer = null;
+        }
         this._state = 'connected';
         this._joinUrl = env.joinUrl ?? null;
         this._provisioningAuth = env.auth ?? null;

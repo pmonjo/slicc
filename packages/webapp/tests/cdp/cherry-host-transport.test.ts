@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { CherryHostTransport } from '../../src/cdp/cherry-host-transport.js';
 import { CHERRY_PROTOCOL_VERSION } from '../../src/cdp/cherry-host-protocol.js';
 
@@ -24,6 +24,9 @@ describe('CherryHostTransport', () => {
   let h: ReturnType<typeof makeTransport>;
   beforeEach(() => {
     h = makeTransport();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
   });
 
   it('handshakes: sends hello, resolves connect on welcome', async () => {
@@ -82,6 +85,39 @@ describe('CherryHostTransport', () => {
     });
     await p;
     expect(events).toEqual(['frameNavigated', 'loadEventFired']);
+  });
+
+  it('rejects connect and resets state when the handshake times out', async () => {
+    vi.useFakeTimers();
+    const p = h.transport.connect();
+    const rejection = expect(p).rejects.toThrow(/Cherry handshake timed out after \d+ms/);
+    await vi.advanceTimersByTimeAsync(30000);
+    await rejection;
+    expect(h.transport.state).toBe('disconnected');
+  });
+
+  it('rejects the send promise on a cdp.response error', async () => {
+    await connectHelper(h);
+    const channelId = lastChannelId(h);
+    const p = h.transport.send('SomeDomain.method');
+    const req = h.posted.find((m) => m.kind === 'cdp.request' && m.method === 'SomeDomain.method');
+    expect(req).toBeTruthy();
+    h.inbound({
+      cherry: CHERRY_PROTOCOL_VERSION,
+      channelId,
+      kind: 'cdp.response',
+      id: req.id,
+      error: { code: -32601, message: 'nope' },
+    });
+    await expect(p).rejects.toThrow(/nope.*-32601|-32601.*nope/s);
+  });
+
+  it('rejects pending sends when disconnect is called', async () => {
+    await connectHelper(h);
+    const p = h.transport.send('SomeDomain.method');
+    // do not resolve it; disconnect should reject it
+    h.transport.disconnect();
+    await expect(p).rejects.toThrow(/disconnected/);
   });
 
   it('rejects inbound from a foreign origin', async () => {
