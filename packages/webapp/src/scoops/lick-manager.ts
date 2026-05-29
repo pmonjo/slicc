@@ -33,7 +33,15 @@ export interface CronTaskEntry {
 }
 
 export interface LickEvent {
-  type: 'webhook' | 'cron' | 'sprinkle' | 'fswatch' | 'session-reload' | 'navigate' | 'upgrade';
+  type:
+    | 'webhook'
+    | 'cron'
+    | 'sprinkle'
+    | 'fswatch'
+    | 'session-reload'
+    | 'navigate'
+    | 'upgrade'
+    | 'cherry';
   webhookId?: string;
   webhookName?: string;
   cronId?: string;
@@ -48,6 +56,10 @@ export interface LickEvent {
   /** For upgrade events: the previously-seen and current bundled SLICC versions. */
   upgradeFromVersion?: string;
   upgradeToVersion?: string;
+  /** For cherry events: the host-page event name, owning follower runtime, and host origin. */
+  cherryName?: string;
+  cherryRuntimeId?: string;
+  cherryOrigin?: string;
   targetScoop?: string;
   timestamp: string;
   headers?: Record<string, string>;
