@@ -1,0 +1,138 @@
+import type { MountSliccOptions, SliccHandle } from './index.js';
+import { createCdpHostHandler, CherryUnsupportedError } from './cdp-host-handlers.js';
+import { CHERRY_PROTOCOL_VERSION, acceptEnvelope, type CherryEnvelope } from './protocol.js';
+
+interface CdpResponseShape {
+  result?: Record<string, unknown>;
+  error?: { code: number; message: string };
+}
+
+export interface CherrySliccHandle extends SliccHandle {
+  /** Test seam: feed a parsed envelope as if it arrived via postMessage. */
+  __test_receive(env: CherryEnvelope): Promise<CdpResponseShape | undefined>;
+}
+
+/** `mountSliccImpl` accepts an optional `__test_post` seam to capture outbound envelopes in tests. */
+type MountSliccImplOptions = MountSliccOptions & {
+  __test_post?: (env: CherryEnvelope) => void;
+};
+
+export function mountSliccImpl(options: MountSliccImplOptions): CherrySliccHandle {
+  const iframe = document.createElement('iframe');
+  const src = new URL(options.sliccOrigin);
+  src.searchParams.set('cherry', '1');
+  iframe.src = src.toString();
+  iframe.style.border = '0';
+  iframe.style.width = '100%';
+  iframe.style.height = '100%';
+  options.container.appendChild(iframe);
+
+  let channelId: string | null = null;
+  const hostHandler = createCdpHostHandler({
+    capabilities: options.capabilities,
+    onOpenUrl: options.hooks?.onOpenUrl,
+  });
+
+  const post = (env: CherryEnvelope) => {
+    if (options.__test_post) {
+      options.__test_post(env);
+      return;
+    }
+    iframe.contentWindow?.postMessage(env, options.sliccOrigin);
+  };
+
+  const dispatchCdp = async (
+    env: Extract<CherryEnvelope, { kind: 'cdp.request' }>
+  ): Promise<CdpResponseShape> => {
+    const domain = env.method.split('.')[0] ?? env.method;
+    const granted = options.hooks?.onPermissionRequest
+      ? await options.hooks.onPermissionRequest(domain)
+      : true;
+    if (!granted) {
+      return { error: { code: -32601, message: `Cherry: permission denied for ${domain}` } };
+    }
+    try {
+      const result = await hostHandler(env.method, env.params ?? {});
+      return { result };
+    } catch (err) {
+      if (err instanceof CherryUnsupportedError) {
+        return { error: { code: err.code, message: err.message } };
+      }
+      return {
+        error: { code: -32000, message: err instanceof Error ? err.message : String(err) },
+      };
+    }
+  };
+
+  const handleEnvelope = async (env: CherryEnvelope): Promise<CdpResponseShape | undefined> => {
+    switch (env.kind) {
+      case 'handshake.hello': {
+        channelId = env.channelId;
+        // The SDK forwards either a ready joinToken OR the IMS auth for the
+        // iframe to provision with (same-origin /api/cloud/*). It never calls
+        // the cloud API itself — that would be a cross-origin request from the
+        // third-party host with a third-party Authorization header.
+        const welcome: Extract<CherryEnvelope, { kind: 'handshake.welcome' }> = {
+          cherry: CHERRY_PROTOCOL_VERSION,
+          channelId,
+          kind: 'handshake.welcome',
+        };
+        if (options.joinToken) {
+          welcome.joinUrl = options.joinToken;
+        } else if (options.imsToken) {
+          welcome.auth = {
+            token: options.imsToken,
+            coneName: options.coneName,
+            createIfMissing: options.createIfMissing,
+          };
+        }
+        post(welcome);
+        return undefined;
+      }
+      case 'cdp.request': {
+        const resp = await dispatchCdp(env);
+        post({
+          cherry: CHERRY_PROTOCOL_VERSION,
+          channelId: channelId!,
+          kind: 'cdp.response',
+          id: env.id,
+          ...resp,
+        });
+        return resp;
+      }
+      case 'slicc.event': {
+        options.hooks?.onSliccEvent?.(env.name, env.detail);
+        if (env.name === 'open-url' && options.capabilities.openUrl) {
+          const url = (env.detail as { url?: string } | undefined)?.url;
+          if (url) options.hooks?.onOpenUrl?.(url);
+        }
+        return undefined;
+      }
+      default:
+        return undefined;
+    }
+  };
+
+  const onMessage = (event: MessageEvent) => {
+    if (
+      !acceptEnvelope(event, {
+        allowOrigins: [options.sliccOrigin],
+        expectedSource: iframe.contentWindow,
+        channelId,
+      })
+    ) {
+      return;
+    }
+    void handleEnvelope(event.data as CherryEnvelope);
+  };
+  window.addEventListener('message', onMessage);
+
+  return {
+    iframe,
+    destroy() {
+      window.removeEventListener('message', onMessage);
+      iframe.remove();
+    },
+    __test_receive: (env) => handleEnvelope(env),
+  };
+}

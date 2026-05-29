@@ -3,6 +3,8 @@
  * the host page to a remote cloud-cone leader as a driveable CDP target.
  */
 
+import { mountSliccImpl } from './mount.js';
+
 export interface HostCapabilities {
   /** Allow the leader to navigate the host page top-level frame. */
   navigate: boolean;
@@ -56,6 +58,5 @@ export function mountSlicc(options: MountSliccOptions): SliccHandle {
   if (!options || !options.container) {
     throw new Error('mountSlicc: options.container is required');
   }
-  // Implemented in Task 12 (mount.ts). Stub keeps the surface importable.
-  throw new Error('mountSlicc: not yet implemented');
+  return mountSliccImpl(options);
 }
