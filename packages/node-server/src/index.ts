@@ -36,6 +36,7 @@ import { handleDaSignAndForward, handleS3SignAndForward } from './secrets/sign-a
 import { readOrCreateSessionId } from './secrets/session-id-file.js';
 import { registerCloudStatusEndpoint } from './cloud-status.js';
 import { registerHostedBootstrapEndpoint } from './hosted-bootstrap.js';
+import { registerSecretsReloadEndpoint } from './secrets-reload-endpoint.js';
 import { createHttpCdp, registerLeaderRestartEndpoint } from './leader-restart.js';
 
 import { FETCH_PROXY_SKIP_HEADERS } from './fetch-proxy-headers.js';
@@ -1202,6 +1203,7 @@ async function main() {
   if (RUNTIME_FLAGS.hosted) {
     registerCloudStatusEndpoint(app, { joinFilePath: '/tmp/slicc-join.json' });
     registerHostedBootstrapEndpoint(app, { secretStore });
+    registerSecretsReloadEndpoint(app, { secretProxy });
   }
 
   // Fetch proxy — forwards cross-origin requests from the browser to bypass CORS.
