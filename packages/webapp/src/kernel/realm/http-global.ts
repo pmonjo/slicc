@@ -163,17 +163,19 @@ async function readBody(resp: Response): Promise<unknown> {
   return resp.text();
 }
 
-function serializeBody(body: unknown, headers: Record<string, string>): string | undefined {
+function serializeBody(body: unknown, headers: Record<string, string>): BodyInit | undefined {
   if (body === undefined || body === null) return undefined;
   if (typeof body === 'string') return body;
   if (
     body instanceof ArrayBuffer ||
     ArrayBuffer.isView(body) ||
     (typeof Blob !== 'undefined' && body instanceof Blob) ||
-    (typeof FormData !== 'undefined' && body instanceof FormData)
+    (typeof FormData !== 'undefined' && body instanceof FormData) ||
+    (typeof URLSearchParams !== 'undefined' && body instanceof URLSearchParams) ||
+    (typeof ReadableStream !== 'undefined' && body instanceof ReadableStream)
   ) {
     // Pass through opaque payloads unchanged — caller owns Content-Type.
-    return body as unknown as string;
+    return body as BodyInit;
   }
   if (typeof body === 'object') {
     if (!Object.keys(headers).some((k) => k.toLowerCase() === 'content-type')) {
@@ -207,7 +209,7 @@ export function createHttpGlobal(deps: HttpGlobalDeps): HttpGlobal {
       }
       const body = serializeBody(opts.body, headers);
       const init: RequestInit = { method, headers };
-      if (body !== undefined) init.body = body as BodyInit;
+      if (body !== undefined) init.body = body;
 
       let lastResponse: Response | null = null;
       for (let attempt = 0; attempt < maxAttempts; attempt++) {

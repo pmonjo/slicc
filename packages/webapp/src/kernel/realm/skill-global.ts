@@ -58,12 +58,24 @@ function shellQuote(arg: string): string {
   return "'" + arg.replace(/'/g, "'\\''") + "'";
 }
 
+/**
+ * Join a directory and a child name without producing double slashes
+ * when `dir` is the filesystem root. `dir === ''` is the bare
+ * "no slash in argv" fallback and keeps the relative shape the
+ * pre-PR-786 code shipped.
+ */
+function joinChild(dir: string, name: string): string {
+  if (dir === '') return name;
+  if (dir === '/') return `/${name}`;
+  return `${dir}/${name}`;
+}
+
 export function createSkillGlobal(deps: SkillGlobalDeps): SkillGlobal {
   const scriptPath = deps.argv[1] ?? '';
   const dir = dirname(scriptPath);
-  const refs = dir ? `${dir}/references` : 'references';
-  const assets = dir ? `${dir}/assets` : 'assets';
-  const configPath = dir ? `${dir}/.config` : '.config';
+  const refs = joinChild(dir, 'references');
+  const assets = joinChild(dir, 'assets');
+  const configPath = joinChild(dir, '.config');
 
   async function readConfig(): Promise<Record<string, unknown> | null> {
     let exists: boolean;

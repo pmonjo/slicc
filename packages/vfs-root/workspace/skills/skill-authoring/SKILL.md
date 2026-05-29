@@ -84,7 +84,7 @@ Rules of thumb:
 
 ### `.jsh` — JavaScript shell scripts
 
-`.jsh` files are auto-discovered as shell commands anywhere on the VFS. **Full reference: `docs/shell-reference.md` (sections "Globals API" and "Proposed jsh runtime extensions").**
+`.jsh` files are auto-discovered as shell commands anywhere on the VFS. **Full reference: `docs/shell-reference.md` (sections "Globals API" and "jsh runtime extensions").**
 
 - **Auto-discovery**: registered as callable commands by filename (without the extension). A skill can ship its own commands by including a `.jsh` next to `SKILL.md`. Priority root `/workspace/skills/` wins on basename collisions.
 - **Dual-mode**: works in both the CLI server and the Chrome extension (sandbox iframe). Don't rely on CLI-only Node modules.
@@ -101,16 +101,16 @@ Rules of thumb:
 | `fetch`      | Standard `fetch` routed through SLICC's proxied transport (cookies + CORS handled).                                                                |
 | `require(p)` | Pull npm packages from esm.sh (version-pinnable: `require('lodash@4')`). Cached per session.                                                       |
 
-#### Proposed runtime extensions (spec'd — check `commands` before reimplementing)
+#### Runtime extensions (live — prefer these over hand-rolled equivalents)
 
-If you find yourself writing one of these patterns, **stop and check whether the runtime now provides it** — the surface below was extracted from cross-skill duplication and may already be live (test with `node -e "console.log(typeof process.argv.parseFlags, typeof browser)"`):
+The globals below ship in the jsh realm. Full reference: `docs/shell-reference.md` ("jsh runtime extensions"). Use them instead of reimplementing the cross-skill patterns they replace.
 
 - **`process.argv.parseFlags()`** — returns `{ positional, flags, subcommand }`. Replaces the per-skill `--flag=val` / `--flag val` parsing loop.
 - **`browser.*`** — `findTab({ domain | urlMatch })`, `ensureTab(url)`, `eval(tab, fn)`, `evalAsync(tab, fn)`, `cookie(tab, name)`, `localStorage(tab, key)`. Replaces shelling out to `playwright-cli tab-list` and regex-parsing its output.
 - **`browser.fetch(tab, url, opts)`** — page-context fetch (runs inside the tab's origin, so cookies + same-origin headers are automatic). Replaces the `eval-file` temp-file + double-JSON-unwrap dance.
 - **`browser.websocket.on(tab, …).filter({…}).forward({ sink })`** — declarative WebSocket observer with a closed sink set (`webhook` / `scoop` / `vfs` / `log`). **Required** for any new WS-watch use case; do not author page-context `WebSocket.prototype` patches in skill code.
-
-When the runtime offers one of these, prefer it over hand-rolled equivalents — it's audited once and shorter in skill code.
+- **`http.client({ baseUrl, token, headers, retry })`** — `get`/`post`/`put`/`delete` with merged headers, lazy token resolution, and Retry-After-aware backoff for `retry.on` statuses.
+- **`skill.dir` / `skill.refs` / `skill.assets` / `skill.config()` / `skill.token(providerId)`** — replace the per-skill `process.argv[1]` dirname math, ad-hoc `.config` JSON readers, and bespoke `oauth-token` shell-outs.
 
 Ship a `.jsh` when the skill needs deterministic, parameterizable behavior the agent shouldn't have to re-derive each time (e.g. a `slicc-handoff` helper, a custom diff formatter, a domain-specific lint).
 

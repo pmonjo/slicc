@@ -62,15 +62,30 @@ describe('createSkillGlobal — path math', () => {
     expect(skill.assets).toBe('/workspace/skills/concur/assets');
   });
 
-  it('handles a script at the filesystem root', () => {
+  it('handles a script at the filesystem root without double slashes', () => {
     const skill = createSkillGlobal({
       argv: ['node', '/runme.jsh'],
       fs: makeFs(),
       exec: makeExec(() => ({ stdout: '', stderr: '', exitCode: 0 })),
     });
     expect(skill.dir).toBe('/');
-    expect(skill.refs).toBe('//references');
-    expect(skill.assets).toBe('//assets');
+    // Regression: previously produced `//references` / `//assets`
+    // because the helper concatenated `${dir}/...` unconditionally.
+    expect(skill.refs).toBe('/references');
+    expect(skill.assets).toBe('/assets');
+  });
+
+  it('reads/writes .config at the root without a doubled slash', async () => {
+    const fs = makeFs();
+    const skill = createSkillGlobal({
+      argv: ['node', '/runme.jsh'],
+      fs,
+      exec: makeExec(() => ({ stdout: '', stderr: '', exitCode: 0 })),
+    });
+    await skill.config({ apiBase: 'https://x' });
+    expect(fs.store.has('/.config')).toBe(true);
+    expect(fs.store.has('//.config')).toBe(false);
+    expect(await skill.config()).toEqual({ apiBase: 'https://x' });
   });
 
   it('falls back to empty dir when argv[1] has no slash', () => {

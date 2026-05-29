@@ -17,6 +17,7 @@
  */
 
 import { createLogger } from '../../core/logger.js';
+import { normalizePath } from '../../fs/path-utils.js';
 import type { WsObserveRequest, WsSelector, WsSubscriberInfo } from './realm-types.js';
 
 const log = createLogger('ws-subscribers');
@@ -36,11 +37,19 @@ export interface WsPageBridge {
     urlMatch: string | undefined,
     filter: WsSelector | undefined
   ): Promise<void>;
+  /**
+   * Update an existing selector. The `urlMatch` / `filter`
+   * arguments are tri-state: `undefined` means "leave unchanged",
+   * `null` means "explicitly clear", a value means "set". The
+   * page-side router needs the clear directive distinct from
+   * absence so it can `delete` the field rather than silently
+   * keep stale criteria.
+   */
   updateSelector(
     targetId: string,
     subId: string,
-    urlMatch: string | undefined,
-    filter: WsSelector | undefined
+    urlMatch: string | null | undefined,
+    filter: WsSelector | null | undefined
   ): Promise<void>;
   unregisterSelector(targetId: string, subId: string): Promise<void>;
   /** Forward router→host frame reports to a handler. Returns dispose. */
@@ -123,11 +132,16 @@ export class WsSubscriberRegistry {
   ): Promise<WsSubscriberInfo> {
     const sub = this.subs.get(id);
     if (!sub) throw new Error(`browser.websocket: subscriber not found: ${id}`);
-    const urlMatch = patch.urlMatch === null ? undefined : (patch.urlMatch ?? sub.urlMatch);
-    const filter = patch.filter === null ? undefined : (patch.filter ?? sub.filter);
-    await this.bridge.updateSelector(sub.targetId, id, urlMatch, filter);
-    sub.urlMatch = urlMatch;
-    sub.filter = filter;
+    // Forward the explicit `null` sentinel through so the page-side
+    // router knows to delete the field; `undefined` means "leave the
+    // current selector criterion in place".
+    const urlMatchUpdate: string | null | undefined = patch.urlMatch;
+    const filterUpdate: WsSelector | null | undefined = patch.filter;
+    await this.bridge.updateSelector(sub.targetId, id, urlMatchUpdate, filterUpdate);
+    if (patch.urlMatch === null) delete sub.urlMatch;
+    else if (patch.urlMatch !== undefined) sub.urlMatch = patch.urlMatch;
+    if (patch.filter === null) delete sub.filter;
+    else if (patch.filter !== undefined) sub.filter = patch.filter;
     return this.toInfo(sub);
   }
 
@@ -187,13 +201,24 @@ export class WsSubscriberRegistry {
           throw new Error('browser.websocket: scoop sink requires a scoopJid');
         }
         return;
-      case 'vfs':
+      case 'vfs': {
         if (typeof sink.path !== 'string' || !sink.path.startsWith('/workspace/')) {
           throw new Error(
             'browser.websocket: vfs sink path must be an absolute /workspace/... path'
           );
         }
+        // Re-normalize after the prefix check so traversal payloads
+        // like `/workspace/../etc/passwd` (which the VFS would later
+        // collapse to `/etc/passwd` at write time) are rejected at
+        // observe() time rather than silently escaping the sandbox.
+        const normalized = normalizePath(sink.path);
+        if (!normalized.startsWith('/workspace/') && normalized !== '/workspace') {
+          throw new Error(
+            `browser.websocket: vfs sink path escapes /workspace/ after normalization (got "${sink.path}" → "${normalized}")`
+          );
+        }
         return;
+      }
       case 'log':
         return;
       default:

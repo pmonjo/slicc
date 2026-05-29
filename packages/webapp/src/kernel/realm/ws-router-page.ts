@@ -44,9 +44,26 @@ export function installWsRouter(win: typeof globalThis): void {
     id: string;
     urlMatch?: string;
     filter?: Selector;
+    /**
+     * Cached compiled regex for `urlMatch`. `null` means the pattern
+     * failed to compile — silently skip the subscriber (preserves the
+     * pre-cache behavior). `undefined` means no `urlMatch` was set.
+     * Recomputed only on register/update so chatty sockets don't pay
+     * a per-frame `new RegExp(...)`.
+     */
+    _urlMatchRe?: RegExp | null;
   }
 
   const subs = new Map<string, Subscriber>();
+
+  function compileUrlMatch(pattern: string | undefined): RegExp | null | undefined {
+    if (pattern === undefined) return undefined;
+    try {
+      return new RegExp(pattern);
+    } catch {
+      return null;
+    }
+  }
 
   function isPlainObject(v: unknown): v is Record<string, unknown> {
     return typeof v === 'object' && v !== null && !Array.isArray(v);
@@ -91,12 +108,12 @@ export function installWsRouter(win: typeof globalThis): void {
   function dispatchFrame(url: string, raw: string): void {
     if (subs.size === 0) return;
     for (const sub of subs.values()) {
-      if (sub.urlMatch) {
-        try {
-          if (!new RegExp(sub.urlMatch).test(url)) continue;
-        } catch {
-          continue;
-        }
+      if (sub.urlMatch !== undefined) {
+        const re = sub._urlMatchRe;
+        // `null` = pattern failed to compile at register time; skip
+        // this subscriber rather than re-attempting per frame.
+        if (re === null) continue;
+        if (re && !re.test(url)) continue;
       }
       const body = parseFrame(raw, sub.filter?.parseAs);
       if (body === undefined) continue;
@@ -132,12 +149,43 @@ export function installWsRouter(win: typeof globalThis): void {
 
   const router = {
     register(sub: Subscriber): void {
-      subs.set(sub.id, sub);
+      subs.set(sub.id, { ...sub, _urlMatchRe: compileUrlMatch(sub.urlMatch) });
     },
-    update(id: string, sub: Partial<Subscriber>): void {
+    /**
+     * Update an existing subscriber. The patch is tri-state per
+     * field — an explicit `null` clears the field (the host bridge
+     * forwards `sub.update({ filter: null })` as a `null`), absence
+     * leaves it unchanged, and a value sets it. Without the null
+     * branch the router would silently keep the old criterion and
+     * continue matching with stale filter/urlMatch.
+     */
+    update(
+      id: string,
+      patch: {
+        urlMatch?: string | null;
+        filter?: Selector | null;
+      }
+    ): void {
       const cur = subs.get(id);
       if (!cur) return;
-      subs.set(id, { ...cur, ...sub, id });
+      const next: Subscriber = { ...cur, id };
+      if (Object.prototype.hasOwnProperty.call(patch, 'urlMatch')) {
+        if (patch.urlMatch === null) {
+          delete next.urlMatch;
+          next._urlMatchRe = undefined;
+        } else if (typeof patch.urlMatch === 'string') {
+          next.urlMatch = patch.urlMatch;
+          next._urlMatchRe = compileUrlMatch(patch.urlMatch);
+        }
+      }
+      if (Object.prototype.hasOwnProperty.call(patch, 'filter')) {
+        if (patch.filter === null) {
+          delete next.filter;
+        } else if (patch.filter !== undefined) {
+          next.filter = patch.filter;
+        }
+      }
+      subs.set(id, next);
     },
     unregister(id: string): void {
       subs.delete(id);

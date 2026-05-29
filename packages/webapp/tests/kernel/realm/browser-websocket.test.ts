@@ -68,9 +68,19 @@ function makeFakeWindow(): {
   return { win, WebSocketCtor: FakeWebSocket as unknown as typeof WebSocket, reports };
 }
 
+interface BridgeUpdateCall {
+  targetId: string;
+  subId: string;
+  // Tri-state per field. `undefined` = "key absent from patch" (leave
+  // unchanged); `null` = explicit clear directive; value = set.
+  urlMatch: string | null | undefined;
+  filter: WsSelector | null | undefined;
+}
+
 function makeBridge(): WsPageBridge & {
   installed: string[];
   registered: Array<{ targetId: string; subId: string; urlMatch?: string; filter?: WsSelector }>;
+  updates: BridgeUpdateCall[];
   unregistered: Array<{ targetId: string; subId: string }>;
   emit: (subId: string, payload: unknown) => void;
 } {
@@ -82,10 +92,12 @@ function makeBridge(): WsPageBridge & {
     urlMatch?: string;
     filter?: WsSelector;
   }> = [];
+  const updates: BridgeUpdateCall[] = [];
   const unregistered: Array<{ targetId: string; subId: string }> = [];
   return {
     installed,
     registered,
+    updates,
     unregistered,
     async installRouter(targetId) {
       installed.push(targetId);
@@ -100,12 +112,17 @@ function makeBridge(): WsPageBridge & {
       registered.push(entry);
     },
     async updateSelector(targetId, subId, urlMatch, filter) {
+      // Mirror the production bridge: record the tri-state values
+      // verbatim so tests can assert on explicit clears (`null`) vs
+      // omissions (`undefined`). Also push a `registered`-shaped
+      // entry for the existing "last entry reflects the patch" test.
+      updates.push({ targetId, subId, urlMatch, filter });
       const entry: { targetId: string; subId: string; urlMatch?: string; filter?: WsSelector } = {
         targetId,
         subId,
       };
-      if (urlMatch !== undefined) entry.urlMatch = urlMatch;
-      if (filter !== undefined) entry.filter = filter;
+      if (urlMatch != null) entry.urlMatch = urlMatch;
+      if (filter != null) entry.filter = filter;
       registered.push(entry);
     },
     async unregisterSelector(targetId, subId) {
@@ -308,6 +325,42 @@ describe('WsSubscriberRegistry: sink resolution', () => {
     ).rejects.toThrow(/workspace/);
   });
 
+  // Regression: PR #786 review (Copilot — path traversal bypass).
+  // The pre-fix check was `sink.path.startsWith('/workspace/')`,
+  // which accepted traversal payloads that the VFS would later
+  // collapse outside `/workspace/` at write time.
+  for (const traversal of [
+    '/workspace/../etc/passwd',
+    '/workspace/foo/../../etc/passwd',
+    '/workspace/./../../tmp/x',
+  ]) {
+    it(`rejects vfs sink traversal payload ${JSON.stringify(traversal)}`, async () => {
+      const bridge = makeBridge();
+      const reg = new WsSubscriberRegistry({
+        bridge,
+        webhooks: makeWebhooks([]),
+        dispatcher: makeDispatcher(),
+      });
+      await expect(
+        reg.observe({ targetId: 't1', forward: { sink: 'vfs', path: traversal } })
+      ).rejects.toThrow(/workspace|escapes/);
+    });
+  }
+
+  it('accepts a benign vfs sink under /workspace/', async () => {
+    const bridge = makeBridge();
+    const reg = new WsSubscriberRegistry({
+      bridge,
+      webhooks: makeWebhooks([]),
+      dispatcher: makeDispatcher(),
+    });
+    const info = await reg.observe({
+      targetId: 't1',
+      forward: { sink: 'vfs', path: '/workspace/logs/ws.jsonl' },
+    });
+    expect(info.id).toMatch(/^wssub-/);
+  });
+
   it('rejects an unknown sink string', async () => {
     const bridge = makeBridge();
     const reg = new WsSubscriberRegistry({
@@ -341,6 +394,76 @@ describe('WsSubscriberRegistry: lifecycle', () => {
     const last = bridge.registered.at(-1);
     expect(last?.subId).toBe(info.id);
     expect(last?.filter).toEqual({ where: { channel: 'C-new' } });
+  });
+
+  // Regression: PR #786 review (Codex P2 — send explicit clears to
+  // the page router). `sub.update({ filter: null })` must propagate
+  // the explicit `null` to the bridge so the in-page router can
+  // `delete` the field rather than silently keeping the stale criterion.
+  it('update({ filter: null }) forwards an explicit clear to the bridge', async () => {
+    const bridge = makeBridge();
+    const reg = new WsSubscriberRegistry({
+      bridge,
+      webhooks: makeWebhooks(['wh-1']),
+      dispatcher: makeDispatcher(),
+    });
+    const info = await reg.observe({
+      targetId: 't1',
+      urlMatch: 'wss://example/',
+      filter: { where: { channel: 'C-old' } },
+      forward: { sink: 'webhook', webhookId: 'wh-1' },
+    });
+    await reg.update(info.id, { filter: null });
+    const last = bridge.updates.at(-1);
+    expect(last?.subId).toBe(info.id);
+    // Explicit null = clear directive forwarded.
+    expect(last?.filter).toBeNull();
+    // `urlMatch` was untouched in the patch — must remain absent
+    // (omission) rather than being clobbered with the previous value.
+    expect(last?.urlMatch).toBeUndefined();
+    // Local record reflects the clear.
+    expect(reg.list()[0]?.filter).toBeUndefined();
+    expect(reg.list()[0]?.urlMatch).toBe('wss://example/');
+  });
+
+  it('update({ urlMatch: null }) forwards an explicit clear to the bridge', async () => {
+    const bridge = makeBridge();
+    const reg = new WsSubscriberRegistry({
+      bridge,
+      webhooks: makeWebhooks(['wh-1']),
+      dispatcher: makeDispatcher(),
+    });
+    const info = await reg.observe({
+      targetId: 't1',
+      urlMatch: 'wss://example/',
+      forward: { sink: 'webhook', webhookId: 'wh-1' },
+    });
+    await reg.update(info.id, { urlMatch: null });
+    const last = bridge.updates.at(-1);
+    expect(last?.urlMatch).toBeNull();
+    expect(last?.filter).toBeUndefined();
+    expect(reg.list()[0]?.urlMatch).toBeUndefined();
+  });
+
+  it('update({}) leaves both fields untouched (omission, not clear)', async () => {
+    const bridge = makeBridge();
+    const reg = new WsSubscriberRegistry({
+      bridge,
+      webhooks: makeWebhooks(['wh-1']),
+      dispatcher: makeDispatcher(),
+    });
+    const info = await reg.observe({
+      targetId: 't1',
+      urlMatch: 'wss://example/',
+      filter: { where: { channel: 'C' } },
+      forward: { sink: 'webhook', webhookId: 'wh-1' },
+    });
+    await reg.update(info.id, {});
+    const last = bridge.updates.at(-1);
+    expect(last?.urlMatch).toBeUndefined();
+    expect(last?.filter).toBeUndefined();
+    expect(reg.list()[0]?.urlMatch).toBe('wss://example/');
+    expect(reg.list()[0]?.filter).toEqual({ where: { channel: 'C' } });
   });
 
   it('close() removes the subscriber and unregisters in-page', async () => {

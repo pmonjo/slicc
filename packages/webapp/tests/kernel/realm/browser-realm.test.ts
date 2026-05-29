@@ -331,6 +331,52 @@ describe('realm RPC: browser channel — eval / evalAsync', () => {
     dispose();
   });
 
+  // Regression: PR #786 review (Codex P2 — preserve strings that look
+  // like JSON primitives). `localStorage`/DOM-attribute values that
+  // happen to be numeric / boolean / null strings must keep their
+  // string type — pre-fix the heuristic JSON-parsed them silently.
+  for (const literal of ['123', '-1.5', 'true', 'false', 'null']) {
+    it(`preserves the string ${JSON.stringify(literal)} as-is`, async () => {
+      const expr = `(() => ${JSON.stringify(literal)})()`;
+      const state = makeBrowserState({
+        pages: [{ targetId: 't1', url: 'https://x/', title: 'x' }],
+        evalResults: new Map([[expr, literal]]),
+      });
+      const { client, dispose } = setup(state);
+      const out = await client.call('browser', 'eval', ['t1', expr]);
+      expect(out).toBe(literal);
+      dispose();
+    });
+  }
+
+  it('unwraps a single intentional JSON.stringify of a string to the inner string', async () => {
+    // `JSON.stringify("hello")` → `"\"hello\""`. The first parse
+    // yields the inner string `hello`. Since that inner string is
+    // not a stringified object/array, we return it as-is rather
+    // than attempting a second parse — matching the documented
+    // contract ("\"hello\"" → "hello").
+    const expr = '(() => JSON.stringify("hello"))()';
+    const state = makeBrowserState({
+      pages: [{ targetId: 't1', url: 'https://x/', title: 'x' }],
+      evalResults: new Map([[expr, JSON.stringify('hello')]]),
+    });
+    const { client, dispose } = setup(state);
+    const out = await client.call('browser', 'eval', ['t1', expr]);
+    expect(out).toBe('hello');
+    dispose();
+  });
+
+  it('returns non-string CDP values unchanged (no JSON ceremony)', async () => {
+    const state = makeBrowserState({
+      pages: [{ targetId: 't1', url: 'https://x/', title: 'x' }],
+      evalResults: new Map<string, unknown>([['(() => 42)()', 42]]),
+    });
+    const { client, dispose } = setup(state);
+    const out = await client.call('browser', 'eval', ['t1', '(() => 42)()']);
+    expect(out).toBe(42);
+    dispose();
+  });
+
   it('evalAsync awaits the promise and unwraps the resolved value', async () => {
     // Same RPC path as eval — the host passes awaitPromise=true to
     // CDP, but the mock browser doesn't distinguish since CDP would

@@ -513,29 +513,51 @@ async function evalInTab(
  * `playwright eval-file` scripts is to `JSON.stringify` the final
  * value so the shell can pipe it cleanly. That puts one or two
  * layers of JSON encoding between the user's value and the realm
- * caller. We peel both transparently so realm code sees the value
- * directly, no `JSON.parse(JSON.parse(...))` ceremony.
+ * caller. We peel only the layers we can prove are wrappers:
+ *
+ *  - If the first parse yields an object/array, the original
+ *    string can only have been `JSON.stringify(obj)` — return it.
+ *  - If the first parse yields a string AND that inner string
+ *    itself starts with `{` or `[`, the original was a double
+ *    `JSON.stringify` — peel one more layer.
+ *  - Otherwise (primitive parses such as `"123"`, `"true"`,
+ *    `"null"`, `"-1.5"`, or a `JSON.stringify("hello")` →
+ *    `"\"hello\""` round-trip), leave the original string alone or
+ *    return the single-unwrapped inner string. Primitives that the
+ *    page returned as strings must keep their string type — losing
+ *    that distinction would silently turn `localStorage.getItem`
+ *    values into numbers/booleans.
  */
 function unwrapEvalResult(value: unknown): unknown {
   if (typeof value !== 'string') return value;
   const first = tryParseJson(value);
   if (first === undefined) return value;
+  if (first !== null && typeof first === 'object') return first;
   if (typeof first === 'string') {
-    const second = tryParseJson(first);
-    return second === undefined ? first : second;
+    // First layer was a stringified string. Only unwrap a second
+    // time when the inner string is itself a stringified
+    // object/array — that's the only shape we can be sure was a
+    // double wrap rather than a deliberate single `JSON.stringify`
+    // of a plain string.
+    const trimmed = first.trim();
+    if (trimmed.length > 0 && (trimmed[0] === '{' || trimmed[0] === '[')) {
+      const second = tryParseJson(first);
+      if (second !== null && typeof second === 'object') return second;
+    }
+    return first;
   }
-  return first;
+  // Primitive (number / boolean / null) — keep the caller's original
+  // string so a page value of `"123"` doesn't become `123`.
+  return value;
 }
 
 function tryParseJson(text: string): unknown {
   const trimmed = text.trim();
   // Cheap heuristic gate: only parse strings that look like a JSON
-  // literal. Avoids accidentally turning `"42"` (a stringified
-  // number a user explicitly wanted as a string) into 42 — every
-  // bare `JSON.stringify(value)` for non-object values still starts
-  // with `"`/`[`/`{` or a digit/`-`/`true`/`false`/`null`. The trim
-  // is necessary because Runtime.evaluate sometimes returns the
-  // wrapped string with leading/trailing whitespace.
+  // literal. The check is intentionally permissive (we still need
+  // to recognize stringified objects, arrays, and strings) — the
+  // result-type discrimination in `unwrapEvalResult` is what
+  // protects primitive payloads from getting unwrapped.
   if (trimmed.length === 0) return undefined;
   const first = trimmed[0];
   const looksJson =

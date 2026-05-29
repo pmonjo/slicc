@@ -109,13 +109,20 @@ export class CdpWsPageBridge implements WsPageBridge {
   async updateSelector(
     targetId: string,
     subId: string,
-    urlMatch: string | undefined,
-    filter: WsSelector | undefined
+    urlMatch: string | null | undefined,
+    filter: WsSelector | null | undefined
   ): Promise<void> {
     await this.browser.withTab(targetId, async () => {
+      // Tri-state: `undefined` is omitted from the patch (router keeps
+      // the field), an explicit `null` is forwarded so the router can
+      // `delete` the field, and any value sets it. Without the explicit
+      // clear directive, `sub.update({ filter: null })` would leave the
+      // page-side router matching with stale criteria.
       const patch: Record<string, unknown> = {};
-      if (urlMatch !== undefined) patch['urlMatch'] = urlMatch;
-      if (filter !== undefined) patch['filter'] = filter;
+      if (urlMatch === null) patch['urlMatch'] = null;
+      else if (urlMatch !== undefined) patch['urlMatch'] = urlMatch;
+      if (filter === null) patch['filter'] = null;
+      else if (filter !== undefined) patch['filter'] = filter;
       const expr = `window.__sliccWsRouter && window.__sliccWsRouter.update(${JSON.stringify(subId)}, ${JSON.stringify(patch)})`;
       await this.browser.sendCDP('Runtime.evaluate', { expression: expr, returnByValue: true });
     });

@@ -386,9 +386,9 @@ module.exports: {}        // Available for ES module pattern
 exports: module.exports   // Alias
 ```
 
-### Proposed jsh runtime extensions
+### jsh runtime extensions
 
-The following globals are **spec'd but not yet implemented** — they were extracted from cross-skill duplication analysis (see the workspace spec at `analyze-skills`). Skills MAY reference them in design discussions and SHOULD prefer them over hand-rolled equivalents once shipped. When in doubt, run `commands` or check whether the global resolves at runtime before reimplementing.
+The following globals were added in PR #786 and are available in the jsh realm in both standalone and extension floats. They were extracted from cross-skill duplication analysis (see the workspace spec at `analyze-skills`); skills SHOULD prefer them over hand-rolled equivalents. Test availability with `node -e "console.log(typeof process.argv.parseFlags, typeof browser, typeof http, typeof skill)"`.
 
 #### `process.argv.parseFlags()`
 
@@ -468,36 +468,6 @@ await browser.websocket.list();
 - Subscribers owned by a scoop are auto-closed when the scoop is dropped
   (`Orchestrator.unregisterScoop` → `WsSubscriberRegistry.dropForScoop`).
 
-#### `browser.fetch(tab, url, opts)`
-
-Replaces the eval-file + base64 + double-JSON-unwrap pattern in ~9 skills (slack, linkedin, concur, suno, fluffyjaws, servicenow, apple-music, oryx, outlook).
-
-```typescript
-browser.fetch(tab: TabHandle, url: string, opts?: {
-  method?: 'GET' | 'POST' | 'PUT' | 'DELETE' | ...;
-  headers?: Record<string, string>;
-  body?: unknown;                  // object → JSON-stringified
-  credentials?: 'include' | 'omit'; // defaults to 'include'
-}): Promise<{ ok: boolean; status: number; headers: Record<string, string>; body: unknown }>
-```
-
-Runs inside the tab's origin, so session cookies and same-origin headers are automatic. Response body is JSON-parsed when content-type permits.
-
-#### `browser.websocket` — declarative WebSocket observer
-
-Replaces the `WebSocket.prototype.send` prototype patch + page-context `onmessage` reader + `fetch(arbitraryUrl, …)` exfil pattern flagged by security review in `slack.jsh`.
-
-```typescript
-browser.websocket
-  .on(tab, opts: { urlMatch: RegExp | string }): Subscription
-  .filter(opts: { parseAs: 'json' | 'text'; where: Record<string, unknown> }): Subscription
-  .forward(opts: { sink: 'webhook' | 'scoop' | 'vfs' | 'log'; webhookId?: string; scoopName?: string; path?: string }): Promise<Subscriber>
-
-browser.websocket.list(): Promise<Subscriber[]>
-subscriber.update(opts): Promise<void>
-subscriber.close(): Promise<void>
-```
-
 **Sink set is a closed enum.** Skills cannot supply an arbitrary URL — the page-side router (runtime-owned, audited once) only knows how to forward matched frames to: a registered `webhook` ID, an in-process `scoop`, an allowlisted VFS `path`, or `log`. There is no way for skill code to monkey-patch `WebSocket.prototype` or author the page-context router.
 
 ```javascript
@@ -513,7 +483,20 @@ const sub = await browser.websocket
   .forward({ sink: 'webhook', webhookId: 'slack-watch-abc123' });
 ```
 
-Scope: read-only. Outbound frame interception (modifying `send`) is intentionally out of scope and would be a separate, more heavily gated API.
+#### `browser.fetch(tab, url, opts)`
+
+Replaces the eval-file + base64 + double-JSON-unwrap pattern in ~9 skills (slack, linkedin, concur, suno, fluffyjaws, servicenow, apple-music, oryx, outlook).
+
+```typescript
+browser.fetch(tab: TabHandle, url: string, opts?: {
+  method?: 'GET' | 'POST' | 'PUT' | 'DELETE' | ...;
+  headers?: Record<string, string>;
+  body?: unknown;                  // object → JSON-stringified
+  credentials?: 'include' | 'omit'; // defaults to 'include'
+}): Promise<{ ok: boolean; status: number; headers: Record<string, string>; body: unknown }>
+```
+
+Runs inside the tab's origin, so session cookies and same-origin headers are automatic. Response body is JSON-parsed when content-type permits.
 
 ### Example .jsh Script
 
