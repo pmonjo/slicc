@@ -2092,4 +2092,64 @@ describe('LeaderSyncManager', () => {
       expect(onSprinkleLick).toHaveBeenCalledTimes(2);
     });
   });
+
+  describe('inbound generic lick', () => {
+    it('stamps origin from the connection and calls onForwardedLick', () => {
+      const onForwardedLick = vi.fn();
+      const { manager } = createManager({ onForwardedLick });
+      const channel = new FakeChannel();
+      manager.addFollower('b1', channel, { runtime: 'slicc-extension-offscreen' });
+
+      channel.simulateMessage({
+        type: 'lick',
+        event: { type: 'navigate', navigateUrl: 'https://x', timestamp: 't', body: { v: 1 } },
+      });
+
+      expect(onForwardedLick).toHaveBeenCalledTimes(1);
+      const [event, bootstrapId] = onForwardedLick.mock.calls[0];
+      expect(bootstrapId).toBe('b1');
+      expect(event).toMatchObject({
+        type: 'navigate',
+        originFollowerId: 'b1',
+        originLabel: 'extension follower',
+      });
+    });
+
+    it('rejects a non-forwardable lick type', () => {
+      const onForwardedLick = vi.fn();
+      const { manager } = createManager({ onForwardedLick });
+      const channel = new FakeChannel();
+      manager.addFollower('b1', channel, { runtime: 'slicc-extension-offscreen' });
+
+      channel.simulateMessage({
+        type: 'lick',
+        event: { type: 'webhook', timestamp: 't', body: {} },
+      } as unknown as FollowerToLeaderMessage);
+
+      expect(onForwardedLick).not.toHaveBeenCalled();
+    });
+
+    it('scrubs follower-sent origin fields before stamping', () => {
+      const onForwardedLick = vi.fn();
+      const { manager } = createManager({ onForwardedLick });
+      const channel = new FakeChannel();
+      manager.addFollower('b1', channel, { runtime: 'slicc-extension-offscreen' });
+
+      channel.simulateMessage({
+        type: 'lick',
+        event: {
+          type: 'navigate',
+          navigateUrl: 'https://x',
+          timestamp: 't',
+          body: {},
+          originFollowerId: 'SPOOFED',
+          originLabel: 'SPOOFED',
+        },
+      } as unknown as FollowerToLeaderMessage);
+
+      const [event] = onForwardedLick.mock.calls[0];
+      expect(event.originFollowerId).toBe('b1');
+      expect(event.originLabel).toBe('extension follower');
+    });
+  });
 });

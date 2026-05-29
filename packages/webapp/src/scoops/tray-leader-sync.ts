@@ -30,6 +30,7 @@ import type { BrowserAPI } from '../cdp/browser-api.js';
 import { RemoteCDPTransport, type RemoteCDPSender } from '../cdp/remote-cdp-transport.js';
 import { DataChannelKeepalive } from './data-channel-keepalive.js';
 import { createLogger } from '../core/logger.js';
+import { FORWARDABLE_TO_LEADER, type LickEvent } from './lick-manager.js';
 
 const log = createLogger('tray-leader-sync');
 
@@ -48,6 +49,13 @@ export interface LeaderSyncManagerOptions {
   readSprinkleContent?: (sprinkleName: string) => Promise<string | null> | string | null;
   /** Forward a sprinkle lick (from a follower's open or inline sprinkle) to the leader's lick router. */
   onSprinkleLick?: (sprinkleName: string, body: unknown, targetScoop?: string) => void;
+  /**
+   * Handle a generic lick (e.g. `navigate`) forwarded by a follower.
+   * The event arrives already validated, scrubbed, and stamped with
+   * `originFollowerId`/`originLabel`. Adapters route it into the
+   * leader's `lickManager.emitEvent`.
+   */
+  onForwardedLick?: (event: LickEvent, originBootstrapId: string) => void;
   /** Handle a user message arriving from a follower. */
   onFollowerMessage: (text: string, messageId: string, attachments?: MessageAttachment[]) => void;
   /** Handle an abort request from a follower. */
@@ -632,6 +640,33 @@ export class LeaderSyncManager {
           });
         }
         break;
+      case 'lick': {
+        const incoming = message.event;
+        if (!FORWARDABLE_TO_LEADER.has(incoming.type)) {
+          log.warn('Rejecting non-forwardable lick from follower', {
+            bootstrapId,
+            type: incoming.type,
+          });
+          break;
+        }
+        const follower = this.followers.get(bootstrapId);
+        // Strip any follower-sent origin fields — the leader is the sole
+        // authority on origin.
+        const { originFollowerId: _o1, originLabel: _o2, ...rest } = incoming;
+        const stamped: LickEvent = {
+          ...rest,
+          originFollowerId: bootstrapId,
+          originLabel: labelForFollower(follower?.floatType ?? 'unknown', follower?.runtime),
+        };
+        try {
+          this.options.onForwardedLick?.(stamped, bootstrapId);
+        } catch (err) {
+          log.warn('onForwardedLick handler threw', {
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
+        break;
+      }
       case 'targets.advertise': {
         log.info('Follower targets advertised', {
           bootstrapId,
