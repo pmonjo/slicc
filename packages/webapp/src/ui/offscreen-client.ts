@@ -34,6 +34,7 @@ import { setFollowerTrayRuntimeStatus } from '../scoops/tray-follower-status.js'
 import type { KernelClientFacade, KernelTransport } from '../kernel/types.js';
 import { createPanelChromeRuntimeTransport } from '../kernel/transport-chrome-runtime.js';
 import type { TerminalEventMsg } from '../shell/terminal-protocol.js';
+import type { LickEvent } from '../scoops/lick-manager.js';
 
 const log = createLogger('offscreen-client');
 
@@ -369,6 +370,7 @@ export class OffscreenClient implements KernelClientFacade {
   // -------------------------------------------------------------------------
 
   private sprinkleOpHandler: ((payload: unknown) => void) | null = null;
+  private forwardLickHandler: ((event: LickEvent) => void) | null = null;
 
   /** Send a sprinkle lick event to the offscreen orchestrator. */
   sendSprinkleLick(sprinkleName: string, body: unknown, targetScoop?: string): void {
@@ -394,6 +396,21 @@ export class OffscreenClient implements KernelClientFacade {
       headers,
       body,
     } as PanelToOffscreenMessage);
+  }
+
+  /** Standalone follower: tell the worker to forward (or stop forwarding) licks. */
+  sendSetFollowerForwarding(enabled: boolean): void {
+    this.send({ type: 'set-follower-forwarding', enabled } as PanelToOffscreenMessage);
+  }
+
+  /** Standalone leader: inject a follower-forwarded lick into the worker's LickManager. */
+  sendForwardedLick(event: LickEvent): void {
+    this.send({ type: 'inject-forwarded-lick', event } as PanelToOffscreenMessage);
+  }
+
+  /** Register the page-side handler the worker's forward-lick messages dispatch into. */
+  setForwardLickHandler(handler: ((event: LickEvent) => void) | null): void {
+    this.forwardLickHandler = handler;
   }
 
   /** Register a handler for sprinkle-op messages from the offscreen proxy. */
@@ -491,6 +508,10 @@ export class OffscreenClient implements KernelClientFacade {
         applyTrayRuntimeStatusSnapshot(m.leader, m.follower);
         break;
       }
+
+      case 'forward-lick':
+        this.forwardLickHandler?.(msg.event as unknown as LickEvent);
+        break;
 
       // Terminal session events route to subscribers registered via
       // `onTerminalEvent`. Not chat-related, so they don't go through
