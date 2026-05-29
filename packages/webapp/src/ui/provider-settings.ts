@@ -839,7 +839,7 @@ export async function saveOAuthAccount(opts: {
           await saveAccountsAsync(accounts);
         }
       }
-    } else {
+    } else if (!(globalThis as Record<string, unknown>).__slicc_connect_mode) {
       const r = await fetch('/api/secrets/oauth-update', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },

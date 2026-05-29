@@ -3364,6 +3364,15 @@ async function main(): Promise<void> {
   const isExtension = typeof chrome !== 'undefined' && !!chrome?.runtime?.id;
   const runtimeMode = resolveUiRuntimeMode(window.location.href, isExtension);
 
+  // Connect mode (?connect=1): slim provider-login + accounts + model-picker UI.
+  // Used by /cloud dashboard for shared localStorage account provisioning.
+  if (runtimeMode === 'connect') {
+    (globalThis as Record<string, unknown>).__slicc_connect_mode = true;
+    const { mountConnectSurface } = await import('./connect-surface.js');
+    await mountConnectSurface(app);
+    return;
+  }
+
   // Detached extension tab (?detached=1): standalone-density Layout with
   // the offscreen agent. See docs/superpowers/specs/2026-05-13-extension-detached-popout-design.md
   if (runtimeMode === 'extension-detached') {
