@@ -45,6 +45,7 @@ import { buildTrayLaunchUrl } from '../scoops/tray-runtime-config.js';
 import { getLeaderTrayRuntimeStatus, type LeaderTrayRuntimeStatus } from '../scoops/tray-leader.js';
 import { createLogger } from '../core/logger.js';
 import { ThrottledErrorTracker } from '../scoops/throttled-error-tracker.js';
+import type { LickEvent } from '../scoops/lick-manager.js';
 
 const log = createLogger('page-leader-tray');
 
@@ -77,6 +78,7 @@ export interface StartPageLeaderTrayOptions {
   getSprinkles?: () => SprinkleSummary[];
   readSprinkleContent?: LeaderSyncManagerOptions['readSprinkleContent'];
   onSprinkleLick?: LeaderSyncManagerOptions['onSprinkleLick'];
+  onForwardedLick?: (event: LickEvent, originBootstrapId: string) => void;
   onFollowerMessage: LeaderSyncManagerOptions['onFollowerMessage'];
   onFollowerAbort: LeaderSyncManagerOptions['onFollowerAbort'];
   onFollowerCountChanged?: LeaderSyncManagerOptions['onFollowerCountChanged'];
@@ -162,6 +164,7 @@ export function startPageLeaderTray(options: StartPageLeaderTrayOptions): PageLe
     getSprinkles: options.getSprinkles,
     readSprinkleContent: options.readSprinkleContent,
     onSprinkleLick: options.onSprinkleLick,
+    onForwardedLick: options.onForwardedLick,
     onFollowerMessage: options.onFollowerMessage,
     onFollowerAbort: options.onFollowerAbort,
     onFollowerCountChanged: options.onFollowerCountChanged,

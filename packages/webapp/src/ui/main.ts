@@ -2584,6 +2584,7 @@ async function mainStandaloneWorker(app: HTMLElement, runtimeMode: UiRuntimeMode
     },
     onSprinkleLick: (sprinkleName: string, body: unknown, targetScoop?: string) =>
       client.sendSprinkleLick(sprinkleName, body, targetScoop),
+    onForwardedLick: (event) => client.sendForwardedLick(event),
     onFollowerMessage: (text, messageId, attachments) => {
       layout.panels.chat.addUserMessage(text, attachments);
       agentHandle.sendMessage(text, messageId, attachments);
