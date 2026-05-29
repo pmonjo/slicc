@@ -9,6 +9,7 @@ import {
   sendSnapshot,
   reassembleSnapshot,
   isCherrySliccEventMessage,
+  isCherryHostEventMessage,
   CDP_CHUNK_THRESHOLD,
   type LeaderToFollowerMessage,
   type FollowerToLeaderMessage,
@@ -745,6 +746,18 @@ describe('tray-sync-protocol', () => {
         })
       ).toBe(true);
       expect(isCherrySliccEventMessage({ type: 'cdp.request' })).toBe(false);
+    });
+
+    it('isCherryHostEventMessage narrows the union', () => {
+      expect(
+        isCherryHostEventMessage({
+          type: 'cherry.host_event',
+          targetId: 't1',
+          name: 'checkout',
+          detail: {},
+        })
+      ).toBe(true);
+      expect(isCherryHostEventMessage({ type: 'cherry.slicc_event' })).toBe(false);
     });
   });
 });
