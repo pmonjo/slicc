@@ -96,16 +96,28 @@ export function isCherryTarget(t: Pick<RemoteTargetInfo, 'kind'>): boolean {
 
 /**
  * Filter a list of advertised targets down to those eligible for a teleport.
- * Real browser targets always qualify. Cherry host pages are excluded when the
- * teleport needs `Network.*` CDP (`requireNetwork: true`) because a cooperative
- * host page does not serve the network domain; otherwise they are kept.
+ * Real browser targets always qualify. A cherry host page is included for a
+ * network-requiring teleport (`requireNetwork: true`) only when it explicitly
+ * advertises `capabilities.network === true` — honoring the field the protocol
+ * doc on `RemoteTargetInfo.capabilities` says "gates whether the target may
+ * serve `Network.*` CDP for teleport-pool selection." When the teleport does
+ * not need network, cherry targets are always kept.
+ *
+ * NOTE: the teleport target-*selection* consumer lives in
+ * `shell/supplemental-commands/playwright-command.ts`. `getBestFollowerForTeleport`
+ * (and the broader teleport selection) must become cherry-aware — i.e. route
+ * through this helper — once cherry advertisement lands (Task 12/13). Today
+ * nothing advertises `kind: 'cherry'`, so this helper is intentionally not yet
+ * called from production.
  */
 export function selectTeleportPool<
   T extends Pick<RemoteTargetInfo, 'kind' | 'capabilities'> & { targetId: string },
 >(targets: T[], opts: { requireNetwork: boolean }): T[] {
   return targets.filter((t) => {
     if (!isCherryTarget(t)) return true;
-    if (opts.requireNetwork) return false;
+    // Cherry hosts drive a host-page realm over postMessage; they can only
+    // serve a network-requiring teleport if they explicitly advertise it.
+    if (opts.requireNetwork) return t.capabilities?.network === true;
     return true;
   });
 }
@@ -1152,6 +1164,11 @@ export class LeaderSyncManager {
    * browser target (or no registry entry yet) are allowed through unchanged.
    */
   private canRuntimeOpenTab(targetRuntimeId: string): boolean {
+    // `getEntries()` is a read that ALSO clears the registry's dirty flag.
+    // That is benign here: the registry mutation paths (`setTargets` via
+    // `targets.advertise` / `setLocalTargets`) broadcast in the same
+    // synchronous turn, before any `tab.open` can interleave — so a `tab.open`
+    // gating read can never swallow a not-yet-broadcast change.
     const entries = this.registry.getEntries().filter((e) => e.runtimeId === targetRuntimeId);
     if (entries.length === 0) return true;
     return entries.some((e) => !isCherryTarget(e));

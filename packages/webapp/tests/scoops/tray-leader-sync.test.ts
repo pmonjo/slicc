@@ -2080,6 +2080,150 @@ describe('LeaderSyncManager', () => {
       expect(onSprinkleLick).toHaveBeenCalledTimes(2);
     });
   });
+
+  // ---------------------------------------------------------------------------
+  // Cherry event routing + tab.open gating (leader side)
+  // ---------------------------------------------------------------------------
+
+  describe('cherry leader-side methods', () => {
+    it('routes cherry.host_event to lickManager.emitEvent as a cherry lick', () => {
+      const emitEvent = vi.fn();
+      const { manager } = createManager({ lickManager: { emitEvent } });
+      const channel = new FakeChannel();
+      manager.addFollower('b1', channel);
+
+      // Advertise so the bootstrapId maps to a runtimeId.
+      channel.simulateMessage({
+        type: 'targets.advertise',
+        targets: [{ targetId: 'host1', title: 'Host', url: 'https://host.com' }],
+        runtimeId: 'follower-b1',
+      });
+
+      channel.simulateMessage({
+        type: 'cherry.host_event',
+        targetId: 'follower-b1:host1',
+        name: 'cart.updated',
+        detail: { items: 3 },
+      });
+
+      expect(emitEvent).toHaveBeenCalledTimes(1);
+      const evt = emitEvent.mock.calls[0][0] as Record<string, unknown>;
+      expect(evt.type).toBe('cherry');
+      expect(evt.cherryName).toBe('cart.updated');
+      expect(evt.body).toEqual({ items: 3 });
+      expect(evt.cherryRuntimeId).toBe('follower-b1');
+    });
+
+    it('drops cherry.host_event without throwing when no lickManager is wired', () => {
+      const { manager } = createManager(); // No lickManager.
+      const channel = new FakeChannel();
+      manager.addFollower('b1', channel);
+
+      expect(() =>
+        channel.simulateMessage({
+          type: 'cherry.host_event',
+          targetId: 'follower-b1:host1',
+          name: 'cart.updated',
+          detail: { items: 3 },
+        })
+      ).not.toThrow();
+    });
+
+    it('emitCherrySliccEvent returns false for an unknown/disconnected runtime', () => {
+      const { manager } = createManager();
+      const channel = new FakeChannel();
+      manager.addFollower('b1', channel);
+      // No targets.advertise → no runtimeToBootstrap mapping for 'ghost'.
+
+      expect(manager.emitCherrySliccEvent('ghost:host1', 'open', { x: 1 })).toBe(false);
+    });
+
+    it('emitCherrySliccEvent sends cherry.slicc_event over the owning follower channel', () => {
+      const { manager } = createManager();
+      const channel = new FakeChannel();
+      manager.addFollower('b1', channel);
+
+      channel.simulateMessage({
+        type: 'targets.advertise',
+        targets: [{ targetId: 'host1', title: 'Host', url: 'https://host.com' }],
+        runtimeId: 'follower-b1',
+      });
+      channel.sent.length = 0;
+
+      const ok = manager.emitCherrySliccEvent('follower-b1:host1', 'open', { x: 1 });
+      expect(ok).toBe(true);
+
+      const sent = channel.parseSent();
+      const evt = sent.find((m) => m.type === 'cherry.slicc_event');
+      expect(evt).toBeDefined();
+      if (evt && evt.type === 'cherry.slicc_event') {
+        expect(evt.targetId).toBe('follower-b1:host1');
+        expect(evt.name).toBe('open');
+        expect(evt.detail).toEqual({ x: 1 });
+      }
+    });
+
+    it('openRemoteTab refuses a runtime whose advertised targets are all cherry', async () => {
+      const { manager } = createManager();
+      const channel = new FakeChannel();
+      manager.addFollower('b1', channel);
+
+      channel.simulateMessage({
+        type: 'targets.advertise',
+        targets: [
+          {
+            targetId: 'host1',
+            title: 'Host',
+            url: 'https://host.com',
+            kind: 'cherry',
+            capabilities: { navigate: true, network: false, screenshot: true },
+          },
+        ],
+        runtimeId: 'follower-b1',
+      });
+
+      await expect(manager.openRemoteTab('follower-b1', 'https://new.com')).rejects.toThrow(
+        /cherry host that cannot open tabs/i
+      );
+    });
+
+    it('openRemoteTab allows a runtime with at least one browser target', async () => {
+      const { manager } = createManager();
+      const channel = new FakeChannel();
+      manager.addFollower('b1', channel);
+
+      channel.simulateMessage({
+        type: 'targets.advertise',
+        targets: [
+          {
+            targetId: 'host1',
+            title: 'Host',
+            url: 'https://host.com',
+            kind: 'cherry',
+            capabilities: { navigate: true, network: false, screenshot: true },
+          },
+          { targetId: 'tab1', title: 'Real Tab', url: 'https://real.com', kind: 'browser' },
+        ],
+        runtimeId: 'follower-b1',
+      });
+      channel.sent.length = 0;
+
+      const promise = manager.openRemoteTab('follower-b1', 'https://new.com');
+
+      // It should NOT have rejected synchronously — instead it sent a tab.open.
+      const sent = channel.parseSent();
+      const tabOpen = sent.find((m) => m.type === 'tab.open');
+      expect(tabOpen).toBeDefined();
+      if (tabOpen && tabOpen.type === 'tab.open') {
+        channel.simulateMessage({
+          type: 'tab.opened',
+          requestId: tabOpen.requestId,
+          targetId: 'follower-b1:new-99',
+        });
+      }
+      await expect(promise).resolves.toBe('follower-b1:new-99');
+    });
+  });
 });
 
 describe('cherry teleport selection', () => {
@@ -2103,5 +2247,15 @@ describe('cherry teleport selection', () => {
   it('selectTeleportPool includes cherry targets when network is not required', () => {
     const pool = selectTeleportPool([browserTarget, cherryTarget], { requireNetwork: false });
     expect(pool.map((t) => t.targetId).sort()).toEqual(['b', 'c']);
+  });
+
+  it('selectTeleportPool includes a cherry target that advertises network when network is required', () => {
+    const networkCherry = {
+      targetId: 'nc',
+      kind: 'cherry' as const,
+      capabilities: { navigate: true, network: true, screenshot: true },
+    };
+    const pool = selectTeleportPool([browserTarget, networkCherry], { requireNetwork: true });
+    expect(pool.map((t) => t.targetId).sort()).toEqual(['b', 'nc']);
   });
 });
