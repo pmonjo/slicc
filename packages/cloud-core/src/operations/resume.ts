@@ -3,6 +3,16 @@ import { pollForRefreshedStatus } from '../polling.js';
 import type { Registry } from '../registry.js';
 import type { SandboxHandle, SandboxSubstrate } from '../substrate.js';
 import type { ResumeResult } from '../types.js';
+import {
+  mergeConeConfig,
+  bundleToFiles,
+  bundleIndex,
+  validateConeConfig,
+  type ConeConfig,
+  type ConeConfigDelta,
+  type ConeConfigIndex,
+  type SecretEntry,
+} from '../cone-config/index.js';
 
 export interface ResumeConeDeps {
   substrate: SandboxSubstrate;
@@ -16,6 +26,8 @@ export interface ResumeConeOpts {
    * and BEFORE the leader-restart kick. Both CLI (cloud/resume.ts) and worker
    * (cloud-sessions-do.ts) pass this unconditionally now to inject a fresh IMS bearer. */
   refreshSecretsContents?: string;
+  /** Optional: merge delta into existing cone-config.json + secrets.env. */
+  coneConfigDelta?: ConeConfigDelta;
   pollIntervalMs?: number;
   pollTimeoutMs?: number;
   /** Skip the state check (NOT_FOUND + ALREADY_RUNNING). Used by the worker
@@ -29,6 +41,61 @@ export interface ResumeConeOpts {
 // Therefore: no `|| true`; we parse status from stdout AND check exitCode.
 const KICK_CMD =
   'curl -sS -X POST http://localhost:5710/api/leader-restart -o /dev/null -w "%{http_code}"';
+
+const DEFAULT_MODEL = 'adobe:claude-opus-4-6';
+
+function parseSecretsEnv(text: string): SecretEntry[] {
+  const domains = new Map<string, string[]>();
+  for (const l of text.split('\n')) {
+    const eq = l.indexOf('=');
+    if (eq < 0) continue;
+    const key = l.slice(0, eq);
+    if (key.endsWith('_DOMAINS')) {
+      domains.set(
+        key.slice(0, -'_DOMAINS'.length),
+        l
+          .slice(eq + 1)
+          .split(',')
+          .filter(Boolean)
+      );
+    }
+  }
+  const out: SecretEntry[] = [];
+  for (const l of text.split('\n')) {
+    const eq = l.indexOf('=');
+    if (eq < 0) continue;
+    const name = l.slice(0, eq);
+    if (name.endsWith('_DOMAINS')) continue;
+    out.push({ name, value: l.slice(eq + 1), domains: domains.get(name) ?? [] });
+  }
+  return out;
+}
+
+/**
+ * Merge `delta` over the existing files; returns new file contents + names index.
+ * When `coneConfigJson` is null (a pre-feature cone), synthesizes a degenerate
+ * base from secrets.env.
+ */
+export function applyConeConfigDelta(
+  coneConfigJson: string | null,
+  secretsEnv: string,
+  delta: ConeConfigDelta
+): { coneConfigJson: string; secretsEnv: string; index: ConeConfigIndex } {
+  let base: ConeConfig;
+  if (coneConfigJson) {
+    const parsed = JSON.parse(coneConfigJson) as { model?: string; accounts?: unknown[] };
+    base = validateConeConfig({
+      model: parsed.model ?? DEFAULT_MODEL,
+      accounts: parsed.accounts ?? [],
+      secrets: parseSecretsEnv(secretsEnv),
+    });
+  } else {
+    base = { model: DEFAULT_MODEL, accounts: [], secrets: parseSecretsEnv(secretsEnv) };
+  }
+  const merged = mergeConeConfig(base, delta);
+  const files = bundleToFiles(merged);
+  return { ...files, index: bundleIndex(merged) };
+}
 
 export async function resumeCone(
   deps: ResumeConeDeps,
@@ -61,9 +128,36 @@ export async function resumeCone(
 
   const handle = await deps.substrate.connect(entry.sandboxId);
 
-  // refreshSecretsContents: both CLI and worker pass this now to inject a fresh
-  // IMS bearer. Write to /slicc/secrets.env BEFORE the kick loop.
-  if (opts.refreshSecretsContents !== undefined) {
+  let resumeIndex: ConeConfigIndex | undefined;
+
+  // New: coneConfigDelta takes precedence — read existing files, merge, write both.
+  if (opts.coneConfigDelta) {
+    let existingConeConfig: string | null = null;
+    try {
+      existingConeConfig = await handle.readFile('/slicc/cone-config.json');
+    } catch {
+      existingConeConfig = null;
+    }
+    let existingSecretsEnv = '';
+    try {
+      existingSecretsEnv = await handle.readFile('/slicc/secrets.env');
+    } catch {
+      existingSecretsEnv = '';
+    }
+    const applied = applyConeConfigDelta(
+      existingConeConfig,
+      existingSecretsEnv,
+      opts.coneConfigDelta
+    );
+    await handle.writeFile('/slicc/secrets.env', applied.secretsEnv);
+    await handle.writeFile('/slicc/cone-config.json', applied.coneConfigJson);
+    await handle.run(
+      'curl -sS -X POST http://localhost:5710/api/secrets/reload -o /dev/null -w "%{http_code}"'
+    );
+    resumeIndex = applied.index;
+  } else if (opts.refreshSecretsContents !== undefined) {
+    // Legacy path: both CLI and worker pass this now to inject a fresh IMS bearer.
+    // Write to /slicc/secrets.env BEFORE the kick loop.
     await handle.writeFile('/slicc/secrets.env', opts.refreshSecretsContents);
   }
 
@@ -109,6 +203,7 @@ export async function resumeCone(
     joinUrl: refreshed.joinUrl,
     trayRebuilt,
     ...(versionMismatch ? { versionMismatch } : {}),
+    coneConfigIndex: resumeIndex,
   };
 }
 
