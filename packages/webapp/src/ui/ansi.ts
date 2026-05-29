@@ -150,10 +150,8 @@ const wrap = (chunk: string, state: SgrState): string => {
   return hasStyle(state) ? `<span style="${styleFor(state)}">${safe}</span>` : safe;
 };
 
- 
 const ESC_PATTERN = /\x1b\[[?!#>]?[\d;]*[A-Za-z]|\x1b\][\s\S]*?(?:\x07|\x1b\\)/g;
 const SGR_PATTERN = /^\x1b\[([\d;]*)m$/;
- 
 
 /**
  * Convert an ANSI-escaped string into a sanitized HTML fragment. The
