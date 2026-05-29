@@ -299,6 +299,7 @@ async function init(): Promise<void> {
         }
         if (!activeSync) return;
         bridge.setFollowerSync(null);
+        lickManager.setForwarder(null);
         browser.setTrayTargetProvider(null);
         activeSync.close();
         activeSync = null;
@@ -424,6 +425,11 @@ async function init(): Promise<void> {
             activeSync = sync;
             browser.setTrayTargetProvider(sync);
             bridge.setFollowerSync(sync);
+            // Follower mode: forwardable licks (navigate/handoff) observed
+            // locally must go to the LEADER's agent, not this follower's
+            // (model-less or invisible) local cone. The LickManager dispatch
+            // chokepoint ships them over the data channel.
+            lickManager.setForwarder((event) => sync.forwardLick(event));
             sync.requestSnapshot();
             targetRefreshInterval = setInterval(() => void refreshTargets(), 5000);
             void refreshTargets();
