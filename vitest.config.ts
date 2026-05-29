@@ -139,6 +139,14 @@ export default defineConfig({
           include: ['packages/cloud-core/tests/**/*.test.ts'],
         },
       },
+      {
+        extends: true,
+        test: {
+          name: 'cherry',
+          environment: 'jsdom',
+          include: ['packages/cherry/tests/**/*.test.ts'],
+        },
+      },
     ],
   },
 });
