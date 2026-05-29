@@ -1,0 +1,120 @@
+import { describe, it, expect } from 'vitest';
+import {
+  validateConeConfig,
+  mergeConeConfig,
+  serializeSecretsEnv,
+  bundleToFiles,
+  bundleIndex,
+  encodeBundleEnv,
+  decodeBundleEnv,
+  MAX_CONE_CONFIG_BYTES,
+  type ConeConfig,
+} from '../../src/cone-config/index.js';
+
+const base: ConeConfig = {
+  model: 'anthropic:claude-opus-4-6',
+  accounts: [
+    { providerId: 'adobe', kind: 'oauth', accessToken: 'a', tokenExpiresAt: 0 },
+    { providerId: 'anthropic', kind: 'apikey', apiKey: 'k' },
+  ],
+  secrets: [{ name: 'GITHUB_TOKEN', value: 'gt', domains: ['api.github.com', 'github.com'] }],
+};
+
+describe('validateConeConfig', () => {
+  it('accepts a well-formed bundle', () => {
+    expect(validateConeConfig(base)).toEqual(base);
+  });
+  it('rejects an oauth account missing accessToken', () => {
+    expect(() =>
+      validateConeConfig({ ...base, accounts: [{ providerId: 'x', kind: 'oauth' }] })
+    ).toThrow(/accessToken/);
+  });
+  it('rejects an apikey account missing apiKey', () => {
+    expect(() =>
+      validateConeConfig({ ...base, accounts: [{ providerId: 'x', kind: 'apikey' }] })
+    ).toThrow(/apiKey/);
+  });
+  it('rejects a secret whose domains is not string[]', () => {
+    expect(() =>
+      validateConeConfig({ ...base, secrets: [{ name: 'X', value: 'v', domains: 'a,b' }] })
+    ).toThrow(/domains/);
+  });
+  it('rejects an account with a missing/invalid kind', () => {
+    expect(() => validateConeConfig({ ...base, accounts: [{ providerId: 'x' }] })).toThrow(
+      /kind required/
+    );
+  });
+});
+
+describe('mergeConeConfig', () => {
+  it('upserts accounts by providerId and secrets by name, and deletes', () => {
+    const merged = mergeConeConfig(base, {
+      upsert: {
+        accounts: [{ providerId: 'anthropic', kind: 'apikey', apiKey: 'k2' }],
+        secrets: [{ name: 'NEW', value: 'n', domains: ['x.com'] }],
+      },
+      delete: { providerIds: ['adobe'], secretNames: ['GITHUB_TOKEN'] },
+    });
+    expect(merged.accounts).toEqual([{ providerId: 'anthropic', kind: 'apikey', apiKey: 'k2' }]);
+    expect(merged.secrets).toEqual([{ name: 'NEW', value: 'n', domains: ['x.com'] }]);
+    expect(merged.model).toBe('anthropic:claude-opus-4-6');
+  });
+  it('replaces model only when the delta provides one', () => {
+    expect(mergeConeConfig(base, { model: 'openai:gpt-x' }).model).toBe('openai:gpt-x');
+    expect(mergeConeConfig(base, {}).model).toBe('anthropic:claude-opus-4-6');
+  });
+  it('handles upsert-only, delete-only, and empty deltas without mutating base', () => {
+    const snapshot = JSON.parse(JSON.stringify(base));
+    expect(
+      mergeConeConfig(base, { upsert: { secrets: [{ name: 'A', value: 'v', domains: ['x'] }] } })
+        .secrets
+    ).toHaveLength(2);
+    expect(mergeConeConfig(base, { delete: { providerIds: ['anthropic'] } }).accounts).toHaveLength(
+      1
+    );
+    expect(mergeConeConfig(base, {}).accounts).toEqual(base.accounts);
+    expect(base).toEqual(snapshot); // base not mutated
+  });
+});
+
+describe('serializeSecretsEnv + bundleToFiles', () => {
+  it('emits NAME and NAME_DOMAINS lines', () => {
+    expect(serializeSecretsEnv(base.secrets)).toBe(
+      'GITHUB_TOKEN=gt\nGITHUB_TOKEN_DOMAINS=api.github.com,github.com\n'
+    );
+  });
+  it('emits empty string for no secrets', () => {
+    expect(serializeSecretsEnv([])).toBe('');
+  });
+  it('splits a bundle into cone-config.json + secrets.env', () => {
+    const { coneConfigJson, secretsEnv } = bundleToFiles(base);
+    expect(JSON.parse(coneConfigJson)).toEqual({ model: base.model, accounts: base.accounts });
+    expect(secretsEnv).toContain('GITHUB_TOKEN=gt');
+  });
+});
+
+describe('bundleIndex', () => {
+  it('produces a names-only index with no values', () => {
+    const idx = bundleIndex(base);
+    expect(idx).toEqual({
+      model: 'anthropic:claude-opus-4-6',
+      accountProviderIds: ['adobe', 'anthropic'],
+      accountMeta: [
+        { providerId: 'adobe', kind: 'oauth', tokenExpiresAt: 0 },
+        { providerId: 'anthropic', kind: 'apikey', tokenExpiresAt: undefined },
+      ],
+      secretNames: ['GITHUB_TOKEN'],
+    });
+    expect(JSON.stringify(idx)).not.toContain('gt'); // no secret values leak
+  });
+});
+
+describe('base64 env round-trip', () => {
+  it('round-trips UTF-8 JSON', () => {
+    const json = JSON.stringify({ s: 'héllo — 🍦' });
+    expect(decodeBundleEnv(encodeBundleEnv(json))).toBe(json);
+  });
+  it('exposes a positive size cap', () => {
+    expect(MAX_CONE_CONFIG_BYTES).toBeGreaterThan(0);
+  });
+});
