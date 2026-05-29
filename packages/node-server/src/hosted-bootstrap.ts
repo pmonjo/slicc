@@ -63,7 +63,13 @@ export function registerHostedBootstrapEndpoint(
       readConeConfig: () => {
         try {
           return readFileSync(CONE_CONFIG_PATH, 'utf-8');
-        } catch {
+        } catch (err) {
+          // A missing file is the normal pre-feature/back-compat case. Any other
+          // error (EACCES, EIO, …) means the config exists but is unreadable —
+          // log it so a silent fallback to legacy/empty doesn't hide the cause.
+          if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
+            console.warn('[hosted-bootstrap] failed to read cone-config.json:', err);
+          }
           return null;
         }
       },

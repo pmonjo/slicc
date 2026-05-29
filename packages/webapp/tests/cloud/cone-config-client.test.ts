@@ -20,6 +20,32 @@ describe('assembleBundle', () => {
     expect(bundle.accounts).toEqual([{ providerId: 'anthropic', kind: 'apikey', apiKey: 'k' }]);
     expect(bundle.secrets).toEqual([{ name: 'GITHUB_TOKEN', value: 'g', domains: ['github.com'] }]);
   });
+
+  it('drops a flat secret with no domains (would be unusable by the fetch-proxy)', () => {
+    const bundle = assembleBundle({
+      model: 'm',
+      selectedProviderIds: [],
+      allAccounts: [],
+      secretRows: [
+        { name: 'NO_DOM', value: 'v', domains: '' },
+        { name: 'OK', value: 'v', domains: 'x.com' },
+      ],
+    });
+    expect(bundle.secrets).toEqual([{ name: 'OK', value: 'v', domains: ['x.com'] }]);
+  });
+
+  it('skips a selected account with no credential (cleared/logged-out token)', () => {
+    const bundle = assembleBundle({
+      model: 'm',
+      selectedProviderIds: ['adobe', 'anthropic'],
+      allAccounts: [
+        { providerId: 'adobe', apiKey: '', accessToken: '' }, // logged out
+        { providerId: 'anthropic', apiKey: 'k', accessToken: '' },
+      ],
+      secretRows: [],
+    });
+    expect(bundle.accounts).toEqual([{ providerId: 'anthropic', kind: 'apikey', apiKey: 'k' }]);
+  });
 });
 
 describe('validateModelHasAccount (F6 strict)', () => {

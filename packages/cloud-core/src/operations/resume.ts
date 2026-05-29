@@ -83,7 +83,16 @@ export function applyConeConfigDelta(
 ): { coneConfigJson: string; secretsEnv: string; index: ConeConfigIndex } {
   let base: ConeConfig;
   if (coneConfigJson) {
-    const parsed = JSON.parse(coneConfigJson) as { model?: string; accounts?: unknown[] };
+    let parsed: { model?: string; accounts?: unknown[] };
+    try {
+      parsed = JSON.parse(coneConfigJson) as { model?: string; accounts?: unknown[] };
+    } catch (err) {
+      // Distinguish a corrupt on-disk file from invalid data, so the surfaced
+      // error points at the right cause instead of an opaque SyntaxError.
+      throw new Error(
+        `cone-config: corrupt /slicc/cone-config.json: ${err instanceof Error ? err.message : String(err)}`
+      );
+    }
     base = validateConeConfig({
       model: parsed.model ?? DEFAULT_MODEL,
       accounts: parsed.accounts ?? [],
@@ -154,9 +163,10 @@ export async function resumeCone(
     );
     await handle.writeFile('/slicc/secrets.env', applied.secretsEnv);
     await handle.writeFile('/slicc/cone-config.json', applied.coneConfigJson);
-    await handle.run(
-      'curl -sS -X POST http://localhost:5710/api/secrets/reload -o /dev/null -w "%{http_code}"'
-    );
+    // Reload the fetch-proxy masking so changed flat secrets take effect. Must
+    // succeed before the leader Page.reload — a silent failure here would leave
+    // the running cone with stale flat secrets while reporting resume success.
+    await reloadSecretsProxyUntilReady(handle);
     resumeIndex = applied.index;
   } else if (opts.refreshSecretsContents !== undefined) {
     // Legacy path: both CLI and worker pass this now to inject a fresh IMS bearer.
@@ -226,4 +236,31 @@ async function kickLeaderUntilReady(handle: SandboxHandle): Promise<boolean> {
     await new Promise((r) => setTimeout(r, 1000));
   }
   return false;
+}
+
+const RELOAD_CMD =
+  'curl -sS -X POST http://localhost:5710/api/secrets/reload -o /dev/null -w "%{http_code}"';
+
+// Reload the node-server secret proxy, retrying the cold-start (503/connect)
+// window like the leader kick. Throws if it never succeeds — a stale fetch-proxy
+// would silently serve old flat secrets.
+async function reloadSecretsProxyUntilReady(handle: SandboxHandle): Promise<void> {
+  for (let i = 0; i < 5; i++) {
+    const result = await handle.run(RELOAD_CMD);
+    if (result.exitCode === 0) {
+      const status = result.stdout.trim();
+      if (status === '200') return;
+      if (status !== '503') {
+        throw new CloudError(
+          'INTERNAL',
+          `/api/secrets/reload returned unexpected status ${status}`
+        );
+      }
+    }
+    await new Promise((r) => setTimeout(r, 1000));
+  }
+  throw new CloudError(
+    'INTERNAL',
+    'Failed to reload secrets proxy after 5 retries (changed secrets may be stale)'
+  );
 }

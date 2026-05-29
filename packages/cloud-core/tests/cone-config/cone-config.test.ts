@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import {
   validateConeConfig,
+  validateConeConfigDelta,
   mergeConeConfig,
   serializeSecretsEnv,
   bundleToFiles,
@@ -56,6 +57,35 @@ describe('validateConeConfig', () => {
     expect(() =>
       validateConeConfig({ ...base, secrets: [{ name: 'X', value: 'v', domains: ['a,b'] }] })
     ).toThrow(/comma-free/);
+  });
+});
+
+describe('validateConeConfigDelta', () => {
+  it('accepts a well-formed delta', () => {
+    const d = {
+      model: 'openai:x',
+      upsert: { accounts: [{ providerId: 'openai', kind: 'apikey', apiKey: 'k' }], secrets: [] },
+      delete: { providerIds: ['adobe'], secretNames: ['OLD'] },
+    };
+    expect(validateConeConfigDelta(d)).toEqual(d);
+  });
+  it('rejects a non-array upsert.accounts', () => {
+    expect(() => validateConeConfigDelta({ upsert: { accounts: 'nope' } })).toThrow(
+      /upsert.accounts must be an array/
+    );
+  });
+  it('rejects a nested secret that would inject a newline', () => {
+    expect(() =>
+      validateConeConfigDelta({ upsert: { secrets: [{ name: 'X', value: 'a\nb', domains: [] }] } })
+    ).toThrow(/single-line/);
+  });
+  it('rejects a non-string delete.secretNames entry', () => {
+    expect(() => validateConeConfigDelta({ delete: { secretNames: [1] } })).toThrow(
+      /secretNames must be string\[\]/
+    );
+  });
+  it('accepts an empty delta', () => {
+    expect(validateConeConfigDelta({})).toEqual({});
   });
 });
 

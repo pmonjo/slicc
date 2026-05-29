@@ -3,7 +3,9 @@
 export function assembleBundle({ model, selectedProviderIds, allAccounts, secretRows }) {
   const selected = new Set(selectedProviderIds);
   const accounts = allAccounts
-    .filter((a) => selected.has(a.providerId))
+    // Skip selected-but-credential-less accounts (e.g. a logged-out token cleared
+    // to '') so we don't ship a meaningless { kind:'apikey', apiKey:'' }.
+    .filter((a) => selected.has(a.providerId) && (a.accessToken || a.apiKey))
     .map((a) =>
       a.accessToken
         ? {
@@ -17,7 +19,6 @@ export function assembleBundle({ model, selectedProviderIds, allAccounts, secret
         : { providerId: a.providerId, kind: 'apikey', apiKey: a.apiKey }
     );
   const secrets = secretRows
-    .filter((r) => r.name && r.value)
     .map((r) => ({
       name: r.name,
       value: r.value,
@@ -25,7 +26,11 @@ export function assembleBundle({ model, selectedProviderIds, allAccounts, secret
         .split(',')
         .map((d) => d.trim())
         .filter(Boolean),
-    }));
+    }))
+    // A flat secret needs >=1 domain or the fetch-proxy can never inject it
+    // (EnvSecretStore drops domain-less entries). Require name + value + domain
+    // so we don't ship a silently-useless secret.
+    .filter((s) => s.name && s.value && s.domains.length > 0);
   return { model, accounts, secrets };
 }
 

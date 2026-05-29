@@ -1,7 +1,7 @@
 import { authenticateRequest } from './auth-middleware.js';
 import { errorResponse } from './error-envelope.js';
 import { checkRateLimit } from './rate-limit.js';
-import { MAX_CONE_CONFIG_BYTES } from '@slicc/cloud-core/cone-config';
+import { MAX_CONE_CONFIG_BYTES, validateConeConfigDelta } from '@slicc/cloud-core/cone-config';
 
 export interface CloudEnv {
   CLOUD_SESSIONS: DurableObjectNamespaceLike;
@@ -122,6 +122,11 @@ export async function handleResume(request: Request, env: CloudEnv): Promise<Res
   if (!body.sandboxId) {
     return errorResponse(400, 'BAD_REQUEST', 'sandboxId is required');
   }
+  try {
+    validateResumeBody(body);
+  } catch (e) {
+    return errorResponse(400, 'BAD_REQUEST', (e as Error).message);
+  }
   const stub = getDoStub(env, auth.userId);
   return forwardToDo(stub, '/resume-cone', {
     bearer,
@@ -156,6 +161,17 @@ export function validateStartBody(body: { name?: string; coneConfig?: unknown })
       throw new Error(`coneConfig too large: ${size} > ${MAX_CONE_CONFIG_BYTES}`);
     }
   }
+}
+
+export function validateResumeBody(body: { coneConfigDelta?: unknown }): void {
+  if (body.coneConfigDelta === undefined) return;
+  const size = new TextEncoder().encode(JSON.stringify(body.coneConfigDelta)).length;
+  if (size > MAX_CONE_CONFIG_BYTES) {
+    throw new Error(`coneConfigDelta too large: ${size} > ${MAX_CONE_CONFIG_BYTES}`);
+  }
+  // Shape/hygiene validation (env-name, single-line values, etc.). Errors are
+  // redacted (shape only, never values) — safe to surface as a 400.
+  validateConeConfigDelta(body.coneConfigDelta);
 }
 
 export async function handleConeConfig(request: Request, env: CloudEnv): Promise<Response> {

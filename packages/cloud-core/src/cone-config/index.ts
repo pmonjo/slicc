@@ -123,6 +123,63 @@ function validateSecret(s: unknown): SecretEntry {
   return { name: sec.name, value: sec.value, domains: sec.domains as string[] };
 }
 
+/**
+ * Validate an untrusted resume delta (the worker receives it as `unknown`).
+ * Nested accounts/secrets go through the same validators as a full bundle, so a
+ * malformed or newline-injecting entry is rejected at the boundary with a clear
+ * message rather than blowing up later inside mergeConeConfig.
+ */
+export function validateConeConfigDelta(input: unknown): ConeConfigDelta {
+  if (!input || typeof input !== 'object') throw new Error('cone-config: delta not an object');
+  const d = input as Record<string, unknown>;
+  const out: ConeConfigDelta = {};
+  if (d.model !== undefined) {
+    if (!isStr(d.model)) throw new Error('cone-config: delta.model must be a string');
+    out.model = d.model;
+  }
+  if (d.upsert !== undefined) {
+    if (!d.upsert || typeof d.upsert !== 'object') {
+      throw new Error('cone-config: delta.upsert must be an object');
+    }
+    const up = d.upsert as Record<string, unknown>;
+    const upsert: { accounts?: Account[]; secrets?: SecretEntry[] } = {};
+    if (up.accounts !== undefined) {
+      if (!Array.isArray(up.accounts)) {
+        throw new Error('cone-config: delta.upsert.accounts must be an array');
+      }
+      upsert.accounts = up.accounts.map((a) => validateAccount(a));
+    }
+    if (up.secrets !== undefined) {
+      if (!Array.isArray(up.secrets)) {
+        throw new Error('cone-config: delta.upsert.secrets must be an array');
+      }
+      upsert.secrets = up.secrets.map((s) => validateSecret(s));
+    }
+    out.upsert = upsert;
+  }
+  if (d.delete !== undefined) {
+    if (!d.delete || typeof d.delete !== 'object') {
+      throw new Error('cone-config: delta.delete must be an object');
+    }
+    const del = d.delete as Record<string, unknown>;
+    const deletion: { providerIds?: string[]; secretNames?: string[] } = {};
+    if (del.providerIds !== undefined) {
+      if (!Array.isArray(del.providerIds) || !del.providerIds.every(isStr)) {
+        throw new Error('cone-config: delta.delete.providerIds must be string[]');
+      }
+      deletion.providerIds = del.providerIds as string[];
+    }
+    if (del.secretNames !== undefined) {
+      if (!Array.isArray(del.secretNames) || !del.secretNames.every(isStr)) {
+        throw new Error('cone-config: delta.delete.secretNames must be string[]');
+      }
+      deletion.secretNames = del.secretNames as string[];
+    }
+    out.delete = deletion;
+  }
+  return out;
+}
+
 export function mergeConeConfig(base: ConeConfig, delta: ConeConfigDelta): ConeConfig {
   const accounts = new Map(base.accounts.map((a) => [a.providerId, a]));
   for (const a of delta.upsert?.accounts ?? []) accounts.set(a.providerId, a);

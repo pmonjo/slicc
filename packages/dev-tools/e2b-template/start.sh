@@ -17,7 +17,10 @@ export SLICC_CDP_LAUNCH_TIMEOUT_MS=60000
 # --- Cone config preboot (race-free: write files before node-server boots) ---
 mkdir -p /slicc
 if [ -n "$SLICC_SECRETS_ENV_B64" ]; then
-  printf '%s' "$SLICC_SECRETS_ENV_B64" | base64 -d > /slicc/secrets.env
+  if ! printf '%s' "$SLICC_SECRETS_ENV_B64" | base64 -d > /slicc/secrets.env; then
+    echo "FATAL: failed to base64-decode SLICC_SECRETS_ENV_B64" >&2
+    exit 1
+  fi
   unset SLICC_SECRETS_ENV_B64
 elif [ -n "$ADOBE_IMS_TOKEN" ] && [ ! -f /slicc/secrets.env ]; then
   # Back-compat: older worker images only pass ADOBE_IMS_TOKEN.
@@ -31,7 +34,10 @@ fi
 unset ADOBE_IMS_TOKEN ADOBE_IMS_TOKEN_DOMAINS
 
 if [ -n "$SLICC_CONE_CONFIG_B64" ]; then
-  printf '%s' "$SLICC_CONE_CONFIG_B64" | base64 -d > /slicc/cone-config.json
+  if ! printf '%s' "$SLICC_CONE_CONFIG_B64" | base64 -d > /slicc/cone-config.json; then
+    echo "FATAL: failed to base64-decode SLICC_CONE_CONFIG_B64" >&2
+    exit 1
+  fi
   unset SLICC_CONE_CONFIG_B64
 fi
 
