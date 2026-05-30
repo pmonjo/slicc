@@ -35,7 +35,11 @@ import { FollowerSyncManager } from '../scoops/tray-follower-sync.js';
 import type { AgentHandle, ChatMessage } from './types.js';
 import type { MessageAttachment } from '../core/attachments.js';
 import type { BrowserAPI } from '../cdp/browser-api.js';
-import type { SprinkleSummary } from '../scoops/tray-sync-protocol.js';
+import {
+  CHERRY_RUNTIME_TAG,
+  type RemoteTargetInfo,
+  type SprinkleSummary,
+} from '../scoops/tray-sync-protocol.js';
 import type { SprinkleAddOptions } from './sprinkle-manager.js';
 import { SprinkleFollowerController } from './sprinkle-follower-controller.js';
 import { canonicalRuntimeId } from './runtime-identity.js';
@@ -43,6 +47,40 @@ import { createLogger } from '../core/logger.js';
 import { ThrottledErrorTracker } from '../scoops/throttled-error-tracker.js';
 
 const log = createLogger('page-follower-tray');
+
+export { CHERRY_RUNTIME_TAG } from '../scoops/tray-sync-protocol.js';
+
+/**
+ * Shape the page's local browser targets for advertisement to the leader.
+ *
+ * A cherry follower (`runtime === CHERRY_RUNTIME_TAG`) lends a cooperative host
+ * page, not a real browser tab: it can never serve `Network.*`, so every target
+ * it advertises is tagged `kind: 'cherry'` with `capabilities.network = false`.
+ * That metadata is what lets the leader keep cherry out of flows it cannot
+ * satisfy — `canRuntimeOpenTab` (tab.open) reads `kind`, and
+ * `getBestFollowerForTeleport` / `selectTeleportPool` read `capabilities.network`.
+ * `navigate`/`screenshot` are advisory: the host SDK is the real authority and
+ * gates each CDP domain itself, and the iframe never learns the host's exact
+ * grants — only `network` (always false) and `kind` drive leader selection here.
+ *
+ * Non-cherry runtimes advertise bare `{ targetId, title, url }` (the registry
+ * defaults `kind` to `'browser'`), unchanged from before.
+ */
+export function buildAdvertisedTargets(
+  pages: { targetId: string; title: string; url: string }[],
+  runtime: string
+): RemoteTargetInfo[] {
+  if (runtime !== CHERRY_RUNTIME_TAG) {
+    return pages.map((p) => ({ targetId: p.targetId, title: p.title, url: p.url }));
+  }
+  return pages.map((p) => ({
+    targetId: p.targetId,
+    title: p.title,
+    url: p.url,
+    kind: 'cherry' as const,
+    capabilities: { navigate: true, network: false, screenshot: true },
+  }));
+}
 
 export interface StartPageFollowerTrayOptions {
   /** The leader's join URL (from the `TRAY_JOIN_STORAGE_KEY` constant — `slicc.trayJoinUrl` — in localStorage). */
@@ -219,7 +257,7 @@ export function startPageFollowerTray(
       cdpThrottle.reportSuccess();
       try {
         sync.advertiseTargets(
-          pages.map((p) => ({ targetId: p.targetId, title: p.title, url: p.url })),
+          buildAdvertisedTargets(pages, options.runtime ?? 'slicc-standalone'),
           runtimeId
         );
       } catch (err) {

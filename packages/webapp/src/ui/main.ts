@@ -91,7 +91,7 @@ import { canonicalRuntimeId } from './runtime-identity.js';
 import { startPageLeaderTray } from './page-leader-tray.js';
 import type { PageLeaderTrayHandle, StartPageLeaderTrayOptions } from './page-leader-tray.js';
 import type { TrayLeaveResult } from '../scoops/tray-leave.js';
-import { startPageFollowerTray } from './page-follower-tray.js';
+import { startPageFollowerTray, CHERRY_RUNTIME_TAG } from './page-follower-tray.js';
 import type { PageFollowerTrayHandle } from './page-follower-tray.js';
 import {
   getElectronOverlayInitialTab,
@@ -2852,7 +2852,7 @@ async function mainStandaloneWorker(app: HTMLElement, runtimeMode: UiRuntimeMode
     } else if (runtimeMode === 'cherry' && cherryJoinUrl) {
       pageFollowerTray = startPageFollowerTray({
         joinUrl: cherryJoinUrl,
-        runtime: 'slicc-cherry',
+        runtime: CHERRY_RUNTIME_TAG,
         onSnapshot: (messages) => layout.panels.chat.loadMessages(messages),
         onUserMessage: (text, _messageId, _scoopJid, attachments) =>
           layout.panels.chat.addUserMessage(text, attachments),

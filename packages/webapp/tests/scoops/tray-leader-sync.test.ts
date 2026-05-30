@@ -7,6 +7,7 @@ import {
   selectTeleportPool,
   type LeaderSyncManagerOptions,
 } from '../../src/scoops/tray-leader-sync.js';
+import { CHERRY_RUNTIME_TAG } from '../../src/scoops/tray-sync-protocol.js';
 import type { TrayDataChannelLike } from '../../src/scoops/tray-webrtc.js';
 import type { AgentEvent, ChatMessage } from '../../src/ui/types.js';
 import type {
@@ -1588,6 +1589,67 @@ describe('LeaderSyncManager', () => {
 
       const best = manager.getBestFollowerForTeleport();
       expect(best!.floatType).toBe('extension');
+    });
+
+    it('excludes a cherry follower by runtime tag even before it advertises targets', () => {
+      const { manager } = createManager();
+
+      const ch = new FakeChannel();
+      manager.addFollower('b1', ch, { runtime: CHERRY_RUNTIME_TAG });
+      // No advertise yet — the runtime-tag short-circuit must still exclude it,
+      // so it is never offered as a teleport target.
+      expect(manager.getBestFollowerForTeleport()).toBeNull();
+    });
+
+    it('skips a cherry follower and selects the real browser follower', () => {
+      const { manager } = createManager();
+
+      const chCherry = new FakeChannel();
+      manager.addFollower('b1', chCherry, { runtime: CHERRY_RUNTIME_TAG });
+      chCherry.simulateMessage({
+        type: 'targets.advertise',
+        targets: [
+          {
+            targetId: 'host',
+            title: 'Host',
+            url: 'https://host.example',
+            kind: 'cherry',
+            capabilities: { navigate: true, network: false, screenshot: true },
+          },
+        ],
+        runtimeId: 'f-cherry',
+      });
+
+      const chStd = new FakeChannel();
+      manager.addFollower('b2', chStd, { runtime: 'slicc-standalone' });
+      chStd.simulateMessage({ type: 'targets.advertise', targets: [], runtimeId: 'f-std' });
+
+      const best = manager.getBestFollowerForTeleport();
+      expect(best!.runtimeId).toBe('f-std');
+    });
+
+    it('excludes a non-cherry-tagged follower whose advertised targets are all cherry', () => {
+      const { manager } = createManager();
+
+      // Runtime tag is not cherry, but every advertised target is — so it
+      // cannot serve a network-requiring teleport and must be excluded.
+      const ch = new FakeChannel();
+      manager.addFollower('b1', ch, { runtime: 'slicc-standalone' });
+      ch.simulateMessage({
+        type: 'targets.advertise',
+        targets: [
+          {
+            targetId: 'host',
+            title: 'Host',
+            url: 'https://host.example',
+            kind: 'cherry',
+            capabilities: { navigate: true, network: false, screenshot: true },
+          },
+        ],
+        runtimeId: 'f-allcherry',
+      });
+
+      expect(manager.getBestFollowerForTeleport()).toBeNull();
     });
   });
 

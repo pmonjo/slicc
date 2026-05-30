@@ -23,6 +23,7 @@ import {
   type SprinkleSummary,
   type CherryHostEventMessage,
   isCherryHostEventMessage,
+  CHERRY_RUNTIME_TAG,
 } from './tray-sync-protocol.js';
 import type { LickManager } from './lick-manager.js';
 import { handleFsRequest } from './tray-fs-handler.js';
@@ -103,12 +104,9 @@ export function isCherryTarget(t: Pick<RemoteTargetInfo, 'kind'>): boolean {
  * serve `Network.*` CDP for teleport-pool selection." When the teleport does
  * not need network, cherry targets are always kept.
  *
- * NOTE: the teleport target-*selection* consumer lives in
- * `shell/supplemental-commands/playwright-command.ts`. `getBestFollowerForTeleport`
- * (and the broader teleport selection) must become cherry-aware — i.e. route
- * through this helper — once cherry advertisement lands (Task 12/13). Today
- * nothing advertises `kind: 'cherry'`, so this helper is intentionally not yet
- * called from production.
+ * Consumed by `getBestFollowerForTeleport` (auto-select) via
+ * `canRuntimeServeTeleport`. The explicit `--runtime` path is gated separately
+ * by `canRuntimeOpenTab`, since teleport opens a fresh tab on the follower.
  */
 export function selectTeleportPool<
   T extends Pick<RemoteTargetInfo, 'kind' | 'capabilities'> & { targetId: string },
@@ -894,9 +892,29 @@ export class LeaderSyncManager {
   }
 
   /**
+   * Whether a runtime can serve a (network-requiring) cookie teleport. A cherry
+   * host can never serve `Network.*`, so it is excluded two ways: the
+   * `CHERRY_RUNTIME_TAG` runtime tag short-circuits even before the follower has
+   * advertised any targets (closing the pre-advertisement window), and once
+   * targets exist they must pass `selectTeleportPool` with `requireNetwork`.
+   * A runtime with no registry entries yet (and a non-cherry tag) is given the
+   * benefit of the doubt — same posture as `canRuntimeOpenTab`.
+   */
+  private canRuntimeServeTeleport(runtimeId: string, follower: ConnectedFollower): boolean {
+    if (follower.runtime === CHERRY_RUNTIME_TAG) return false;
+    // `getEntries()` clears the registry dirty flag — benign here for the same
+    // reason documented on `canRuntimeOpenTab`: advertise paths broadcast
+    // synchronously before any teleport selection can interleave.
+    const entries = this.registry.getEntries().filter((e) => e.runtimeId === runtimeId);
+    if (entries.length === 0) return true;
+    return selectTeleportPool(entries, { requireNetwork: true }).length > 0;
+  }
+
+  /**
    * Find the best follower for a cookie teleport.
    * Prefers standalone floats, then sorts by most recent activity.
-   * Returns null if no alive followers exist.
+   * Excludes cherry hosts and any runtime that cannot serve `Network.*`.
+   * Returns null if no eligible followers exist.
    */
   getBestFollowerForTeleport(): {
     runtimeId: string;
@@ -912,6 +930,7 @@ export class LeaderSyncManager {
     for (const [runtimeId, bootstrapId] of this.runtimeToBootstrap) {
       const follower = this.followers.get(bootstrapId);
       if (!follower) continue;
+      if (!this.canRuntimeServeTeleport(runtimeId, follower)) continue;
       candidates.push({
         runtimeId,
         bootstrapId,

@@ -28,6 +28,16 @@ import { createLogger } from '../core/logger.js';
 
 const log = createLogger('tray-sync');
 
+/**
+ * Runtime tag a cherry follower connects with (`StartPageFollowerTrayOptions.runtime`).
+ * It is the advertisement-independent signal the leader uses to keep a cooperative
+ * cherry host page out of flows it cannot satisfy (teleport selection) — see
+ * `tray-leader-sync.ts:getBestFollowerForTeleport`. Kept here, next to the wire
+ * format, because both the follower boot (`ui/`) and the leader (`scoops/`) must
+ * agree on the exact string without one layer importing the other.
+ */
+export const CHERRY_RUNTIME_TAG = 'slicc-cherry';
+
 // ---------------------------------------------------------------------------
 // Protocol messages
 // ---------------------------------------------------------------------------
