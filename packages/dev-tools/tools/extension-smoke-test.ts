@@ -261,6 +261,17 @@ class CdpSession {
  *   - Exposes `window.__sliccSmokeExec(command)` returning the captured
  *     stdout/stderr/exitCode.
  *
+ * Timing note: the offscreen document's `TerminalSessionHost` listener
+ * comes online only after `createKernelHost` finishes (typically 3-5s
+ * after Chrome boot). The panel tab and bridge are usually ready before
+ * that, so the first `terminal-open` broadcast is silently dropped
+ * (`chrome.runtime.sendMessage` has no late delivery). The bridge
+ * therefore retries `terminal-open` on a 500ms cadence until it sees a
+ * `terminal-status: opened` reply matching its SID. Duplicate-open
+ * `session already open` errors that arrive after we've already latched
+ * `opened` are benign acks and are ignored — they would otherwise reject
+ * inflight execs.
+ *
  * Note: we keep this as a string so `Runtime.evaluate` ships exactly what
  * the page executes — no TS-to-JS surprises at runtime.
  */
@@ -271,6 +282,19 @@ const PAGE_BRIDGE_SOURCE = `
   const inflight = new Map();
   let openedResolve;
   const opened = new Promise((res) => { openedResolve = res; });
+  let openedAcked = false;
+  let retryTimer = null;
+
+  const sendOpen = () => {
+    if (openedAcked) return;
+    try {
+      const p = chrome.runtime.sendMessage({
+        source: 'panel',
+        payload: { type: 'terminal-open', sid: SID, cwd: '/' }
+      });
+      if (p && typeof p.catch === 'function') p.catch(() => {});
+    } catch (_) { /* receiving end may not exist yet */ }
+  };
 
   chrome.runtime.onMessage.addListener((msg) => {
     if (!msg || msg.source !== 'offscreen') return false;
@@ -278,6 +302,8 @@ const PAGE_BRIDGE_SOURCE = `
     if (!payload || typeof payload !== 'object') return false;
     if (payload.sid !== SID) return false;
     if (payload.type === 'terminal-status' && payload.state === 'opened') {
+      openedAcked = true;
+      if (retryTimer !== null) { clearInterval(retryTimer); retryTimer = null; }
       openedResolve(true);
     } else if (payload.type === 'terminal-output') {
       const slot = inflight.get(payload.execId);
@@ -292,16 +318,24 @@ const PAGE_BRIDGE_SOURCE = `
         slot.resolve({ stdout: slot.stdout, stderr: slot.stderr, exitCode: payload.exitCode });
       }
     } else if (payload.type === 'terminal-status' && payload.state === 'error') {
-      for (const [, slot] of inflight) slot.reject(new Error(payload.error || 'terminal error'));
-      inflight.clear();
+      // 'session already open' is the expected response to a retry-race
+      // duplicate open and must NOT reject inflight execs. Any other
+      // error (e.g. shell construction failure) propagates normally.
+      const msgStr = String(payload.error || '');
+      const isDupeOpen = openedAcked && /already open/i.test(msgStr);
+      if (!isDupeOpen) {
+        for (const [, slot] of inflight) slot.reject(new Error(msgStr || 'terminal error'));
+        inflight.clear();
+      }
     }
     return false;
   });
 
-  chrome.runtime.sendMessage({
-    source: 'panel',
-    payload: { type: 'terminal-open', sid: SID, cwd: '/' }
-  });
+  sendOpen();
+  // Retry until opened. 40 * 500ms = 20s upper bound; the outer
+  // installBridge() race rejects at the same horizon, so we'd surface
+  // the timeout there even if the interval ran past.
+  retryTimer = setInterval(sendOpen, 500);
 
   window.__sliccSmokeOpened = opened;
   window.__sliccSmokeExec = (command, timeoutMs) => {
