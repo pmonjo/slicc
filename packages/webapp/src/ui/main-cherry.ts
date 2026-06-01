@@ -25,7 +25,7 @@ export interface CherryBootResult {
  * 5-step flow: list → resume/use-running → start-if-missing. Returns a join URL.
  * The Bearer token never leaves this same-origin call and is not persisted.
  */
-async function resolveCherryJoinUrl(auth: CherryProvisioningAuth): Promise<string> {
+export async function resolveCherryJoinUrl(auth: CherryProvisioningAuth): Promise<string> {
   const authHeader = { Authorization: `Bearer ${auth.token}` };
   const listRes = await fetch('/api/cloud/list?json=true', { headers: authHeader });
   if (!listRes.ok)
@@ -92,13 +92,13 @@ export async function setupCherryFollower(): Promise<CherryBootResult> {
     throw new Error('cherry boot: no joinUrl from handshake and no provisioning auth');
   }
 
+  // The handshake above already connected the transport, so the BrowserAPI
+  // wraps an already-connected transport. We must NOT call `browser.connect()`
+  // here: it re-enters `CherryHostTransport.connect()`, which throws
+  // "Cannot connect: state is connected". A swallowed throw on every boot would
+  // also hide a genuine transport fault. `BrowserAPI.ensureConnected()` instead
+  // (re)connects lazily only when the transport is `disconnected`, so a real
+  // drop surfaces to the caller on the next command rather than silently here.
   const browser = new BrowserAPI(transport);
-  try {
-    await browser.connect();
-  } catch (err) {
-    log.warn('Cherry CDP connect failed; will retry on demand', {
-      error: err instanceof Error ? err.message : String(err),
-    });
-  }
   return { transport, browser, joinUrl };
 }
