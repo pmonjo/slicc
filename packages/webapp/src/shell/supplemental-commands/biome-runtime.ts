@@ -40,11 +40,11 @@
  *  lockstep.
  */
 
+import type { Biome } from '@biomejs/js-api';
+import type { ProjectKey } from '@biomejs/wasm-web';
 import wasmWebPkg from '@biomejs/wasm-web/package.json' with { type: 'json' };
 import { unpkgUrl } from './cdn-url-builder.js';
 import { isNodeRuntime, resolvePinnedPackageVersion } from './shared.js';
-import type { Biome } from '@biomejs/js-api';
-import type { ProjectKey } from '@biomejs/wasm-web';
 
 export const BIOME_VERSION = resolvePinnedPackageVersion(
   '@biomejs/wasm-web',

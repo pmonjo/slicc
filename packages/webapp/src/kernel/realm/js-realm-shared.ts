@@ -18,7 +18,16 @@
  */
 
 import { esmShUrl } from '../../shell/supplemental-commands/cdn-url-builder.js';
-import { RealmRpcClient, type RealmPortLike } from './realm-rpc.js';
+import { createHttpGlobal } from './http-global.js';
+import {
+  attachArgvParseFlags,
+  createCli,
+  createColor,
+  fmt,
+  pool,
+  time,
+} from './js-realm-helpers.js';
+import { type RealmPortLike, RealmRpcClient } from './realm-rpc.js';
 import type {
   RealmDoneMsg,
   RealmInitMsg,
@@ -35,15 +44,6 @@ import {
   withTimeout,
 } from './require-guards.js';
 import { createSkillGlobal } from './skill-global.js';
-import { createHttpGlobal } from './http-global.js';
-import {
-  attachArgvParseFlags,
-  createCli,
-  createColor,
-  fmt,
-  pool,
-  time,
-} from './js-realm-helpers.js';
 
 const NODE_BUILTINS_UNAVAILABLE = new Set([
   'http',

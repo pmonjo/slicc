@@ -1,12 +1,12 @@
-import { describe, it, expect } from 'vitest';
+import { describe, expect, it } from 'vitest';
 import {
-  UNPKG_HOST,
-  ESM_SH_HOST,
-  JSDELIVR_HOST,
   buildCdnUrl,
-  unpkgUrl,
+  ESM_SH_HOST,
   esmShUrl,
+  JSDELIVR_HOST,
   jsdelivrNpmUrl,
+  UNPKG_HOST,
+  unpkgUrl,
 } from '../../../src/shell/supplemental-commands/cdn-url-builder.js';
 
 describe('cdn-url-builder host constants', () => {
