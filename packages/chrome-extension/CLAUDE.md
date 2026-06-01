@@ -343,6 +343,59 @@ Each provider's hardcoded `oauthTokenDomains` is the immutable default safelist.
 
 The extras are read by `saveOAuthAccount` in `provider-settings.ts` and merged with provider defaults (deduped case-insensitively) before being pushed to `chrome.storage.local`'s `oauth.<id>.token_DOMAINS`. Page-side `oauth-bootstrap` re-pushes the merged list on every page load, so newly-added extras apply on next side-panel reload.
 
+## Automated CDP Smoke Test
+
+`packages/dev-tools/tools/extension-smoke-test.ts` is the end-to-end
+verification that the rebuilt extension actually works in a real Chrome
+without remote-code-hosting violations. The npm script
+`test:extension-smoke` runs it after a fresh extension build:
+
+```bash
+npm run build -w @slicc/chrome-extension
+npm run test:extension-smoke -w @slicc/chrome-extension
+```
+
+What it does:
+
+1. Verifies `dist/extension/` exists.
+2. Launches Chrome for Testing (via `findChromeExecutable`) with a
+   disposable user-data-dir and `--load-extension=dist/extension`.
+   `--remote-debugging-port=0` lets Chrome pick a free port, discovered
+   via `<userDataDir>/DevToolsActivePort`.
+3. Resolves the extension ID dynamically from `/json/list`
+   (matches the `chrome-extension://<id>/service-worker.js` target).
+4. Opens `chrome-extension://<id>/index.html?detached=1` as a regular
+   tab so the side-panel UI bootstraps in a CDP-reachable target.
+5. Installs a tiny in-page bridge via `Runtime.evaluate` that
+   synthesizes `TerminalControlMsg` envelopes through
+   `chrome.runtime.sendMessage` (same wire format as the panel's own
+   `TerminalSessionClient`). The bridge opens one terminal session and
+   exposes `window.__sliccSmokeExec(command)`.
+6. Runs two scenarios with `Network.requestWillBeSent` capture:
+   - **`ffmpeg -version`** — asserts exit 0, output contains
+     `ffmpeg version`, no remote `.js` fetches from forbidden hosts
+     (`unpkg.com`, `esm.sh`, `cdn.jsdelivr.net`), and
+     `ffmpeg-core.js` was loaded from `chrome-extension://<id>/`.
+   - **`node -e "..."`** with a `require('lodash')` — asserts exit 0
+     and non-empty stdout (validates the `esm.sh` JS-loader path).
+7. Tears down Chrome and the tmp profile.
+
+On failure the script prints a per-assertion diagnostic and writes a
+full transcript to a temporary file (`smoke artifacts: <path>` is the
+last line on stderr). Chrome stderr is captured next to it.
+
+Local debugging knobs:
+
+- `CHROME_PATH=<bin>` override the resolved Chrome executable.
+- `SLICC_SMOKE_KEEP_PROFILE=1` skip teardown of the tmp profile.
+- `SLICC_SMOKE_TIMEOUT_MS=180000` extend the per-scenario budget.
+
+CI runs the smoke test on Linux under `xvfb-run` (MV3 side panels need
+headed Chrome; `--headless=new` is incompatible with extension loading
+in production Chrome). The CI step is `continue-on-error: true` while
+the `ffmpeg-core.js` bundling work lands — the artifact stays visible
+so regressions are obvious without blocking merges during the rollout.
+
 ## Related Guides
 
 - `packages/webapp/CLAUDE.md` for shared browser architecture
