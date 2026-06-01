@@ -392,7 +392,7 @@ describe('FollowerSyncManager', () => {
   });
 
   describe('cherry.slicc_event handling', () => {
-    it('invokes onCherrySliccEvent with targetId, name, detail', () => {
+    it('invokes onCherrySliccEvent with name, detail (wire targetId not forwarded)', () => {
       const channel = new FakeChannel();
       const onCherrySliccEvent = vi.fn();
       new FollowerSyncManager(channel, { onCherrySliccEvent });
@@ -404,7 +404,7 @@ describe('FollowerSyncManager', () => {
         detail: { ok: true },
       });
 
-      expect(onCherrySliccEvent).toHaveBeenCalledWith('follower-abc', 'build.done', { ok: true });
+      expect(onCherrySliccEvent).toHaveBeenCalledWith('build.done', { ok: true });
     });
 
     it('ignores cherry.slicc_event when no callback is wired', () => {

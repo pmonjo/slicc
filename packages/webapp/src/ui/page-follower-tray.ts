@@ -107,7 +107,7 @@ export interface StartPageFollowerTrayOptions {
    * the iframe's `CherryHostTransport.emitSliccEventToHost`. Omitted by ordinary
    * followers, where the event has no host page to reach.
    */
-  onCherrySliccEvent?: (targetId: string, name: string, detail?: unknown) => void;
+  onCherrySliccEvent?: (name: string, detail?: unknown) => void;
 
   // --- Page-side wiring callbacks ---
   /**

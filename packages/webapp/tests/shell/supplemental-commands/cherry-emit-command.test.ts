@@ -19,9 +19,10 @@ function createMockCtx() {
 }
 
 function runtimeRegistry(
-  ids: string[]
+  ids: string[],
+  emit: ReturnType<typeof vi.fn> = vi.fn().mockResolvedValue({ delivered: true })
 ): CherryRuntimeRegistry & { emitSliccEvent: ReturnType<typeof vi.fn> } {
-  return { listRuntimeIds: () => ids, emitSliccEvent: vi.fn() };
+  return { listRuntimeIds: () => ids, emitSliccEvent: emit };
 }
 
 describe('cherry-emit command', () => {
@@ -36,6 +37,19 @@ describe('cherry-emit command', () => {
     expect(reg.emitSliccEvent).toHaveBeenCalledWith('follower-a', 'ping', { x: 1 });
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toContain('follower-a');
+  });
+
+  it('exits non-zero with the reason on stderr when delivery fails', async () => {
+    const emit = vi.fn().mockResolvedValue({ delivered: false, reason: 'no host attached' });
+    const reg = runtimeRegistry(['follower-a'], emit);
+    const result = await createCherryEmitCommand({ registry: reg }).execute(
+      ['ping'],
+      createMockCtx()
+    );
+    expect(result.exitCode).toBe(1);
+    expect(result.stdout).toBe('');
+    expect(result.stderr).toContain('no host attached');
+    expect(result.stderr).toMatch(/failed to deliver 'ping'/);
   });
 
   it('errors (exit 1) when multiple runtimes and no --runtime', async () => {
@@ -127,20 +141,41 @@ describe('buildDefaultCherryRegistry', () => {
     expect(reg.listRuntimeIds()).toEqual(['follower-cherry', 'follower-cherry2']);
   });
 
-  it('emitSliccEvent bridges to the page via panel-RPC cherry-emit', () => {
+  it('emitSliccEvent bridges to the page via panel-RPC and reports delivered', async () => {
     const call = vi.fn().mockResolvedValue({ delivered: true });
     const client = { call } as unknown as PanelRpcClient;
     const reg = buildDefaultCherryRegistry({ getPanelRpc: () => client });
-    reg.emitSliccEvent('follower-cherry', 'build.done', { ok: true });
+    const result = await reg.emitSliccEvent('follower-cherry', 'build.done', { ok: true });
     expect(call).toHaveBeenCalledWith('cherry-emit', {
       runtimeId: 'follower-cherry',
       name: 'build.done',
       detail: { ok: true },
     });
+    expect(result).toEqual({ delivered: true });
   });
 
-  it('emitSliccEvent is a no-op (no throw) when no panel-RPC client is published', () => {
+  it('emitSliccEvent reports a reason (no throw) when no panel-RPC client is published', async () => {
     const reg = buildDefaultCherryRegistry({ getPanelRpc: () => null });
-    expect(() => reg.emitSliccEvent('follower-cherry', 'noop', undefined)).not.toThrow();
+    const result = await reg.emitSliccEvent('follower-cherry', 'noop', undefined);
+    expect(result.delivered).toBe(false);
+    expect(result.reason).toMatch(/page bridge/i);
+  });
+
+  it('emitSliccEvent reports a reason when the leader returns delivered:false', async () => {
+    const call = vi.fn().mockResolvedValue({ delivered: false });
+    const client = { call } as unknown as PanelRpcClient;
+    const reg = buildDefaultCherryRegistry({ getPanelRpc: () => client });
+    const result = await reg.emitSliccEvent('follower-cherry', 'build.done', undefined);
+    expect(result.delivered).toBe(false);
+    expect(result.reason).toMatch(/not connected/i);
+  });
+
+  it('emitSliccEvent reports a reason (no throw) when the panel-RPC call rejects', async () => {
+    const call = vi.fn().mockRejectedValue(new Error('channel gone'));
+    const client = { call } as unknown as PanelRpcClient;
+    const reg = buildDefaultCherryRegistry({ getPanelRpc: () => client });
+    const result = await reg.emitSliccEvent('follower-cherry', 'build.done', undefined);
+    expect(result.delivered).toBe(false);
+    expect(result.reason).toMatch(/panel-RPC delivery failed: channel gone/);
   });
 });

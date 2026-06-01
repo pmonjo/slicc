@@ -3,25 +3,34 @@ import type { Command } from 'just-bash';
 import { getConnectedFollowersWithFallback, type ConnectedFollowerInfo } from './host-command.js';
 import { getPanelRpcClient, type PanelRpcClient } from '../../kernel/panel-rpc.js';
 import { CHERRY_RUNTIME_TAG } from '../../scoops/tray-sync-protocol.js';
-import { createLogger } from '../../core/logger.js';
 
-const log = createLogger('cherry-emit');
+/**
+ * Outcome of an `emitSliccEvent` attempt. `delivered` is true only when the
+ * event reached the cherry host page; on any failure `reason` carries a
+ * single-line, agent-readable explanation (no page bridge, owning follower not
+ * connected, or transport fault) that `cherry-emit` surfaces on stderr.
+ */
+export interface CherryEmitResult {
+  delivered: boolean;
+  reason?: string;
+}
 
 /**
  * Leader-side registry the `cherry-emit` command drives to push a `slicc.event`
  * out to a cherry host page through a connected follower runtime.
  * `listRuntimeIds()` returns canonical ids (`follower-<bootstrapId>`);
- * `emitSliccEvent` forwards the named event over that runtime's tray channel.
+ * `emitSliccEvent` forwards the named event over that runtime's tray channel
+ * and resolves with whether it was actually delivered.
  *
  * Tests inject a fake registry; production uses `buildDefaultCherryRegistry()`,
  * which reads the leader's connected followers and bridges the emit to the
- * page-side LeaderSyncManager via panel-RPC. When no cherry runtime is
- * connected `cherry-emit` reports that and exits non-zero rather than silently
- * succeeding.
+ * page-side LeaderSyncManager via panel-RPC. Non-delivery never collapses to a
+ * silent log: it resolves `delivered:false` with a reason so `cherry-emit`
+ * exits non-zero rather than reporting a phantom success.
  */
 export interface CherryRuntimeRegistry {
   listRuntimeIds(): string[];
-  emitSliccEvent(runtimeId: string, name: string, detail: unknown): void;
+  emitSliccEvent(runtimeId: string, name: string, detail: unknown): Promise<CherryEmitResult>;
 }
 
 export interface CherryEmitCommandOptions {
@@ -54,35 +63,25 @@ export function buildDefaultCherryRegistry(
         .filter((f) => f.runtime === CHERRY_RUNTIME_TAG)
         .map((f) => f.runtimeId);
     },
-    emitSliccEvent(runtimeId: string, name: string, detail: unknown): void {
+    async emitSliccEvent(
+      runtimeId: string,
+      name: string,
+      detail: unknown
+    ): Promise<CherryEmitResult> {
       const client = getPanelRpc();
       if (!client) {
         // No page bridge — the leader tray lives on the page, so without a
-        // panel-RPC client there's no way to reach it. Surface it loudly
-        // rather than dropping the event silently.
-        log.warn('no panel-RPC client; cannot reach the page-side leader tray', {
-          runtimeId,
-          name,
-        });
-        return;
+        // panel-RPC client there's no way to reach it.
+        return { delivered: false, reason: 'no page bridge to the leader tray (panel-RPC client)' };
       }
-      void client
-        .call('cherry-emit', { runtimeId, name, detail })
-        .then((res) => {
-          if (!res?.delivered) {
-            log.warn('leader reported the follower runtime was not connected', {
-              runtimeId,
-              name,
-            });
-          }
-        })
-        .catch((err: unknown) => {
-          log.warn('panel-RPC delivery failed', {
-            runtimeId,
-            name,
-            error: err instanceof Error ? err.message : String(err),
-          });
-        });
+      try {
+        const res = await client.call('cherry-emit', { runtimeId, name, detail });
+        if (res?.delivered) return { delivered: true };
+        return { delivered: false, reason: 'the follower runtime is not connected to the leader' };
+      } catch (err: unknown) {
+        const message = err instanceof Error ? err.message : String(err);
+        return { delivered: false, reason: `panel-RPC delivery failed: ${message}` };
+      }
     },
   };
 }
@@ -162,7 +161,14 @@ Usage: cherry-emit <name> [--detail <json>] [--runtime <id>]
       }
     }
 
-    registry.emitSliccEvent(runtime!, name, detail);
+    const result = await registry.emitSliccEvent(runtime!, name, detail);
+    if (!result.delivered) {
+      return {
+        stdout: '',
+        stderr: `cherry-emit: failed to deliver '${name}' to ${runtime}: ${result.reason ?? 'unknown reason'}\n`,
+        exitCode: 1,
+      };
+    }
     return { stdout: `cherry-emit: sent '${name}' to ${runtime}\n`, stderr: '', exitCode: 0 };
   });
 }

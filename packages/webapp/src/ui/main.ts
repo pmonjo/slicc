@@ -2869,10 +2869,9 @@ async function mainStandaloneWorker(app: HTMLElement, runtimeMode: UiRuntimeMode
         onStatus: (status) => layout.panels.chat.setProcessing(status === 'processing'),
         // Outbound cone → host bridge: the leader's `cherry-emit` lands here as a
         // `cherry.slicc_event`; forward it to the host page's `onSliccEvent` hook
-        // via the iframe transport. `targetId` is irrelevant on this side — the
-        // iframe only ever lends its own single host page.
-        onCherrySliccEvent: (_targetId, name, detail) =>
-          cherryTransport?.emitSliccEventToHost(name, detail),
+        // via the iframe transport. The iframe only ever lends its own single
+        // host page, so no target needs to be disambiguated on this side.
+        onCherrySliccEvent: (name, detail) => cherryTransport?.emitSliccEventToHost(name, detail),
         setChatAgent: (agent) => layout.panels.chat.setAgent(agent),
         browserAPI: browser,
         addSprinkle: (name, title, element, zone, options) =>

@@ -179,9 +179,9 @@ export type PanelRpcRequest =
       // in the kernel worker, but the leader tray's WebRTC data channels
       // live on the page, so the worker bridges here. `runtimeId` is the
       // canonical follower id (a bare runtime id, no `:localTarget`
-      // suffix). Result `delivered` is false when the owning follower is
-      // not connected, letting the command surface a clear failure rather
-      // than silently succeeding.
+      // suffix). Result `delivered` is false when no leader tray is active
+      // or the owning follower is not connected, letting the command
+      // surface a clear failure rather than silently succeeding.
       op: 'cherry-emit';
       payload: { runtimeId: string; name: string; detail?: unknown };
     };
