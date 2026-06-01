@@ -862,7 +862,7 @@ async function captureTeleportPageDiagnostics(
   const raw = await browser.evaluate(`(() => JSON.stringify({
     url: window.location.href,
     title: document.title || '',
-    bodySnippet: document.body?.innerText?.replace(/s+/g, ' ').trim().slice(0, 500) || '(empty)',
+    bodySnippet: document.body?.innerText?.replace(/\\s+/g, ' ').trim().slice(0, 500) || '(empty)',
   }))()`);
 
   if (typeof raw !== 'string' || raw.length === 0) {
