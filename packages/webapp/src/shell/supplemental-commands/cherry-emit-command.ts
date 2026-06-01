@@ -5,15 +5,16 @@ import { getPanelRpcClient, type PanelRpcClient } from '../../kernel/panel-rpc.j
 import { CHERRY_RUNTIME_TAG } from '../../scoops/tray-sync-protocol.js';
 
 /**
- * Outcome of an `emitSliccEvent` attempt. `delivered` is true only when the
- * event reached the cherry host page; on any failure `reason` carries a
- * single-line, agent-readable explanation (no page bridge, owning follower not
- * connected, or transport fault) that `cherry-emit` surfaces on stderr.
+ * Outcome of an `emitSliccEvent` attempt. `delivered` is true once the event
+ * was handed off to the leader tray over an open channel — that is queue-level
+ * confirmation, not an end-to-end ack that the cherry host page's
+ * `onSliccEvent` fired. On any failure `reason` carries a single-line,
+ * agent-readable explanation (no page bridge, owning follower not connected, or
+ * transport fault) that `cherry-emit` surfaces on stderr. The discriminated
+ * union makes the invariant compiler-enforced: a non-delivery always has a
+ * reason.
  */
-export interface CherryEmitResult {
-  delivered: boolean;
-  reason?: string;
-}
+export type CherryEmitResult = { delivered: true } | { delivered: false; reason: string };
 
 /**
  * Leader-side registry the `cherry-emit` command drives to push a `slicc.event`
@@ -165,7 +166,7 @@ Usage: cherry-emit <name> [--detail <json>] [--runtime <id>]
     if (!result.delivered) {
       return {
         stdout: '',
-        stderr: `cherry-emit: failed to deliver '${name}' to ${runtime}: ${result.reason ?? 'unknown reason'}\n`,
+        stderr: `cherry-emit: failed to deliver '${name}' to ${runtime}: ${result.reason}\n`,
         exitCode: 1,
       };
     }
