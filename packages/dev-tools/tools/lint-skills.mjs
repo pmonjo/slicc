@@ -5,10 +5,10 @@ import { spawnSync } from 'node:child_process';
  * the npm path (`@tessl/cli` devDependency → node_modules/.bin/tessl), so
  * CI's existing `npm ci` provides it — no curl installer.
  *
- * `tessl skill lint` needs a tile.json. We keep the repo clean (decision
- * A): each skill is copied to a temp dir, `tessl skill import` generates
- * an ephemeral tile.json there, and we lint that copy. Nothing is written
- * back into the repo.
+ * `tessl skill lint` operates on a skill directory. We keep the repo
+ * clean (decision A): each skill is copied to a temp dir, `tessl skill
+ * import` generates ephemeral plugin metadata there, and we lint that
+ * copy. Nothing is written back into the repo.
  *
  * If tessl cannot be resolved/run at all we warn-and-skip (exit 0) so a
  * contributor's local `npm run lint` does not hard-break, but we exit
@@ -66,12 +66,11 @@ function lintSkill(skill) {
   const tmp = mkdtempSync(join(tmpdir(), 'slicc-skill-'));
   try {
     cpSync(skill.dir, tmp, { recursive: true });
-    const tile = join(tmp, 'tile.json');
     const imported = runTessl(['skill', 'import', '--force', tmp], repoRoot);
-    if (imported.status !== 0 || !existsSync(tile)) {
+    if (imported.status !== 0) {
       return { ok: false, log: (imported.stdout || '') + (imported.stderr || '') };
     }
-    const linted = runTessl(['skill', 'lint', tile], repoRoot);
+    const linted = runTessl(['skill', 'lint', tmp], repoRoot);
     if (linted.status !== 0) {
       return { ok: false, log: (linted.stdout || '') + (linted.stderr || '') };
     }
