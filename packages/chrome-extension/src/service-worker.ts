@@ -367,7 +367,9 @@ ensureOffscreen();
 // the capture and broadcasts the bytes back over `chrome.runtime` messaging,
 // which the requesting context picks up directly (no SW relay needed for the
 // result). See `capture-popup.html` / `capture-popup.js`.
-function isCaptureOpenWindowMsg(msg: unknown): msg is { type: 'capture-open-window'; url: string } {
+function isCaptureOpenWindowMsg(
+  msg: unknown
+): msg is { type: 'capture-open-window'; url: string; requestId?: string } {
   return (
     typeof msg === 'object' &&
     msg !== null &&
@@ -379,10 +381,26 @@ function isCaptureOpenWindowMsg(msg: unknown): msg is { type: 'capture-open-wind
 
 chrome.runtime.onMessage.addListener((message: unknown) => {
   if (!isCaptureOpenWindowMsg(message)) return false;
+  const requestId = message.requestId;
   chrome.windows
     .create({ url: message.url, type: 'popup', width: 360, height: 220, focused: true })
     .catch((err) => {
       console.error('[slicc-sw] Failed to open capture popup window:', err);
+      // Surface the failure to the requesting context so captureViaPopup
+      // rejects promptly instead of waiting out its ~5-minute timeout. The
+      // success path never reaches this branch, so there is no double-send.
+      if (requestId) {
+        chrome.runtime
+          .sendMessage({
+            source: 'capture-popup',
+            requestId,
+            ok: false,
+            error: `failed to open capture window: ${err?.message || String(err)}`,
+          })
+          .catch(() => {
+            // Requesting context may not be listening — best effort.
+          });
+      }
     });
   return false;
 });
