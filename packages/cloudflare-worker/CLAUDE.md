@@ -33,7 +33,7 @@ The worker provides tray session coordination, capability-token routing, TURN cr
 - `GET|POST /join/:token` — follower join and bootstrap polling flow
 - `GET|POST /controller/:token` — leader attach flow and leader WebSocket upgrade
 - `POST /webhook/:token/:webhookId` — forward webhook events into the live leader
-- `GET /auth/callback` — OAuth callback relay page (decodes `state` param with source/port/path/nonce, redirects to localhost for `source:'local'`, extension for `source:'extension'`, or allowlisted remote origin for `source:'remote'`)
+- `GET /auth/callback` — OAuth callback relay page (decodes `state` param with source/port/path/nonce, redirects to localhost for `source:'local'`, extension for `source:'extension'`, or allowlisted remote origin for `source:'remote'`). **Capture hop:** when hit with a provider response (`?code`/`?error`) and **no `state`** — i.e. the relay already bounced back to the dashboard's own origin — it instead serves a tiny page that `postMessage`s `{ type:'oauth-callback', redirectUrl }` to `window.opener`. This is the completion path for the webapp-served-by-worker (connect/cloud) context, which has no node-server callback page; the webapp's `launchOAuthCli` waits for that message. Used by connect-mode GitHub login (see `packages/webapp/providers/github.ts` `resolveGithubOAuthRedirect`).
 
 ### Signaling model
 

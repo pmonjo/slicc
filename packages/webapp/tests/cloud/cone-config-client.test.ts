@@ -4,6 +4,9 @@ import {
   validateModelHasAccount,
   assembleDelta,
   bundleDropWarnings,
+  parseModelCatalog,
+  providerLabel,
+  modelsForConnected,
 } from '../../cloud/cone-config-client.js';
 
 describe('assembleBundle', () => {
@@ -86,6 +89,70 @@ describe('bundleDropWarnings (surface what assembleBundle silently drops)', () =
     });
     expect(w).toHaveLength(1);
     expect(w[0]).toContain('NO_DOM');
+  });
+});
+
+describe('parseModelCatalog (safe localStorage read)', () => {
+  it('returns [] for missing / invalid / non-array input', () => {
+    expect(parseModelCatalog(null)).toEqual([]);
+    expect(parseModelCatalog('')).toEqual([]);
+    expect(parseModelCatalog('{not json')).toEqual([]);
+    expect(parseModelCatalog('{"a":1}')).toEqual([]);
+  });
+  it('keeps well-formed groups and coerces missing names to ids', () => {
+    const raw = JSON.stringify([
+      {
+        providerId: 'anthropic',
+        providerName: 'Anthropic',
+        models: [{ id: 'm1', name: 'Model 1' }],
+      },
+      { providerId: 'openai', models: [{ id: 'gpt-5' }] }, // no providerName / model name
+      { models: [] }, // no providerId → dropped
+    ]);
+    expect(parseModelCatalog(raw)).toEqual([
+      {
+        providerId: 'anthropic',
+        providerName: 'Anthropic',
+        models: [{ id: 'm1', name: 'Model 1' }],
+      },
+      { providerId: 'openai', providerName: 'openai', models: [{ id: 'gpt-5', name: 'gpt-5' }] },
+    ]);
+  });
+});
+
+describe('providerLabel', () => {
+  const catalog = [{ providerId: 'anthropic', providerName: 'Anthropic', models: [] }];
+  it('uses the catalog name when known, else the id', () => {
+    expect(providerLabel('anthropic', catalog)).toBe('Anthropic');
+    expect(providerLabel('mystery', catalog)).toBe('mystery');
+  });
+});
+
+describe('modelsForConnected', () => {
+  const catalog = [
+    {
+      providerId: 'anthropic',
+      providerName: 'Anthropic',
+      models: [{ id: 'claude-opus-4-6', name: 'Claude Opus 4.6' }],
+    },
+  ];
+  it('returns catalog groups for connected providers', () => {
+    const groups = modelsForConnected(catalog, [{ providerId: 'anthropic', apiKey: 'k' }]);
+    expect(groups).toEqual(catalog);
+  });
+  it('falls back to the built-in map for a connected provider absent from the catalog', () => {
+    const groups = modelsForConnected([], [{ providerId: 'openai', apiKey: 'k' }]);
+    expect(groups).toHaveLength(1);
+    expect(groups[0].providerId).toBe('openai');
+    expect(groups[0].models.length).toBeGreaterThan(0);
+  });
+  it('omits a connected provider with no catalog entry and no fallback, and dedupes', () => {
+    const groups = modelsForConnected(catalog, [
+      { providerId: 'anthropic', apiKey: 'k' },
+      { providerId: 'anthropic', accessToken: 't' }, // duplicate provider
+      { providerId: 'unknown-xyz', apiKey: 'k' }, // no catalog, no fallback
+    ]);
+    expect(groups).toEqual(catalog); // anthropic once, unknown omitted
   });
 });
 

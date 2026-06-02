@@ -1,5 +1,75 @@
 // Pure bundle-assembly helpers for the /cloud dashboard. No DOM access here.
 
+// localStorage key the connect popup (?connect=1) writes the model catalog to,
+// and the dashboard reads. Same-origin handoff, mirroring slicc_accounts.
+export const MODEL_CATALOG_KEY = 'slicc_cloud_model_catalog';
+
+// Safety net so the model picker is never empty for a connected provider that
+// predates the catalog handoff (user hasn't reopened Connect since this shipped).
+// The catalog from getAllAvailableModels() is always authoritative when present.
+const FALLBACK_MODELS = {
+  adobe: [{ id: 'claude-opus-4-6', name: 'Claude Opus 4.6' }],
+  anthropic: [
+    { id: 'claude-opus-4-6', name: 'Claude Opus 4.6' },
+    { id: 'claude-sonnet-4-6', name: 'Claude Sonnet 4.6' },
+  ],
+  openai: [{ id: 'gpt-5', name: 'GPT-5' }],
+};
+
+// Parse the persisted model catalog. Returns a clean GroupedModels[]
+// ([{providerId, providerName, models:[{id,name}]}]) or [] on any problem —
+// never throws, so a corrupt/absent value degrades to "no catalog".
+export function parseModelCatalog(raw) {
+  if (!raw) return [];
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return [];
+  }
+  if (!Array.isArray(parsed)) return [];
+  return parsed
+    .filter((g) => g && typeof g.providerId === 'string' && Array.isArray(g.models))
+    .map((g) => ({
+      providerId: g.providerId,
+      providerName: typeof g.providerName === 'string' ? g.providerName : g.providerId,
+      models: g.models
+        .filter((m) => m && typeof m.id === 'string')
+        .map((m) => ({ id: m.id, name: typeof m.name === 'string' ? m.name : m.id })),
+    }));
+}
+
+// Friendly display name for a provider, from the catalog if known.
+export function providerLabel(providerId, catalog) {
+  const g = catalog.find((x) => x.providerId === providerId);
+  return (g && g.providerName) || providerId;
+}
+
+// The model groups the dashboard should offer: one per connected provider,
+// using the catalog when it has models, else the fallback map. A connected
+// provider with neither is omitted (nothing to pick).
+export function modelsForConnected(catalog, accounts) {
+  const byProvider = new Map(catalog.map((g) => [g.providerId, g]));
+  const seen = new Set();
+  const groups = [];
+  for (const acc of accounts) {
+    const providerId = acc.providerId;
+    if (seen.has(providerId)) continue;
+    seen.add(providerId);
+    const fromCatalog = byProvider.get(providerId);
+    if (fromCatalog && fromCatalog.models.length > 0) {
+      groups.push(fromCatalog);
+    } else if (FALLBACK_MODELS[providerId]) {
+      groups.push({
+        providerId,
+        providerName: providerLabel(providerId, catalog),
+        models: FALLBACK_MODELS[providerId],
+      });
+    }
+  }
+  return groups;
+}
+
 export function assembleBundle({ model, selectedProviderIds, allAccounts, secretRows }) {
   const selected = new Set(selectedProviderIds);
   const accounts = allAccounts

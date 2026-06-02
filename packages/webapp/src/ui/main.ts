@@ -3276,6 +3276,38 @@ async function main(): Promise<void> {
   const app = document.getElementById('app');
   if (!app) throw new Error('#app element not found');
 
+  // Connect mode (?connect=1) is served by the cloudflare worker, which has NO
+  // /api/fetch-proxy — so the llm-proxy SW (scope '/') would 404 every
+  // cross-origin fetch (e.g. GitHub OAuth). It must not control this page.
+  // Unregister any SW left from a prior full-app visit on this origin and reload
+  // once to detach, then proceed SW-free. Detected inline so it gates before the
+  // registration below; mirrors resolveUiRuntimeMode's `connect=1` check.
+  const isConnectModeForSw = (() => {
+    try {
+      return new URL(window.location.href).searchParams.get('connect') === '1';
+    } catch {
+      return false;
+    }
+  })();
+  if ('serviceWorker' in navigator && isConnectModeForSw) {
+    try {
+      const regs = await navigator.serviceWorker.getRegistrations();
+      await Promise.all(regs.map((r) => r.unregister().catch(() => false)));
+      if (
+        navigator.serviceWorker.controller &&
+        !sessionStorage.getItem('slicc-connect-sw-cleared')
+      ) {
+        sessionStorage.setItem('slicc-connect-sw-cleared', '1');
+        log.info('connect mode: detaching from service worker (no proxy on worker origin)');
+        location.reload();
+        return;
+      }
+      sessionStorage.removeItem('slicc-connect-sw-cleared');
+    } catch (err) {
+      log.error('connect-mode SW cleanup failed', err);
+    }
+  }
+
   // Register preview service worker (serves VFS content at /preview/*)
   // and ensure it is controlling this page before we proceed. If the SW
   // was just installed for the first time, `navigator.serviceWorker.
@@ -3284,8 +3316,9 @@ async function main(): Promise<void> {
   // fetches fall through to the dev server and 404, which breaks dips
   // that load .shtml files (welcome dip, etc.). The standard fix is a
   // one-shot reload right after the first activation; we gate it on
-  // sessionStorage to avoid loops.
-  if ('serviceWorker' in navigator) {
+  // sessionStorage to avoid loops. Skipped in connect mode (handled above —
+  // the worker origin has no /api/fetch-proxy, so no SW should control it).
+  if ('serviceWorker' in navigator && !isConnectModeForSw) {
     try {
       await navigator.serviceWorker.register('/preview-sw.js', { scope: '/preview/' });
       log.info('Preview SW registered');

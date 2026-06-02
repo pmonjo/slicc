@@ -3,6 +3,10 @@ import {
   validateModelHasAccount,
   assembleDelta,
   bundleDropWarnings,
+  parseModelCatalog,
+  providerLabel,
+  modelsForConnected,
+  MODEL_CATALOG_KEY,
 } from './cone-config-client.js';
 
 const TOKEN_KEY = 'cloud-ims-token';
@@ -45,6 +49,9 @@ function showToast(message) {
 }
 
 function setSignedIn() {
+  // Adobe is configured by default from the dashboard's IMS token, so there's
+  // always at least one provider available right after sign-in.
+  ensureAdobeDefaultAccount();
   document.getElementById('signed-out').classList.add('hidden');
   document.getElementById('signed-in').classList.remove('hidden');
   document.getElementById('user-box').classList.remove('hidden');
@@ -245,52 +252,207 @@ function renderCones(cones) {
   }
 }
 
-function renderCreateConfig() {
-  const accountListEl = document.getElementById('account-list');
-  const modelSelect = document.getElementById('cone-model');
-  if (!accountListEl || !modelSelect) return;
-
-  // Read accounts from localStorage
-  const accounts = JSON.parse(localStorage.getItem('slicc_accounts') || '[]');
-
-  // Render account checkboxes
-  accountListEl.replaceChildren();
-  for (const acc of accounts) {
-    const label = document.createElement('label');
-    const checkbox = document.createElement('input');
-    checkbox.type = 'checkbox';
-    checkbox.value = acc.providerId;
-    checkbox.className = 'account-checkbox';
-    label.appendChild(checkbox);
-    label.appendChild(document.createTextNode(' ' + acc.providerId));
-    accountListEl.appendChild(label);
-    accountListEl.appendChild(document.createElement('br'));
-  }
-
-  // Populate model dropdown with a static set
-  modelSelect.replaceChildren();
-  const defaultOption = document.createElement('option');
-  defaultOption.value = '';
-  defaultOption.textContent = 'Select model...';
-  modelSelect.appendChild(defaultOption);
-
-  const models = [
-    { value: 'adobe:claude-opus-4-6', label: 'Adobe: Claude Opus 4.6' },
-    { value: 'anthropic:claude-opus-4-6', label: 'Anthropic: Claude Opus 4.6' },
-    { value: 'openai:gpt-5', label: 'OpenAI: GPT-5' },
-  ];
-  for (const m of models) {
-    const opt = document.createElement('option');
-    opt.value = m.value;
-    opt.textContent = m.label;
-    modelSelect.appendChild(opt);
+function readAccounts() {
+  try {
+    const parsed = JSON.parse(localStorage.getItem('slicc_accounts') || '[]');
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
   }
 }
 
-function addSecretRow() {
-  const container = document.getElementById('secret-rows');
-  if (!container) return;
+function readCatalog() {
+  return parseModelCatalog(localStorage.getItem(MODEL_CATALOG_KEY));
+}
 
+// Drop a provider from slicc_accounts and re-render. (The dashboard is a separate
+// bundle from the webapp, so it edits slicc_accounts directly — same as the
+// Adobe seed.) Removing Adobe sticks while other providers exist; if it leaves
+// zero providers, the next sign-in re-seeds it (the "+ Add Adobe (default)"
+// button re-adds it on demand too).
+function removeDashboardAccount(providerId) {
+  if (providerId === ADOBE_PROVIDER_ID) {
+    try {
+      localStorage.setItem(ADOBE_OPTOUT_KEY, '1'); // keep it gone across sign-ins
+    } catch {
+      /* best-effort */
+    }
+  }
+  const accounts = readAccounts().filter((a) => a.providerId !== providerId);
+  try {
+    localStorage.setItem('slicc_accounts', JSON.stringify(accounts));
+  } catch {
+    /* best-effort */
+  }
+  renderCreateConfig();
+}
+
+const ADOBE_PROVIDER_ID = 'adobe';
+// Set when the user explicitly removes Adobe, so it isn't re-seeded on the next
+// sign-in (removal sticks even if it was the last provider). Cleared by "Add
+// Adobe (default)" / a forced add.
+const ADOBE_OPTOUT_KEY = 'slicc_cloud_adobe_optout';
+
+// The dashboard authenticates with Adobe IMS, and the worker already treats that
+// bearer as the cone's ADOBE_IMS_TOKEN. So Adobe is available as a default
+// provider without any provider login: seed it when the user has no accounts (so a
+// cone can be created immediately), refresh its token whenever it exists, and — when
+// `force` — (re)add it even alongside other providers. `force` backs the dashboard's
+// "Add Adobe (default)" button so a user who removed Adobe can always get it back
+// (the IMS token is on hand, no popup/network needed). An explicit opt-out
+// suppresses auto-seeding until the user asks for Adobe again.
+function ensureAdobeDefaultAccount(force = false) {
+  const token = getToken();
+  if (!token) return;
+  if (force) {
+    try {
+      localStorage.removeItem(ADOBE_OPTOUT_KEY);
+    } catch {
+      /* best-effort */
+    }
+  } else if (localStorage.getItem(ADOBE_OPTOUT_KEY)) {
+    return; // user removed Adobe on purpose — don't bring it back
+  }
+  const expMs = parseInt(localStorage.getItem(TOKEN_EXP_KEY) || '0', 10) || undefined;
+  const accounts = readAccounts();
+  const adobe = accounts.find((a) => a.providerId === ADOBE_PROVIDER_ID);
+  if (adobe) {
+    adobe.accessToken = token; // keep the default token fresh
+    if (expMs) adobe.tokenExpiresAt = expMs;
+    if (!adobe.kind) adobe.kind = 'oauth';
+  } else if (force || accounts.length === 0) {
+    accounts.push({
+      providerId: ADOBE_PROVIDER_ID,
+      kind: 'oauth',
+      accessToken: token,
+      ...(expMs ? { tokenExpiresAt: expMs } : {}),
+    });
+  } else {
+    return; // other providers exist and Adobe was removed — leave it removed
+  }
+  try {
+    localStorage.setItem('slicc_accounts', JSON.stringify(accounts));
+  } catch {
+    /* best-effort */
+  }
+}
+
+// Merge the worker-provided Adobe model list (GET /api/cloud/config → adobeModels,
+// sourced from the proxy /v1/config) into the popup-persisted catalog, so Adobe
+// models are offered without a provider login.
+function effectiveCatalog() {
+  const catalog = readCatalog();
+  const adobeModels = (
+    CONFIG && Array.isArray(CONFIG.adobeModels) ? CONFIG.adobeModels : []
+  ).filter((m) => m && m.id);
+  if (adobeModels.length === 0) return catalog;
+  const others = catalog.filter((g) => g.providerId !== ADOBE_PROVIDER_ID);
+  return [
+    {
+      providerId: ADOBE_PROVIDER_ID,
+      providerName: 'Adobe',
+      models: adobeModels.map((m) => ({ id: m.id, name: m.name || m.id })),
+    },
+    ...others,
+  ];
+}
+
+// Fill a <select> with optgroup-per-provider options built from grouped models.
+// Returns true if at least one model option was added. Preserves `current` if
+// it's still offered. `placeholder` is the first (value="") option's label.
+function populateModelSelect(selectEl, groups, current, placeholder) {
+  selectEl.replaceChildren();
+  const first = document.createElement('option');
+  first.value = '';
+  first.textContent = placeholder;
+  selectEl.appendChild(first);
+
+  let count = 0;
+  for (const group of groups) {
+    const og = document.createElement('optgroup');
+    og.label = group.providerName;
+    for (const model of group.models) {
+      const opt = document.createElement('option');
+      opt.value = `${group.providerId}:${model.id}`;
+      opt.textContent = model.name;
+      og.appendChild(opt);
+      count++;
+    }
+    selectEl.appendChild(og);
+  }
+  if (current && groups.some((g) => g.models.some((m) => `${g.providerId}:${m.id}` === current))) {
+    selectEl.value = current;
+  }
+  return count > 0;
+}
+
+// Friendly credential status for a provider row.
+function accountBadge(acc) {
+  if (acc.accessToken) return { text: acc.userName || 'Logged in', warn: false };
+  if (acc.apiKey) return { text: 'API key', warn: false };
+  return { text: 'No credential', warn: true };
+}
+
+function renderCreateConfig() {
+  const card = document.getElementById('create-card');
+  const accountListEl = document.getElementById('account-list');
+  const connectBtn = document.getElementById('connect-btn');
+  const modelSelect = document.getElementById('cone-model');
+  if (!card || !accountListEl || !modelSelect) return;
+
+  const accounts = readAccounts();
+  const hasProviders = accounts.length > 0;
+  card.classList.toggle('has-providers', hasProviders);
+  if (connectBtn) connectBtn.textContent = hasProviders ? 'Manage providers' : 'Connect a provider';
+
+  // Provider rows — read-only; every connected account is provisioned into the cone.
+  const catalog = effectiveCatalog();
+  accountListEl.replaceChildren();
+  for (const acc of accounts) {
+    const row = document.createElement('div');
+    row.className = 'account-row';
+    const name = document.createElement('span');
+    name.className = 'account-row__name';
+    name.textContent = providerLabel(acc.providerId, catalog);
+    row.appendChild(name);
+    const badge = accountBadge(acc);
+    const badgeEl = document.createElement('span');
+    badgeEl.className = 'account-row__badge' + (badge.warn ? ' account-row__badge--warn' : '');
+    badgeEl.textContent = badge.text;
+    row.appendChild(badgeEl);
+
+    const removeBtn = document.createElement('button');
+    removeBtn.type = 'button';
+    removeBtn.className = 'account-row__remove';
+    removeBtn.textContent = 'Remove';
+    removeBtn.addEventListener('click', () => removeDashboardAccount(acc.providerId));
+    row.appendChild(removeBtn);
+
+    accountListEl.appendChild(row);
+  }
+
+  // Adobe is always re-addable from the IMS token — never strand the user. The
+  // button lives in the always-visible providers actions (NOT in #account-list,
+  // which CSS hides when there are no providers), so it stays reachable even
+  // when the list is empty.
+  const hasAdobe = accounts.some((a) => a.providerId === ADOBE_PROVIDER_ID);
+  const addAdobeBtn = document.getElementById('add-adobe-btn');
+  if (addAdobeBtn) addAdobeBtn.classList.toggle('hidden', hasAdobe || !getToken());
+
+  // Model dropdown — derived from connected providers (catalog handoff + fallback).
+  const groups = modelsForConnected(catalog, accounts);
+  const hadModels = populateModelSelect(
+    modelSelect,
+    groups,
+    modelSelect.value,
+    groups.length === 0 ? 'Open Connect to load models' : 'Select model…'
+  );
+  modelSelect.disabled = !hadModels;
+}
+
+// Build a secret-entry row (name / value / domains + remove). Shared by the
+// create card and the manage panel.
+function makeSecretRow() {
   const row = document.createElement('div');
   row.className = 'secret-row';
 
@@ -312,13 +474,20 @@ function addSecretRow() {
   domainsInput.placeholder = 'domains (comma-separated)';
   domainsInput.autocomplete = 'off';
 
-  row.appendChild(nameInput);
-  row.appendChild(document.createTextNode(' '));
-  row.appendChild(valueInput);
-  row.appendChild(document.createTextNode(' '));
-  row.appendChild(domainsInput);
+  const removeBtn = document.createElement('button');
+  removeBtn.type = 'button';
+  removeBtn.className = 'secret-row__remove';
+  removeBtn.textContent = '✕';
+  removeBtn.title = 'Remove secret';
+  removeBtn.addEventListener('click', () => row.remove());
 
-  container.appendChild(row);
+  row.append(nameInput, valueInput, domainsInput, removeBtn);
+  return row;
+}
+
+function addSecretRow() {
+  const container = document.getElementById('secret-rows');
+  if (container) container.appendChild(makeSecretRow());
 }
 
 async function showManagePanel(li, sandboxId) {
@@ -343,24 +512,15 @@ async function showManagePanel(li, sandboxId) {
     modelLabel.textContent = 'Current model: ' + (idx?.model || 'none');
     panel.appendChild(modelLabel);
 
-    // Model selector
+    // Model selector — derived from the user's connected providers, same as create.
     const modelSelect = document.createElement('select');
     modelSelect.className = 'manage-model-select';
-    const defaultOption = document.createElement('option');
-    defaultOption.value = '';
-    defaultOption.textContent = 'Keep current model';
-    modelSelect.appendChild(defaultOption);
-    const models = [
-      { value: 'adobe:claude-opus-4-6', label: 'Adobe: Claude Opus 4.6' },
-      { value: 'anthropic:claude-opus-4-6', label: 'Anthropic: Claude Opus 4.6' },
-      { value: 'openai:gpt-5', label: 'OpenAI: GPT-5' },
-    ];
-    for (const m of models) {
-      const opt = document.createElement('option');
-      opt.value = m.value;
-      opt.textContent = m.label;
-      modelSelect.appendChild(opt);
-    }
+    populateModelSelect(
+      modelSelect,
+      modelsForConnected(effectiveCatalog(), readAccounts()),
+      '',
+      'Keep current model'
+    );
     panel.appendChild(modelSelect);
 
     // Account list with delete toggles
@@ -418,32 +578,7 @@ async function showManagePanel(li, sandboxId) {
 
     const addBtn = document.createElement('button');
     addBtn.textContent = 'Add secret row';
-    addBtn.addEventListener('click', () => {
-      const row = document.createElement('div');
-      row.className = 'secret-row';
-
-      const nameInput = document.createElement('input');
-      nameInput.type = 'text';
-      nameInput.className = 's-name';
-      nameInput.placeholder = 'SECRET_NAME';
-
-      const valueInput = document.createElement('input');
-      valueInput.type = 'password';
-      valueInput.className = 's-value';
-      valueInput.placeholder = 'value';
-
-      const domainsInput = document.createElement('input');
-      domainsInput.type = 'text';
-      domainsInput.className = 's-domains';
-      domainsInput.placeholder = 'domains';
-
-      row.appendChild(nameInput);
-      row.appendChild(document.createTextNode(' '));
-      row.appendChild(valueInput);
-      row.appendChild(document.createTextNode(' '));
-      row.appendChild(domainsInput);
-      addSecretContainer.appendChild(row);
-    });
+    addBtn.addEventListener('click', () => addSecretContainer.appendChild(makeSecretRow()));
     panel.appendChild(addBtn);
 
     // Reconnect button
@@ -628,11 +763,14 @@ createBtn.addEventListener('click', async () => {
     return;
   }
 
-  const selectedProviderIds = Array.from(
-    document.querySelectorAll('#account-list input:checked')
-  ).map((el) => el.value);
-
-  const allAccounts = JSON.parse(localStorage.getItem('slicc_accounts') || '[]');
+  // Every connected account is provisioned into the cone (the provider list is
+  // read-only). assembleBundle/bundleDropWarnings drop + report credential-less ones.
+  const allAccounts = readAccounts();
+  if (allAccounts.length === 0) {
+    showToast('Connect a provider before creating a cone.');
+    return;
+  }
+  const selectedProviderIds = allAccounts.map((a) => a.providerId);
 
   const secretRows = Array.from(document.querySelectorAll('#secret-rows .secret-row')).map(
     (row) => ({
@@ -688,6 +826,11 @@ window.addEventListener('focus', () => {
 });
 
 document.getElementById('add-secret')?.addEventListener('click', addSecretRow);
+
+document.getElementById('add-adobe-btn')?.addEventListener('click', () => {
+  ensureAdobeDefaultAccount(true); // force re-add (clears the opt-out)
+  renderCreateConfig();
+});
 
 document.getElementById('connect-btn')?.addEventListener('click', () => {
   window.open('/?connect=1', 'slicc-connect', 'width=520,height=720');
