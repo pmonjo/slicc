@@ -965,11 +965,30 @@ chrome.debugger.onEvent.addListener(
 // OAuth handler — generic chrome.identity.launchWebAuthFlow for any OAuth provider
 // ---------------------------------------------------------------------------
 
+// Cap for non-interactive (silent) renewal. IMS's prompt=none page loads and
+// then JS-redirects to the chromiumapp.org URL; we keep the hidden web view
+// alive across those navigations (abortOnLoadForNonInteractive:false) up to
+// this budget. Generous enough for the page load + redirect, short enough that
+// a genuinely stuck flow fails fast instead of hanging the renewal.
+const SILENT_RENEW_TIMEOUT_MS = 10_000;
+
 async function handleOAuthRequest(msg: OAuthRequestMsg): Promise<OAuthResultMsg> {
-  const redirectUrl = await chrome.identity.launchWebAuthFlow({
-    url: msg.authorizeUrl,
-    interactive: true,
-  });
+  const interactive = msg.interactive ?? true;
+  const redirectUrl = await chrome.identity.launchWebAuthFlow(
+    interactive
+      ? { url: msg.authorizeUrl, interactive: true }
+      : {
+          url: msg.authorizeUrl,
+          // Silent renewal (prompt=none): no visible window. The default
+          // non-interactive behavior aborts the instant the IMS page loads
+          // ("User interaction required") — before its JS redirect fires — so
+          // we disable that abort and wait across the follow-up navigations
+          // until the flow reaches the redirect URL.
+          interactive: false,
+          abortOnLoadForNonInteractive: false,
+          timeoutMsForNonInteractive: SILENT_RENEW_TIMEOUT_MS,
+        }
+  );
 
   if (!redirectUrl) {
     return {

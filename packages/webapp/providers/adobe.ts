@@ -547,7 +547,9 @@ async function silentRenewToken(): Promise<string | null> {
       // Use the same launcher as normal login — handles CLI, extension, and Electron
       const { createOAuthLauncher } = await import('../src/providers/oauth-service.js');
       const launcher = createOAuthLauncher();
-      const redirectUrl = await launcher(authorizeUrl);
+      // prompt=none needs no user interaction → drive the launcher silently.
+      // In the extension this maps to launchWebAuthFlow({ interactive: false }).
+      const redirectUrl = await launcher(authorizeUrl, { interactive: false });
 
       if (!redirectUrl) return null;
 
