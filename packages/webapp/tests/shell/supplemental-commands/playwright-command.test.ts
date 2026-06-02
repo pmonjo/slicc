@@ -849,6 +849,36 @@ describe('playwright-cli tab management', () => {
     }
   });
 
+  it('tab-list deduplicates repeated targetIds within the RPC response itself', async () => {
+    (browser as { listAllTargets?: unknown }).listAllTargets = vi
+      .fn()
+      .mockResolvedValue([
+        { targetId: 'local-1', title: 'Local Tab', url: 'https://local.example.com' },
+      ]);
+    // RPC response contains the same composite targetId twice
+    (globalThis as { __slicc_panelRpc?: unknown }).__slicc_panelRpc = {
+      call: vi.fn().mockResolvedValue({
+        targets: [
+          { targetId: 'f:dup', title: 'Follower Tab', url: 'https://follower.example.com' },
+          { targetId: 'f:dup', title: 'Follower Tab', url: 'https://follower.example.com' },
+        ],
+      }),
+      dispose: vi.fn(),
+    };
+    const restoreTray = withTrayConfigured();
+
+    try {
+      const cmd = createPlaywrightCommand('playwright-cli', browser as BrowserAPI, fs as VirtualFS);
+      const result = await cmd.execute(['tab-list'], {} as any);
+      expect(result.exitCode).toBe(0);
+      const matches = (result.stdout.match(/Follower Tab/g) ?? []).length;
+      expect(matches).toBe(1);
+    } finally {
+      (globalThis as { __slicc_panelRpc?: unknown }).__slicc_panelRpc = undefined;
+      restoreTray();
+    }
+  });
+
   it('tab-list skips the panel-RPC supplement when no tray is configured', async () => {
     (browser as { listAllTargets?: unknown }).listAllTargets = vi
       .fn()

@@ -41,9 +41,12 @@ export interface StandalonePanelRpcHandlerOptions {
   }) => Promise<PanelRpcResults['tray-leave']> | PanelRpcResults['tray-leave'];
   /**
    * Return the remote (follower) browser targets known to the page-side
-   * BrowserAPI. Only set when a leader tray is active. The worker's
-   * BrowserAPI has no trayTargetProvider, so it can't call
-   * listAllTargets() itself — this bridges the gap.
+   * BrowserAPI. `mainStandaloneWorker` wires this unconditionally to
+   * `browser.listAllTargets()`; it returns local-only (no composite
+   * targetIds) until a leader tray is active, and the `list-remote-targets`
+   * handler filters to composite ids. The worker's BrowserAPI has no
+   * trayTargetProvider, so it can't call listAllTargets() itself — this
+   * bridges the gap. Optional so other host wirings (tests) may omit it.
    */
   listRemoteTargets?: () => Promise<PageInfo[]> | PageInfo[];
 }

@@ -555,6 +555,7 @@ async function getActionablePages(
         const seen = new Set(pages.map((p) => p.targetId));
         for (const t of targets) {
           if (!seen.has(t.targetId)) {
+            seen.add(t.targetId);
             pages.push({ targetId: t.targetId, title: t.title, url: t.url });
           }
         }
