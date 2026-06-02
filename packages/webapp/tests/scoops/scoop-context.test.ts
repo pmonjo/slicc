@@ -1114,6 +1114,11 @@ describe('isNonRetryableError', () => {
     expect(isNonRetryableError('Invalid API-Key provided')).toBe(true);
   });
 
+  it('treats session-expired / re-login messages as non-retryable', () => {
+    expect(isNonRetryableError('Adobe session expired — please log in again')).toBe(true);
+    expect(isNonRetryableError('Session expired, please re-authenticate')).toBe(true);
+  });
+
   it('matches billing/quota errors', () => {
     expect(isNonRetryableError('insufficient quota')).toBe(true);
     expect(isNonRetryableError('billing issue detected')).toBe(true);
