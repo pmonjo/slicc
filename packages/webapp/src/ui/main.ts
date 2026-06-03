@@ -2468,6 +2468,15 @@ async function mainStandaloneWorker(app: HTMLElement, runtimeMode: UiRuntimeMode
       body: { action, data },
     };
     if (interceptWelcomeLick(event)) return;
+    // Follower mode: the dip lives in the leader's mirrored chat, so its
+    // lick belongs to the leader's cone (this worker's cone is model-less
+    // anyway). Mirrors how panel-rendered follower sprinkles forward via
+    // SprinkleFollowerController → sync.sendSprinkleLick.
+    const followerSync = pageFollowerTray?.currentSync;
+    if (followerSync) {
+      followerSync.sendSprinkleLick('inline', { action, data });
+      return;
+    }
     client.sendSprinkleLick('inline', { action, data });
   };
 

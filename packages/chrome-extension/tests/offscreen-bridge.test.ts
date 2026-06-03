@@ -984,6 +984,44 @@ describe('OffscreenBridge follower mode', () => {
     expect(mockSync.sendMessage).not.toHaveBeenCalled();
   });
 
+  it('sprinkle-lick (e.g. chat dip) in follower mode forwards to leader, skips local cone', async () => {
+    mockSync.sendSprinkleLick = vi.fn();
+    bridge.setFollowerSync(mockSync);
+
+    simulatePanelMessage({
+      type: 'sprinkle-lick',
+      sprinkleName: 'inline',
+      body: { action: 'accept', data: { v: 1 } },
+      targetScoop: undefined,
+    });
+
+    await new Promise((r) => setTimeout(r, 10));
+
+    expect(mockSync.sendSprinkleLick).toHaveBeenCalledWith(
+      'inline',
+      { action: 'accept', data: { v: 1 } },
+      undefined
+    );
+    expect(mockOrchestrator.handleMessage).not.toHaveBeenCalled();
+  });
+
+  it('sprinkle-lick falls through to routeSprinkleLick when follower mode inactive', async () => {
+    mockSync.sendSprinkleLick = vi.fn();
+
+    simulatePanelMessage({
+      type: 'sprinkle-lick',
+      sprinkleName: 'inline',
+      body: { action: 'accept' },
+      targetScoop: undefined,
+    });
+
+    await new Promise((r) => setTimeout(r, 10));
+
+    expect(mockSync.sendSprinkleLick).not.toHaveBeenCalled();
+    // routeSprinkleLick → orchestrator.handleMessage on the cone
+    expect(mockOrchestrator.handleMessage).toHaveBeenCalled();
+  });
+
   it('applyFollowerSnapshot replaces cone buffer, persists, emits scoop-messages-replaced', () => {
     // Pre-populate with stale local content to verify replacement.
     const buf = (bridge as any).getBuffer('cone_1');

@@ -1234,6 +1234,18 @@ export class OffscreenBridge implements KernelFacade {
         // shared `routeSprinkleLick` so `startExtensionLeaderTray`'s
         // `onSprinkleLick` callback can share the same routing.
         const lickMsg = msg as any;
+        // Follower mode: the dip lives in the leader's mirrored chat,
+        // so its lick belongs to the leader's cone (this offscreen's
+        // local cone is model-less). Mirrors how follower-panel
+        // sprinkles forward via follower-sprinkle-bridge.
+        if (this.followerSync) {
+          this.followerSync.sendSprinkleLick(
+            lickMsg.sprinkleName,
+            lickMsg.body,
+            lickMsg.targetScoop
+          );
+          break;
+        }
         await this.routeSprinkleLick(
           lickMsg.sprinkleName,
           lickMsg.body,
