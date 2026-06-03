@@ -197,6 +197,7 @@ import {
   getSelectedModelId,
   getSelectedProvider,
   logoutOAuthAccount,
+  maskOAuthTokenWithRetry,
   migrateLegacyAuthOnlySelection,
   removeAccount,
   resolveCurrentModel,
@@ -1865,5 +1866,49 @@ describe('logoutOAuthAccount', () => {
     // This is the exact finder used in showAvatarPopover — must return undefined after logout.
     const found = accounts.find((a) => !a.loggedOut && (a.userName || a.accessToken || a.apiKey));
     expect(found).toBeUndefined();
+  });
+});
+
+describe('maskOAuthTokenWithRetry (cold service worker — issue #847)', () => {
+  // A freshly-opened side panel can have a cold SW whose secrets pipeline isn't
+  // warm yet, so the first secrets.mask-oauth-token round-trip comes back with
+  // no maskedValue. Without a retry, saveOAuthAccount gave up and oauth-token
+  // reported "no masked value" until the panel was reopened. Retry briefly.
+  const noSleep = async () => {};
+
+  it('returns the masked value once the SW warms up (empty, empty, then value)', async () => {
+    const responses = [{}, {}, { maskedValue: 'MASK' }];
+    let i = 0;
+    const send = async () => responses[i++];
+    const result = await maskOAuthTokenWithRetry(send, { attempts: 3, sleep: noSleep });
+    expect(result).toBe('MASK');
+    expect(i).toBe(3); // retried past the two empty responses
+  });
+
+  it('returns immediately on first success without extra round-trips', async () => {
+    let calls = 0;
+    const send = async () => {
+      calls++;
+      return { maskedValue: 'M' };
+    };
+    expect(await maskOAuthTokenWithRetry(send, { attempts: 3, sleep: noSleep })).toBe('M');
+    expect(calls).toBe(1);
+  });
+
+  it('gives up with undefined after exhausting attempts', async () => {
+    let calls = 0;
+    const send = async () => {
+      calls++;
+      return {};
+    };
+    expect(await maskOAuthTokenWithRetry(send, { attempts: 3, sleep: noSleep })).toBeUndefined();
+    expect(calls).toBe(3); // bounded — does not loop forever
+  });
+
+  it('keeps retrying through a transient SW error (resp.error then value)', async () => {
+    const responses = [{ error: 'pipeline build failed' }, { maskedValue: 'MASK2' }];
+    let i = 0;
+    const send = async () => responses[i++];
+    expect(await maskOAuthTokenWithRetry(send, { attempts: 3, sleep: noSleep })).toBe('MASK2');
   });
 });

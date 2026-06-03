@@ -898,6 +898,31 @@ export async function logoutOAuthAccount(providerId: string): Promise<void> {
   }
 }
 
+/**
+ * Run the service-worker `secrets.mask-oauth-token` round-trip with a small
+ * bounded retry. A freshly-opened side panel can hit a cold SW whose secrets
+ * pipeline isn't warm yet, so the FIRST round-trip returns no `maskedValue`
+ * (issue #847). Without a retry, `saveOAuthAccount` gave up and `oauth-token`
+ * reported "no masked value" until the panel was reopened (the boot-time
+ * oauth-bootstrap re-push happened to warm the SW). Retry a few times with a
+ * short backoff. Pure + injectable (`send`/`sleep`) so it is unit-testable
+ * without `chrome`.
+ */
+export async function maskOAuthTokenWithRetry(
+  send: () => Promise<{ maskedValue?: string; error?: string }>,
+  opts: { attempts?: number; delayMs?: number; sleep?: (ms: number) => Promise<void> } = {}
+): Promise<string | undefined> {
+  const attempts = Math.max(1, opts.attempts ?? 3);
+  const delayMs = opts.delayMs ?? 150;
+  const sleep = opts.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+  for (let i = 0; i < attempts; i++) {
+    const resp = await send();
+    if (resp.maskedValue) return resp.maskedValue;
+    if (i < attempts - 1) await sleep(delayMs);
+  }
+  return undefined;
+}
+
 /** Save an OAuth account (used by external providers after token exchange). */
 export async function saveOAuthAccount(opts: {
   providerId: string;
@@ -948,39 +973,44 @@ export async function saveOAuthAccount(opts: {
         [`oauth.${opts.providerId}.token`]: opts.accessToken,
         [`oauth.${opts.providerId}.token_DOMAINS`]: domains.join(','),
       });
-      const resp = await new Promise<{ maskedValue?: string; error?: string }>((resolve) => {
-        chrome.runtime.sendMessage(
-          { type: 'secrets.mask-oauth-token', providerId: opts.providerId },
-          (r: any) => {
-            // Chrome sets `lastError` AND invokes the callback with
-            // `undefined` when the SW is unreachable / message port closed /
-            // listener crashed. Without explicit handling the empty
-            // resolve looks identical to "SW returned no maskedValue".
-            if (chrome.runtime.lastError) {
-              log.error('SW mask-oauth-token transport failed', {
-                providerId: opts.providerId,
-                error: chrome.runtime.lastError.message,
-              });
+      const sendMaskRequest = () =>
+        new Promise<{ maskedValue?: string; error?: string }>((resolve) => {
+          chrome.runtime.sendMessage(
+            { type: 'secrets.mask-oauth-token', providerId: opts.providerId },
+            (r: any) => {
+              // Chrome sets `lastError` AND invokes the callback with
+              // `undefined` when the SW is unreachable / message port closed /
+              // listener crashed. Without explicit handling the empty
+              // resolve looks identical to "SW returned no maskedValue".
+              if (chrome.runtime.lastError) {
+                log.error('SW mask-oauth-token transport failed', {
+                  providerId: opts.providerId,
+                  error: chrome.runtime.lastError.message,
+                });
+              }
+              // The SW handler returns `{ maskedValue: undefined, error: '<msg>' }`
+              // on pipeline-build failure (see service-worker.ts secrets.mask-oauth-token
+              // catch). Surface that — matching the CLI branch's "OAuth replica POST
+              // non-ok" logging — so a failure isn't invisible from the page side.
+              if (r?.error) {
+                log.warn('SW mask-oauth-token returned error', {
+                  providerId: opts.providerId,
+                  error: r.error,
+                });
+              }
+              resolve(r ?? {});
             }
-            resolve(r ?? {});
-          }
-        );
-      });
-      // The SW handler returns `{ maskedValue: undefined, error: '<msg>' }`
-      // on pipeline-build failure (see service-worker.ts secrets.mask-oauth-token
-      // catch). Surface that — matching the CLI branch's "OAuth replica POST
-      // non-ok" logging — so a failure isn't invisible from the page side.
-      if (resp.error) {
-        log.warn('SW mask-oauth-token returned error', {
-          providerId: opts.providerId,
-          error: resp.error,
+          );
         });
-      }
-      if (resp.maskedValue) {
+      // Cold-SW retry (#847): a freshly-opened panel's service worker can return
+      // no maskedValue on the first round-trip before its secrets pipeline is
+      // warm. Retry briefly instead of silently leaving the account unmasked.
+      const maskedValue = await maskOAuthTokenWithRetry(sendMaskRequest);
+      if (maskedValue) {
         const accounts = getAccounts();
         const acct = accounts.find((a) => a.providerId === opts.providerId);
         if (acct) {
-          acct.maskedValue = resp.maskedValue;
+          acct.maskedValue = maskedValue;
           await saveAccountsAsync(accounts);
         }
       }
