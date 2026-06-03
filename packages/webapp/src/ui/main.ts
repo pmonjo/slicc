@@ -2553,6 +2553,10 @@ async function mainStandaloneWorker(app: HTMLElement, runtimeMode: UiRuntimeMode
   // to this page-side bridge, which owns the real RemoteCDPTransport via
   // `pageLeaderTray.sync`. CDP events flow back as `remote-cdp-event`
   // pushes on a dedicated channel instance (same instance-scoped name).
+  // This channel is intentionally page→worker push only: the worker's
+  // `createPanelRpcClient` (a different realm) receives these, and the
+  // page never consumes from it (a BroadcastChannel doesn't deliver to
+  // the instance that posted).
   const remoteCdpPushChannel =
     typeof BroadcastChannel === 'function'
       ? new BroadcastChannel(panelRpcChannelName(instanceId))

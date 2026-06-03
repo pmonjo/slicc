@@ -35,6 +35,7 @@ export interface RemoteCdpPageBridge {
     method: string;
     params?: Record<string, unknown>;
     sessionId?: string;
+    timeout?: number;
   }): Promise<Record<string, unknown>>;
   subscribe(p: { runtimeId: string; localTargetId: string; event: string }): Promise<{
     ok: true;
@@ -100,9 +101,9 @@ export function createRemoteCdpPageBridge(opts: {
   };
 
   return {
-    async send({ runtimeId, localTargetId, method, params, sessionId }) {
+    async send({ runtimeId, localTargetId, method, params, sessionId, timeout }) {
       const session = getOrCreate(runtimeId, localTargetId);
-      return session.transport.send(method, params, sessionId);
+      return session.transport.send(method, params, sessionId, timeout);
     },
 
     async subscribe({ runtimeId, localTargetId, event }) {

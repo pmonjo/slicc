@@ -129,6 +129,11 @@ export class PanelRpcCdpTransport implements CDPTransport {
         method,
         params,
         sessionId,
+        // Forward the resolved CDP timeout so the page-side transport
+        // honors it instead of flooring at its own 30s default. The
+        // panel-RPC `timeoutMs` above is layered strictly higher, so the
+        // real CDP error surfaces before the bridge call times out.
+        timeout: cdpTimeout,
       },
       { timeoutMs }
     );

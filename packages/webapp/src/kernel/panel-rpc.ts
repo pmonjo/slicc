@@ -209,6 +209,13 @@ export type PanelRpcRequest =
         method: string;
         params?: Record<string, unknown>;
         sessionId?: string;
+        /**
+         * Per-op CDP timeout (ms) forwarded to the page-side
+         * `RemoteCDPTransport.send` so a long op (e.g. `Page.printToPDF`)
+         * isn't floored at the page transport's 30s default. The panel-RPC
+         * `call` timeout is always layered strictly above this.
+         */
+        timeout?: number;
       };
     }
   | {

@@ -8,14 +8,26 @@ import {
 
 /** A fake page-side RemoteCDPTransport with controllable events. */
 class FakeRemoteTransport {
-  sent: Array<{ method: string; params?: Record<string, unknown>; sessionId?: string }> = [];
+  sent: Array<{
+    method: string;
+    params?: Record<string, unknown>;
+    sessionId?: string;
+    timeout?: number;
+  }> = [];
   listeners = new Map<string, Set<CDPEventListener>>();
   disconnected = false;
-  send = vi.fn(async (method: string, params?: Record<string, unknown>, sessionId?: string) => {
-    this.sent.push({ method, params, sessionId });
-    if (method === 'Target.attachToTarget') return { sessionId: 'sess-1' };
-    return { ok: method };
-  });
+  send = vi.fn(
+    async (
+      method: string,
+      params?: Record<string, unknown>,
+      sessionId?: string,
+      timeout?: number
+    ) => {
+      this.sent.push({ method, params, sessionId, timeout });
+      if (method === 'Target.attachToTarget') return { sessionId: 'sess-1' };
+      return { ok: method };
+    }
+  );
   on(event: string, listener: CDPEventListener): void {
     let s = this.listeners.get(event);
     if (!s) {
@@ -79,6 +91,23 @@ describe('createRemoteCdpPageBridge', () => {
     });
     expect(result).toEqual({ sessionId: 'sess-1' });
     expect(transports.get('follower-1:tgt-1')?.sent[0].method).toBe('Target.attachToTarget');
+  });
+
+  it('send forwards the per-op timeout to the page transport', async () => {
+    const { sync, transports } = makeSync();
+    const bridge = createRemoteCdpPageBridge({ getSync: () => sync, postEvent: vi.fn() });
+    await bridge.send({
+      runtimeId: 'follower-1',
+      localTargetId: 'tgt-1',
+      method: 'Page.printToPDF',
+      sessionId: 'sess-1',
+      timeout: 90_000,
+    });
+    expect(transports.get('follower-1:tgt-1')?.sent[0]).toMatchObject({
+      method: 'Page.printToPDF',
+      sessionId: 'sess-1',
+      timeout: 90_000,
+    });
   });
 
   it('send throws a clear error when the leader tray is not started', async () => {

@@ -59,6 +59,8 @@ describe('PanelRpcCdpTransport', () => {
       method: 'Page.captureScreenshot',
       params: { format: 'png' },
       sessionId: 'sess-1',
+      // resolved CDP timeout forwarded to the page so it isn't floored at 30s
+      timeout: 30_000,
     });
     // default CDP timeout 30_000 → max(30_000, 15_000) + margin
     expect(fake.calls[0].timeoutMs).toBe(30_000 + PANEL_RPC_BRIDGE_TIMEOUT_MARGIN_MS);
@@ -73,6 +75,8 @@ describe('PanelRpcCdpTransport', () => {
     // max(5_000, 15_000) + margin
     expect(fake.calls[0].timeoutMs).toBe(15_000 + PANEL_RPC_BRIDGE_TIMEOUT_MARGIN_MS);
     expect(PANEL_RPC_DEFAULT_TIMEOUT_MS).toBe(15_000);
+    // the explicit CDP timeout is forwarded to the page transport verbatim
+    expect((fake.calls[0].payload as { timeout?: number }).timeout).toBe(5_000);
   });
 
   it('fails closed when there is no panel-RPC client', async () => {

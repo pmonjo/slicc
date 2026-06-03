@@ -350,9 +350,16 @@ export function createStandalonePanelRpcHandlers(
       };
     },
 
-    'remote-cdp-send': async ({ runtimeId, localTargetId, method, params, sessionId }) => {
+    'remote-cdp-send': async ({ runtimeId, localTargetId, method, params, sessionId, timeout }) => {
       if (!options.remoteCdp) throw new Error('remote-cdp bridge not available');
-      return options.remoteCdp.send({ runtimeId, localTargetId, method, params, sessionId });
+      return options.remoteCdp.send({
+        runtimeId,
+        localTargetId,
+        method,
+        params,
+        sessionId,
+        timeout,
+      });
     },
 
     'remote-cdp-subscribe': async ({ runtimeId, localTargetId, event }) => {
