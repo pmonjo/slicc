@@ -15,6 +15,7 @@
  * `createRemoteTransport()` → `send('Target.attachToTarget', …)`.
  */
 
+import { createLogger } from '../core/logger.js';
 import {
   PANEL_RPC_DEFAULT_TIMEOUT_MS,
   type PanelRpcClient,
@@ -22,6 +23,8 @@ import {
 } from '../kernel/panel-rpc.js';
 import type { CDPTransport } from './transport.js';
 import type { CDPEventListener, ConnectionState } from './types.js';
+
+const log = createLogger('panel-rpc-cdp');
 
 /** Default CDP send timeout, matching `RemoteCDPTransport`. */
 const DEFAULT_CDP_TIMEOUT_MS = 30_000;
@@ -35,6 +38,15 @@ export const PANEL_RPC_BRIDGE_TIMEOUT_MARGIN_MS = 5_000;
 
 export class PanelRpcCdpTransport implements CDPTransport {
   private readonly eventListeners = new Map<string, Set<CDPEventListener>>();
+  /**
+   * In-flight `once()` waiters, so `disconnect()` can reject them with a
+   * clear `Transport disconnected` (mirroring `RemoteCDPTransport`)
+   * instead of letting them hang to their own event timeout.
+   */
+  private readonly pendingOnce = new Set<{
+    reject: (err: Error) => void;
+    timer: ReturnType<typeof setTimeout>;
+  }>();
   private readonly key: string;
   private _state: ConnectionState = 'connected';
   private pushRegistered = false;
@@ -61,20 +73,34 @@ export class PanelRpcCdpTransport implements CDPTransport {
 
   disconnect(): void {
     this._state = 'disconnected';
+    // Reject any in-flight once() waiters with a clear cause rather than
+    // leaving them to hang to their own event timeout.
+    for (const entry of this.pendingOnce) {
+      clearTimeout(entry.timer);
+      entry.reject(new Error('Transport disconnected'));
+    }
+    this.pendingOnce.clear();
     const rpc = this.getPanelRpc();
     if (rpc) {
       if (this.pushRegistered) {
         rpc.unregisterPushTarget(this.key);
         this.pushRegistered = false;
       }
-      // Best-effort page-side teardown; ignore failures (the page may
-      // already be gone, e.g. on reload).
+      // Best-effort page-side teardown — tolerate "page already gone"
+      // (e.g. on reload) by not rejecting the caller, but surface a real
+      // failure (prod logs gate at ERROR) so a never-wired bridge that
+      // leaks the page-side session doesn't fail silently.
       void rpc
         .call('remote-cdp-detach', {
           runtimeId: this.runtimeId,
           localTargetId: this.localTargetId,
         })
-        .catch(() => {});
+        .catch((err) => {
+          log.error('remote-cdp detach failed (page-side session may leak)', {
+            key: this.key,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        });
     }
     this.eventListeners.clear();
   }
@@ -132,15 +158,21 @@ export class PanelRpcCdpTransport implements CDPTransport {
   once(event: string, timeout?: number): Promise<Record<string, unknown>> {
     return new Promise((resolve, reject) => {
       const tm = timeout ?? this.timeoutMs;
-      const timer = setTimeout(() => {
+      const entry = { reject, timer: undefined as unknown as ReturnType<typeof setTimeout> };
+      const cleanup = () => {
+        clearTimeout(entry.timer);
+        this.pendingOnce.delete(entry);
         this.off(event, handler);
+      };
+      entry.timer = setTimeout(() => {
+        cleanup();
         reject(new Error(`Remote CDP event timed out: ${event}`));
       }, tm);
       const handler = (params: Record<string, unknown>) => {
-        clearTimeout(timer);
-        this.off(event, handler);
+        cleanup();
         resolve(params);
       };
+      this.pendingOnce.add(entry);
       this.on(event, handler);
     });
   }
@@ -162,7 +194,16 @@ export class PanelRpcCdpTransport implements CDPTransport {
 
   private subscribe(event: string): void {
     const rpc = this.getPanelRpc();
-    if (!rpc) return; // fail-closed: events simply won't arrive
+    if (!rpc) {
+      // Fail-closed: events can't arrive without a bridge. Surface it —
+      // a silently-skipped subscribe would otherwise present as a caller
+      // (e.g. `navigate`'s `once`) hanging to its event timeout.
+      log.error('remote-cdp subscribe skipped: no panel-RPC client', {
+        key: this.key,
+        event,
+      });
+      return;
+    }
     this.ensurePushRegistered(rpc);
     void rpc
       .call('remote-cdp-subscribe', {
@@ -170,7 +211,16 @@ export class PanelRpcCdpTransport implements CDPTransport {
         localTargetId: this.localTargetId,
         event,
       })
-      .catch(() => {});
+      .catch((err) => {
+        // Don't reject the caller's on()/once() synchronously, but don't
+        // swallow either: a failed subscribe means events for this event
+        // never arrive, surfacing as a misleading event-timeout later.
+        log.error('remote-cdp subscribe failed; events for this transport will not arrive', {
+          key: this.key,
+          event,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      });
   }
 
   private unsubscribe(event: string): void {
@@ -182,6 +232,14 @@ export class PanelRpcCdpTransport implements CDPTransport {
         localTargetId: this.localTargetId,
         event,
       })
-      .catch(() => {});
+      .catch((err) => {
+        // A failed unsubscribe leaks a page-side forwarder ref-count;
+        // surface it instead of swallowing.
+        log.error('remote-cdp unsubscribe failed (page-side forwarder may leak)', {
+          key: this.key,
+          event,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      });
   }
 }

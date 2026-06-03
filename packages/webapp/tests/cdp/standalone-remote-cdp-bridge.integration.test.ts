@@ -36,10 +36,15 @@ class FakeChannel {
     if (this.closed) return;
     const bus = FakeChannel.buses.get(this.name);
     if (!bus) return;
+    // Mirror real BroadcastChannel semantics: messages cross the channel
+    // by structured clone, not by reference. Cloning here is what makes
+    // the large-ArrayBuffer screenshot test a genuine clone-survival
+    // check rather than a pass-by-reference no-op.
+    const cloned = structuredClone(data);
     for (const peer of bus) {
       if (peer === this || peer.closed) continue;
       queueMicrotask(() => {
-        for (const l of peer.listeners) l(new MessageEvent('message', { data }));
+        for (const l of peer.listeners) l(new MessageEvent('message', { data: cloned }));
       });
     }
   }
@@ -149,12 +154,17 @@ function wire(instanceId: string, responses: Record<string, Record<string, unkno
 }
 
 describe('standalone remote-CDP bridge (integration)', () => {
-  it('round-trips attach + a realistic-size screenshot through the bridge', async () => {
-    const bigData = 'A'.repeat(2_000_000); // ~2MB base64 screenshot payload
+  it('round-trips attach + a realistic-size binary screenshot through the bridge', async () => {
+    // ~2MB ArrayBuffer, matching the real `screencapture` result shape
+    // (`bytes: ArrayBuffer`). The FakeChannel structured-clones every
+    // message, so this exercises genuine clone-survival of a large binary
+    // payload across the bridge — not a pass-by-reference no-op.
+    const bytes = new Uint8Array(2_000_000);
+    for (let i = 0; i < bytes.length; i += 4096) bytes[i] = i % 251; // sparse marker bytes
     const responses = {
       'Target.attachToTarget': { sessionId: 'sess-1' },
       'Page.enable': {},
-      'Page.captureScreenshot': { data: bigData },
+      'Page.captureScreenshot': { bytes: bytes.buffer, width: 1280, height: 720 },
     };
     const { provider, teardown } = wire('itest-screenshot', responses);
     // BrowserAPI would do: createRemoteTransport → Target.attachToTarget →
@@ -165,7 +175,15 @@ describe('standalone remote-CDP bridge (integration)', () => {
     expect(attach).toEqual({ sessionId: 'sess-1' });
     await transport.send('Page.enable', {}, 'sess-1');
     const shot = await transport.send('Page.captureScreenshot', { format: 'png' }, 'sess-1');
-    expect((shot.data as string).length).toBe(2_000_000);
+    const buf = shot.bytes as ArrayBuffer;
+    expect(buf).toBeInstanceOf(ArrayBuffer);
+    expect(buf.byteLength).toBe(2_000_000);
+    // The clone is a copy, not the same buffer reference.
+    expect(buf).not.toBe(bytes.buffer);
+    // Marker bytes survived the structured-clone round-trip intact.
+    const view = new Uint8Array(buf);
+    expect(view[0]).toBe(0);
+    expect(view[4096]).toBe(4096 % 251);
 
     teardown();
   });

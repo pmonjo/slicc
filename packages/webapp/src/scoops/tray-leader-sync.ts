@@ -877,7 +877,18 @@ export class LeaderSyncManager {
         log.debug('Cleaned up stale remote transport', { key });
       }
     }
-    this.options.onRemoteTransportsCleaned?.(runtimeId);
+    // Guard the consumer callback: it runs inside `removeFollower` before
+    // the registry/runtime-map cleanup, so a throwing handler would abort
+    // follower teardown and leave a stale entry. Matches the defensive
+    // pattern around `onSprinkleLick` / `onCherryHostEvent`.
+    try {
+      this.options.onRemoteTransportsCleaned?.(runtimeId);
+    } catch (err) {
+      log.warn('onRemoteTransportsCleaned handler threw', {
+        runtimeId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
   }
 
   /**

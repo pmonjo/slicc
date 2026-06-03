@@ -280,6 +280,16 @@ export type PanelRpcPayloadFor<O extends PanelRpcOp> = Extract<
 >['payload'];
 export type PanelRpcResultFor<O extends PanelRpcOp> = PanelRpcResults[O];
 
+/**
+ * Compile-time completeness guard: every `PanelRpcOp` must have a
+ * matching `PanelRpcResults` entry. Indexing `PanelRpcResults[K]` for an
+ * op `K` that lacks a result entry is a type error here, so adding an op
+ * to the `PanelRpcRequest` union without its result fails the build
+ * (rather than silently degrading `PanelRpcResultFor` to an index error
+ * only at some unrelated call site).
+ */
+export type PanelRpcResultsCoverage = { [K in PanelRpcOp]: PanelRpcResults[K] };
+
 // ── Wire envelopes ──────────────────────────────────────────────────
 
 interface PanelRpcRequestMsg {

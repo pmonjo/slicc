@@ -146,4 +146,33 @@ describe('PanelRpcCdpTransport', () => {
     expect(fake.client.unregisterPushTarget).toHaveBeenCalledWith('follower-1:tgt-1');
     await expect(t.send('Page.enable')).rejects.toThrow(/disconnected/);
   });
+
+  it('disconnect() rejects an in-flight once() with "Transport disconnected"', async () => {
+    const fake = makeFakeClient();
+    const t = new PanelRpcCdpTransport(() => fake.client, 'follower-1', 'tgt-1');
+    const p = t.once('Page.loadEventFired');
+    const expectation = expect(p).rejects.toThrow(/Transport disconnected/);
+    t.disconnect();
+    await expectation;
+  });
+
+  it('once() timeout removes its listener (1→0 unsubscribe)', async () => {
+    vi.useFakeTimers();
+    const fake = makeFakeClient();
+    const t = new PanelRpcCdpTransport(() => fake.client, 'follower-1', 'tgt-1');
+    const p = t.once('Page.loadEventFired', 50);
+    const expectation = expect(p).rejects.toThrow(/timed out/);
+    await vi.advanceTimersByTimeAsync(60);
+    await expectation;
+    // The timed-out once() must unwire its listener so the page-side
+    // forwarder is torn down (no leaked subscription).
+    expect(fake.calls.filter((c) => c.op === 'remote-cdp-unsubscribe')).toHaveLength(1);
+    vi.useRealTimers();
+  });
+
+  it('on() with no panel-RPC client neither throws nor registers a push target', () => {
+    const t = new PanelRpcCdpTransport(() => null, 'follower-1', 'tgt-1');
+    expect(() => t.on('Page.loadEventFired', vi.fn())).not.toThrow();
+    expect(t.state).toBe('connected');
+  });
 });
