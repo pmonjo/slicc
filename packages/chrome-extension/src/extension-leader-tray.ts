@@ -30,6 +30,7 @@ import {
   setConnectedFollowersGetter,
   setTrayResetter,
 } from '../../webapp/src/shell/supplemental-commands/host-command.js';
+import { canonicalRuntimeId } from '../../webapp/src/ui/runtime-identity.js';
 import type { AgentEvent, ChatMessage } from '../../webapp/src/ui/types.js';
 import type { OffscreenLeaderSyncBridgeHandle } from './leader-sync-bridge.js';
 import type { LeaderTrayResetRequestMsg, LeaderTrayResetResponseMsg } from './messages.js';
@@ -358,7 +359,7 @@ export function startExtensionLeaderTray(
   // future panel-realm caller.
   setConnectedFollowersGetter(() =>
     trayPeers.getPeers().map((p) => ({
-      runtimeId: p.bootstrapId,
+      runtimeId: canonicalRuntimeId(p.bootstrapId),
       runtime: p.runtime,
       connectedAt: p.connectedAt ?? undefined,
     }))
@@ -386,7 +387,7 @@ export function startExtensionLeaderTray(
   // after construction mutates the live options.
   syncOptions.onFollowerCountChanged = (_count: number) => {
     const peers = trayPeers.getPeers().map((p) => ({
-      runtimeId: p.bootstrapId,
+      runtimeId: canonicalRuntimeId(p.bootstrapId),
       runtime: p.runtime,
       connectedAt: p.connectedAt ?? undefined,
     }));
