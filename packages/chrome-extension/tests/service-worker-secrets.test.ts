@@ -328,4 +328,30 @@ describe('service-worker fetch-proxy.fetch + secrets handlers', () => {
     expect(response.maskedValue).toBeUndefined();
     expect(typeof response.error).toBe('string');
   });
+
+  it('returns { error: "entry missing after write" } when the entry is absent post-write (real fault, not cold miss)', async () => {
+    await import('../src/service-worker.js');
+    // No-op the write so the entry is genuinely missing after "writing" — the
+    // page must be able to tell this from a cold-start miss, so it gets an error.
+    (globalThis as any).chrome.storage.local.set = vi.fn(async () => {});
+    let response: any;
+    for (const l of messageListeners) {
+      const result = l(
+        {
+          type: 'secrets.mask-oauth-token',
+          providerId: 'ghost',
+          accessToken: 't',
+          domains: 'x.com',
+        },
+        {},
+        (r: any) => {
+          response = r;
+        }
+      );
+      if (result === true) break;
+    }
+    await new Promise((r) => setTimeout(r, 30));
+    expect(response.maskedValue).toBeUndefined();
+    expect(response.error).toBe('entry missing after write');
+  });
 });

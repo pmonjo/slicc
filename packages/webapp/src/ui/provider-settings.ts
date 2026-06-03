@@ -919,35 +919,39 @@ export async function logoutOAuthAccount(providerId: string): Promise<void> {
  * @param send Issues one round-trip, resolving `{ maskedValue?, error? }`.
  * @param opts `attempts` (floored to >=1, default 3), `delayMs` (default 150),
  *   and an injectable `sleep`; no sleep after the final attempt.
- * @returns the masked value, or `undefined` if every attempt was empty (never
- *   throws — the caller decides how to surface the give-up). Pure + injectable.
+ * @returns `{ maskedValue }` on success, else `{ lastError }` carrying the last
+ *   SW-reported error (so the caller can log a non-empty give-up reason; may be
+ *   undefined for a genuinely empty/cold reply). Never throws. Pure + injectable.
  */
 export async function maskOAuthTokenWithRetry(
   send: () => Promise<{ maskedValue?: string; error?: string }>,
   opts: { attempts?: number; delayMs?: number; sleep?: (ms: number) => Promise<void> } = {}
-): Promise<string | undefined> {
+): Promise<{ maskedValue?: string; lastError?: string }> {
   const attempts = Math.max(1, opts.attempts ?? 3);
   const delayMs = opts.delayMs ?? 150;
   const sleep = opts.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+  let lastError: string | undefined;
   for (let i = 0; i < attempts; i++) {
     const resp = await send();
-    if (resp.maskedValue) return resp.maskedValue;
+    if (resp.maskedValue) return { maskedValue: resp.maskedValue };
+    if (resp.error) lastError = resp.error;
     if (i < attempts - 1) await sleep(delayMs);
   }
-  return undefined;
+  return { lastError };
 }
 
 /**
  * Register an OAuth token's masked replica via the service worker and persist
  * the masked value on the account.
  *
- * #847: `oauth-token` runs in the offscreen document, which has `chrome.runtime`
- * but NOT `chrome.storage`. So the token + domains travel IN the SW message —
- * the SW (which owns `chrome.storage`) writes them and returns the masked value.
- * This helper deliberately keeps `chrome.storage` out of the offscreen caller;
- * the remove path does the same via `deleteOAuthReplica`. Returns silently
- * (after a `log.error` breadcrumb) if masking never succeeds, and no-ops if the
- * account row is gone. Pure + injectable so it is unit-testable without `chrome`.
+ * #847: `saveOAuthAccount` is reachable from the offscreen `oauth-token` shell
+ * (which has `chrome.runtime` but NOT `chrome.storage`) as well as the page-side
+ * login button (which does have `chrome.storage`). Routing the write through the
+ * SW — which owns `chrome.storage` — is the single path that works from BOTH, so
+ * the token + domains travel IN the SW message and the SW does the write. The
+ * remove path does the same via `deleteOAuthReplica`. Returns (after a
+ * `log.error` breadcrumb with the SW reason) if masking never succeeds, and
+ * no-ops if the account row is gone. Pure + injectable; unit-testable sans `chrome`.
  */
 export async function persistOAuthMaskViaServiceWorker(
   opts: { providerId: string; accessToken: string; domains: string[] },
@@ -967,13 +971,19 @@ export async function persistOAuthMaskViaServiceWorker(
     accessToken: opts.accessToken,
     domains: opts.domains.join(','),
   };
-  const maskedValue = await maskOAuthTokenWithRetry(() => deps.sendMaskRequest(payload), maskOpts);
+  const { maskedValue, lastError } = await maskOAuthTokenWithRetry(
+    () => deps.sendMaskRequest(payload),
+    maskOpts
+  );
   if (!maskedValue) {
     // Don't fail silently: the account stays unmasked and `oauth-token` will
     // report "no masked value". log.warn is dropped at the prod ERROR level, so
     // this give-up breadcrumb must be log.error to be visible at all (#847).
+    // Carry the SW reason so the operator can tell a cold/empty reply apart from
+    // a write failure or "entry missing after write" pipeline fault.
     log.error('OAuth mask give-up: no masked value after retries', {
       providerId: opts.providerId,
+      reason: lastError ?? 'no error reported (cold SW or empty reply)',
     });
     return;
   }

@@ -1882,7 +1882,7 @@ describe('maskOAuthTokenWithRetry (cold service worker — issue #847)', () => {
     let i = 0;
     const send = async () => responses[i++];
     const result = await maskOAuthTokenWithRetry(send, { attempts: 3, sleep: noSleep });
-    expect(result).toBe('MASK');
+    expect(result.maskedValue).toBe('MASK');
     expect(i).toBe(3); // retried past the two empty responses
   });
 
@@ -1892,17 +1892,20 @@ describe('maskOAuthTokenWithRetry (cold service worker — issue #847)', () => {
       calls++;
       return { maskedValue: 'M' };
     };
-    expect(await maskOAuthTokenWithRetry(send, { attempts: 3, sleep: noSleep })).toBe('M');
+    expect((await maskOAuthTokenWithRetry(send, { attempts: 3, sleep: noSleep })).maskedValue).toBe(
+      'M'
+    );
     expect(calls).toBe(1);
   });
 
-  it('gives up with undefined after exhausting attempts', async () => {
+  it('gives up with no maskedValue after exhausting attempts', async () => {
     let calls = 0;
     const send = async () => {
       calls++;
       return {};
     };
-    expect(await maskOAuthTokenWithRetry(send, { attempts: 3, sleep: noSleep })).toBeUndefined();
+    const result = await maskOAuthTokenWithRetry(send, { attempts: 3, sleep: noSleep });
+    expect(result.maskedValue).toBeUndefined();
     expect(calls).toBe(3); // bounded — does not loop forever
   });
 
@@ -1910,7 +1913,16 @@ describe('maskOAuthTokenWithRetry (cold service worker — issue #847)', () => {
     const responses = [{ error: 'pipeline build failed' }, { maskedValue: 'MASK2' }];
     let i = 0;
     const send = async () => responses[i++];
-    expect(await maskOAuthTokenWithRetry(send, { attempts: 3, sleep: noSleep })).toBe('MASK2');
+    expect((await maskOAuthTokenWithRetry(send, { attempts: 3, sleep: noSleep })).maskedValue).toBe(
+      'MASK2'
+    );
+  });
+
+  it('propagates the last SW error reason on give-up (for a prod-visible diagnostic)', async () => {
+    const send = async () => ({ error: 'entry missing after write' });
+    const result = await maskOAuthTokenWithRetry(send, { attempts: 2, sleep: noSleep });
+    expect(result.maskedValue).toBeUndefined();
+    expect(result.lastError).toBe('entry missing after write');
   });
 });
 
@@ -1944,22 +1956,25 @@ describe('persistOAuthMaskViaServiceWorker (#847 — offscreen has no chrome.sto
     expect((accounts[0] as { maskedValue?: string }).maskedValue).toBe('MASK');
   });
 
-  it('leaves the account unmasked AND logs a prod-visible error when masking never succeeds', async () => {
+  it('leaves the account unmasked AND logs a prod-visible error WITH the SW reason', async () => {
     const accounts = [{ providerId: 'github', apiKey: '', accessToken: 'tok' }] as never[];
     mockLog.error.mockClear();
     await persistOAuthMaskViaServiceWorker(
       { providerId: 'github', accessToken: 'tok', domains: ['github.com'] },
       {
-        sendMaskRequest: async () => ({}),
+        // SW reports WHY it couldn't mask — the reason must reach the give-up log.
+        sendMaskRequest: async () => ({ error: 'entry missing after write' }),
         getAccounts: () => accounts,
         saveAccounts: async () => {},
       },
       { attempts: 2, sleep: noSleep }
     );
     expect((accounts[0] as { maskedValue?: string }).maskedValue).toBeUndefined();
-    // #847: the give-up must NOT be silent. log.warn is dropped in prod
-    // (level=ERROR), so the breadcrumb must be log.error or the "no masked
-    // value" symptom recurs with no diagnostic.
-    expect(mockLog.error).toHaveBeenCalled();
+    // #847: the give-up must NOT be silent (log.warn is dropped at prod ERROR
+    // level) AND must carry the reason so cold-SW vs write-fault is diagnosable.
+    expect(mockLog.error).toHaveBeenCalledWith(
+      expect.stringContaining('give-up'),
+      expect.objectContaining({ providerId: 'github', reason: 'entry missing after write' })
+    );
   });
 });

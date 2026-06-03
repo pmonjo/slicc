@@ -1242,7 +1242,11 @@ chrome.runtime.onMessage.addListener(
           // pipeline stopped emitting it). Surface it so the page side can
           // distinguish "not warm yet" from "wrote it and still missing".
           if (accessToken && domains && !found) {
+            // Real fault (not a cold miss): surface a reason so the page can
+            // distinguish it and the give-up log isn't reason-less (#847).
             console.warn('[sw] secrets.mask-oauth-token: entry missing after write', { name });
+            sendResponse({ maskedValue: undefined, error: 'entry missing after write' });
+            return;
           }
           sendResponse({ maskedValue: found?.maskedValue });
         } catch (err) {

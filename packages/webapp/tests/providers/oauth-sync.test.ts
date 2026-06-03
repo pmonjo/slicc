@@ -85,7 +85,6 @@ describe('saveOAuthAccount — CLI sync to /api/secrets/oauth-update', () => {
     expect(fetchCalled).toBe(true);
     const accounts = getAccounts();
     const info = accounts.find((a) => a.providerId === 'github');
-    console.log('Account:', info);
     expect(info?.maskedValue).toBe('ghp_masked_sentinel');
   });
 
@@ -100,6 +99,28 @@ describe('saveOAuthAccount — CLI sync to /api/secrets/oauth-update', () => {
         accessToken: 'ghp_x',
       })
     ).resolves.toBeUndefined();
+  });
+
+  it('logoutOAuthAccount DELETEs the CLI replica at /api/secrets/oauth/<id>', async () => {
+    const calls: { url: string; method?: string }[] = [];
+    globalThis.fetch = vi.fn(async (url: any, init: any) => {
+      calls.push({ url: String(url), method: init?.method });
+      return { ok: true, status: 200 } as any;
+    });
+    (globalThis as any).localStorage.setItem(
+      'slicc_accounts',
+      JSON.stringify([{ providerId: 'github', apiKey: '', accessToken: 'ghp_x' }])
+    );
+
+    const { logoutOAuthAccount } = await import('../../src/ui/provider-settings.js');
+    await expect(logoutOAuthAccount('github')).resolves.toBeUndefined();
+
+    // The CLI branch of deleteOAuthReplica must issue the replica DELETE so the
+    // node-server OauthSecretStore is cleared (local clear ≠ server clear hazard).
+    const del = calls.find(
+      (c) => c.url.includes('/api/secrets/oauth/github') && c.method === 'DELETE'
+    );
+    expect(del).toBeDefined();
   });
 });
 
