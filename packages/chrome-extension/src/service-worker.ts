@@ -1212,8 +1212,27 @@ chrome.runtime.onMessage.addListener(
       typeof msg.providerId === 'string'
     ) {
       const providerId = msg.providerId;
+      const accessToken =
+        'accessToken' in msg && typeof (msg as { accessToken?: unknown }).accessToken === 'string'
+          ? (msg as { accessToken: string }).accessToken
+          : undefined;
+      const domains =
+        'domains' in msg && typeof (msg as { domains?: unknown }).domains === 'string'
+          ? (msg as { domains: string }).domains
+          : undefined;
       (async () => {
         try {
+          // #847: the caller may be the offscreen document, which has
+          // `chrome.runtime` but NOT `chrome.storage` (MV3 quirk — same reason
+          // `secrets.set` proxies through the SW). Write the secret here, where
+          // the SW owns `chrome.storage`, before building the pipeline that
+          // masks it. `domains` is the comma-joined `_DOMAINS` companion.
+          if (accessToken && domains) {
+            await chrome.storage.local.set({
+              [`oauth.${providerId}.token`]: accessToken,
+              [`oauth.${providerId}.token_DOMAINS`]: domains,
+            });
+          }
           const pipeline = await buildSecretsPipeline();
           await pipeline.reload();
           const name = `oauth.${providerId}.token`;

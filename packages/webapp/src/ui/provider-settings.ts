@@ -923,6 +923,45 @@ export async function maskOAuthTokenWithRetry(
   return undefined;
 }
 
+/**
+ * Register an OAuth token's masked replica via the service worker and persist
+ * the masked value on the account.
+ *
+ * #847: `oauth-token` runs in the offscreen document, which has `chrome.runtime`
+ * but NOT `chrome.storage`. So the token + domains must travel IN the SW message
+ * — the SW (which owns `chrome.storage`) writes them and returns the masked
+ * value. The caller must never touch `chrome.storage` directly (it throws
+ * "Cannot read properties of undefined (reading 'local')" in offscreen). Pure +
+ * injectable so it is unit-testable without `chrome`.
+ */
+export async function persistOAuthMaskViaServiceWorker(
+  opts: { providerId: string; accessToken: string; domains: string[] },
+  deps: {
+    sendMaskRequest: (payload: {
+      providerId: string;
+      accessToken: string;
+      domains: string;
+    }) => Promise<{ maskedValue?: string; error?: string }>;
+    getAccounts: () => Account[];
+    saveAccounts: (accounts: Account[]) => Promise<void>;
+  },
+  maskOpts?: { attempts?: number; delayMs?: number; sleep?: (ms: number) => Promise<void> }
+): Promise<void> {
+  const payload = {
+    providerId: opts.providerId,
+    accessToken: opts.accessToken,
+    domains: opts.domains.join(','),
+  };
+  const maskedValue = await maskOAuthTokenWithRetry(() => deps.sendMaskRequest(payload), maskOpts);
+  if (!maskedValue) return;
+  const accounts = deps.getAccounts();
+  const acct = accounts.find((a) => a.providerId === opts.providerId);
+  if (acct) {
+    acct.maskedValue = maskedValue;
+    await deps.saveAccounts(accounts);
+  }
+}
+
 /** Save an OAuth account (used by external providers after token exchange). */
 export async function saveOAuthAccount(opts: {
   providerId: string;
@@ -969,51 +1008,47 @@ export async function saveOAuthAccount(opts: {
   const isExtension = typeof chrome !== 'undefined' && !!chrome?.runtime?.id;
   try {
     if (isExtension) {
-      await chrome.storage.local.set({
-        [`oauth.${opts.providerId}.token`]: opts.accessToken,
-        [`oauth.${opts.providerId}.token_DOMAINS`]: domains.join(','),
-      });
-      const sendMaskRequest = () =>
+      // #847: `oauth-token` runs in the offscreen document, which has
+      // `chrome.runtime` but NOT `chrome.storage` — a direct
+      // `chrome.storage.local.set` here throws "Cannot read properties of
+      // undefined (reading 'local')", the catch swallows it, and the account is
+      // left unmasked. Send the token + domains IN the message so the service
+      // worker (which owns `chrome.storage`) writes them, then masks. The retry
+      // also covers a genuinely cold SW that isn't ready on the first round-trip.
+      const sendMaskRequest = (payload: {
+        providerId: string;
+        accessToken: string;
+        domains: string;
+      }) =>
         new Promise<{ maskedValue?: string; error?: string }>((resolve) => {
-          chrome.runtime.sendMessage(
-            { type: 'secrets.mask-oauth-token', providerId: opts.providerId },
-            (r: any) => {
-              // Chrome sets `lastError` AND invokes the callback with
-              // `undefined` when the SW is unreachable / message port closed /
-              // listener crashed. Without explicit handling the empty
-              // resolve looks identical to "SW returned no maskedValue".
-              if (chrome.runtime.lastError) {
-                log.error('SW mask-oauth-token transport failed', {
-                  providerId: opts.providerId,
-                  error: chrome.runtime.lastError.message,
-                });
-              }
-              // The SW handler returns `{ maskedValue: undefined, error: '<msg>' }`
-              // on pipeline-build failure (see service-worker.ts secrets.mask-oauth-token
-              // catch). Surface that — matching the CLI branch's "OAuth replica POST
-              // non-ok" logging — so a failure isn't invisible from the page side.
-              if (r?.error) {
-                log.warn('SW mask-oauth-token returned error', {
-                  providerId: opts.providerId,
-                  error: r.error,
-                });
-              }
-              resolve(r ?? {});
+          chrome.runtime.sendMessage({ type: 'secrets.mask-oauth-token', ...payload }, (r: any) => {
+            // Chrome sets `lastError` AND invokes the callback with
+            // `undefined` when the SW is unreachable / message port closed /
+            // listener crashed. Without explicit handling the empty
+            // resolve looks identical to "SW returned no maskedValue".
+            if (chrome.runtime.lastError) {
+              log.error('SW mask-oauth-token transport failed', {
+                providerId: opts.providerId,
+                error: chrome.runtime.lastError.message,
+              });
             }
-          );
+            // The SW handler returns `{ maskedValue: undefined, error: '<msg>' }`
+            // on storage-write / pipeline-build failure (see service-worker.ts
+            // secrets.mask-oauth-token catch). Surface that — matching the CLI
+            // branch's "OAuth replica POST non-ok" logging.
+            if (r?.error) {
+              log.warn('SW mask-oauth-token returned error', {
+                providerId: opts.providerId,
+                error: r.error,
+              });
+            }
+            resolve(r ?? {});
+          });
         });
-      // Cold-SW retry (#847): a freshly-opened panel's service worker can return
-      // no maskedValue on the first round-trip before its secrets pipeline is
-      // warm. Retry briefly instead of silently leaving the account unmasked.
-      const maskedValue = await maskOAuthTokenWithRetry(sendMaskRequest);
-      if (maskedValue) {
-        const accounts = getAccounts();
-        const acct = accounts.find((a) => a.providerId === opts.providerId);
-        if (acct) {
-          acct.maskedValue = maskedValue;
-          await saveAccountsAsync(accounts);
-        }
-      }
+      await persistOAuthMaskViaServiceWorker(
+        { providerId: opts.providerId, accessToken: opts.accessToken, domains },
+        { sendMaskRequest, getAccounts, saveAccounts: saveAccountsAsync }
+      );
     } else if (!(globalThis as Record<string, unknown>).__slicc_connect_mode) {
       const r = await fetch('/api/secrets/oauth-update', {
         method: 'POST',

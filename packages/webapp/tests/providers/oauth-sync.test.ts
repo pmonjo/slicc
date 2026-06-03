@@ -103,7 +103,7 @@ describe('saveOAuthAccount — CLI sync to /api/secrets/oauth-update', () => {
   });
 });
 
-describe('saveOAuthAccount — extension sync via chrome.storage.local + SW message', () => {
+describe('saveOAuthAccount — extension sync via SW message (SW owns chrome.storage, #847)', () => {
   let originalChrome: unknown;
   let originalLocalStorage: Storage;
 
@@ -134,9 +134,9 @@ describe('saveOAuthAccount — extension sync via chrome.storage.local + SW mess
     (globalThis as any).localStorage = originalLocalStorage;
   });
 
-  it('writes to chrome.storage.local + dispatches secrets.mask-oauth-token and caches maskedValue', async () => {
+  it('dispatches secrets.mask-oauth-token WITH the token + domains (SW owns the write) and caches maskedValue', async () => {
     const storageWrites: Record<string, unknown> = {};
-    const sentMessages: { msg: unknown }[] = [];
+    const sentMessages: { msg: any }[] = [];
     (globalThis as any).chrome = {
       runtime: {
         id: 'test-ext-id',
@@ -150,6 +150,9 @@ describe('saveOAuthAccount — extension sync via chrome.storage.local + SW mess
           }
         }),
       },
+      // Present here, but #847: saveOAuthAccount must NOT use it — oauth-token
+      // runs in the offscreen document, which has no chrome.storage. The token
+      // travels in the SW message and the SW does the write.
       storage: {
         local: {
           set: vi.fn(async (obj: Record<string, unknown>) => {
@@ -166,18 +169,15 @@ describe('saveOAuthAccount — extension sync via chrome.storage.local + SW mess
       accessToken: 'ghp_real_extension',
     });
 
-    // chrome.storage.local got the OAuth replica + DOMAINS pair
-    expect(storageWrites['oauth.github.token']).toBe('ghp_real_extension');
-    expect(storageWrites['oauth.github.token_DOMAINS']).toBe('github.com');
+    // saveOAuthAccount must NOT write chrome.storage itself (offscreen has none).
+    expect(storageWrites['oauth.github.token']).toBeUndefined();
 
-    // SW received the mask-oauth-token round-trip
-    const askMask = sentMessages.find(
-      (m) =>
-        typeof m.msg === 'object' &&
-        m.msg != null &&
-        (m.msg as any).type === 'secrets.mask-oauth-token'
-    );
+    // The SW round-trip carries the token + comma-joined domains so the SW can
+    // write them.
+    const askMask = sentMessages.find((m) => m.msg?.type === 'secrets.mask-oauth-token');
     expect(askMask).toBeDefined();
+    expect(askMask?.msg.accessToken).toBe('ghp_real_extension');
+    expect(askMask?.msg.domains).toBe('github.com');
 
     // maskedValue from the SW reply was cached in the Account
     const acct = getAccounts().find((a) => a.providerId === 'github');

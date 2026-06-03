@@ -199,6 +199,7 @@ import {
   logoutOAuthAccount,
   maskOAuthTokenWithRetry,
   migrateLegacyAuthOnlySelection,
+  persistOAuthMaskViaServiceWorker,
   removeAccount,
   resolveCurrentModel,
   resolveModelById,
@@ -1910,5 +1911,50 @@ describe('maskOAuthTokenWithRetry (cold service worker — issue #847)', () => {
     let i = 0;
     const send = async () => responses[i++];
     expect(await maskOAuthTokenWithRetry(send, { attempts: 3, sleep: noSleep })).toBe('MASK2');
+  });
+});
+
+describe('persistOAuthMaskViaServiceWorker (#847 — offscreen has no chrome.storage)', () => {
+  // oauth-token runs in the offscreen document, which has chrome.runtime but
+  // NOT chrome.storage. The token+domains must travel IN the SW message so the
+  // SW (which owns chrome.storage) writes them — the caller must never touch
+  // chrome.storage. This helper does exactly that and persists the mask.
+  const noSleep = async () => {};
+
+  it('sends accessToken + comma-joined domains to the SW (so the SW can write storage) and persists the mask', async () => {
+    let payload: { providerId: string; accessToken: string; domains: string } | undefined;
+    const accounts = [{ providerId: 'github', apiKey: '', accessToken: 'tok' }] as never[];
+    await persistOAuthMaskViaServiceWorker(
+      { providerId: 'github', accessToken: 'tok', domains: ['github.com', 'api.github.com'] },
+      {
+        sendMaskRequest: async (p) => {
+          payload = p;
+          return { maskedValue: 'MASK' };
+        },
+        getAccounts: () => accounts,
+        saveAccounts: async () => {},
+      }
+    );
+    // The whole point: the token leaves via the message, not via chrome.storage.
+    expect(payload).toEqual({
+      providerId: 'github',
+      accessToken: 'tok',
+      domains: 'github.com,api.github.com',
+    });
+    expect((accounts[0] as { maskedValue?: string }).maskedValue).toBe('MASK');
+  });
+
+  it('leaves the account unmasked when the SW returns no maskedValue (bounded, no throw)', async () => {
+    const accounts = [{ providerId: 'github', apiKey: '', accessToken: 'tok' }] as never[];
+    await persistOAuthMaskViaServiceWorker(
+      { providerId: 'github', accessToken: 'tok', domains: ['github.com'] },
+      {
+        sendMaskRequest: async () => ({}),
+        getAccounts: () => accounts,
+        saveAccounts: async () => {},
+      },
+      { attempts: 2, sleep: noSleep }
+    );
+    expect((accounts[0] as { maskedValue?: string }).maskedValue).toBeUndefined();
   });
 });
