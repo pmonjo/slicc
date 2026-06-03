@@ -765,30 +765,42 @@ export function addAccount(
   saveAccounts(accounts);
 }
 
-export async function removeAccount(providerId: string): Promise<void> {
-  // For OAuth providers, run the full logout sequence first (token revocation,
-  // IdP session clear, and replica removal). removeAccount then finishes by
-  // deleting the account entry entirely.
-  const accountToRemove = getAccounts().find((a) => a.providerId === providerId);
-  const configToRemove = getProviderConfig(providerId);
-  if (accountToRemove && configToRemove?.isOAuth) {
-    await logoutOAuthAccount(providerId);
-  }
-
-  // Clear the replica BEFORE wiping the local Account
+/**
+ * Remove an OAuth token's replica (the `oauth.<id>.token` + `_DOMAINS` pair).
+ *
+ * #847 (remove-path twin): `removeAccount`/`logoutOAuthAccount` are reachable
+ * from the offscreen shell (`mcp delete`, provider logout), which has
+ * `chrome.runtime` but NOT `chrome.storage` — a direct
+ * `chrome.storage.local.remove` throws there. Route the delete through the SW
+ * `secrets.delete` message (whose `deleteSecret` removes both keys), mirroring
+ * the write path. CLI deletes the node-server replica. Fail-open with a logged
+ * breadcrumb (the local Account is wiped by the caller regardless).
+ */
+async function deleteOAuthReplica(providerId: string): Promise<void> {
   const isExtension = typeof chrome !== 'undefined' && !!chrome?.runtime?.id;
   try {
     if (isExtension) {
-      await chrome.storage.local.remove([
-        `oauth.${providerId}.token`,
-        `oauth.${providerId}.token_DOMAINS`,
-      ]);
+      const resp = await new Promise<{ ok?: boolean; error?: string }>((resolve) => {
+        chrome.runtime.sendMessage(
+          { type: 'secrets.delete', name: `oauth.${providerId}.token` },
+          (r: unknown) => {
+            if (chrome.runtime.lastError) {
+              log.error('SW secrets.delete transport failed', {
+                providerId,
+                error: chrome.runtime.lastError.message,
+              });
+            }
+            resolve((r as { ok?: boolean; error?: string } | undefined) ?? {});
+          }
+        );
+      });
+      if (resp.error) {
+        log.error('SW secrets.delete returned error', { providerId, error: resp.error });
+      }
     } else {
       const r = await fetch(`/api/secrets/oauth/${providerId}`, { method: 'DELETE' });
-      // 404 is benign (already deleted). Anything else non-2xx means the
-      // server still has the OAuth token in its OauthSecretStore — surface
-      // for operational visibility so the user knows local clear ≠ server
-      // clear in that path.
+      // 404 is benign (already deleted). Anything else non-2xx means the server
+      // still has the OAuth token — surface so local clear ≠ server clear is visible.
       if (!r.ok && r.status !== 404) {
         log.warn('OAuth replica DELETE non-ok', { providerId, status: r.status });
       }
@@ -800,6 +812,21 @@ export async function removeAccount(providerId: string): Promise<void> {
       error: err instanceof Error ? err.message : String(err),
     });
   }
+}
+
+export async function removeAccount(providerId: string): Promise<void> {
+  // For OAuth providers, run the full logout sequence first (token revocation,
+  // IdP session clear, and replica removal). removeAccount then finishes by
+  // deleting the account entry entirely.
+  const accountToRemove = getAccounts().find((a) => a.providerId === providerId);
+  const configToRemove = getProviderConfig(providerId);
+  if (accountToRemove && configToRemove?.isOAuth) {
+    await logoutOAuthAccount(providerId);
+  }
+
+  // Clear the replica BEFORE wiping the local Account (SW-proxied in the
+  // extension so it works from the offscreen shell — see deleteOAuthReplica).
+  await deleteOAuthReplica(providerId);
 
   // Use the worker-safe async variant so `mcp delete` (which runs in
   // the kernel worker) writes through panel-rpc to real page
@@ -875,38 +902,25 @@ export async function logoutOAuthAccount(providerId: string): Promise<void> {
   });
   await saveAccountsAsync(updated);
 
-  // 4. Remove token replica from node-server / extension storage
-  const isExt = typeof chrome !== 'undefined' && !!chrome?.runtime?.id;
-  try {
-    if (isExt) {
-      await chrome.storage.local.remove([
-        `oauth.${providerId}.token`,
-        `oauth.${providerId}.token_DOMAINS`,
-      ]);
-    } else {
-      const r = await fetch(`/api/secrets/oauth/${providerId}`, { method: 'DELETE' });
-      if (!r.ok && r.status !== 404) {
-        log.warn('OAuth replica DELETE non-ok during logout', { providerId, status: r.status });
-      }
-    }
-  } catch (err) {
-    log.error('OAuth replica removal failed during logout', {
-      providerId,
-      isExtension: isExt,
-      error: err instanceof Error ? err.message : String(err),
-    });
-  }
+  // 4. Remove token replica from node-server / extension storage (SW-proxied
+  //    in the extension so it works from the offscreen shell — see #847).
+  await deleteOAuthReplica(providerId);
 }
 
 /**
  * Run the service-worker `secrets.mask-oauth-token` round-trip with a small
- * bounded retry. A freshly-opened side panel can hit a cold SW whose secrets
- * pipeline isn't warm yet, so the FIRST round-trip returns no `maskedValue`
- * (issue #847). Without a retry, `saveOAuthAccount` gave up and `oauth-token`
- * reported "no masked value" until the panel was reopened (the boot-time
- * oauth-bootstrap re-push happened to warm the SW). Retry a few times with a
- * short backoff. Pure + injectable (`send`/`sleep`) so it is unit-testable
- * without `chrome`.
+ * bounded retry. Opening a fresh side panel can cold-start the SW whose secrets
+ * pipeline isn't warm yet, so the first round-trip (issued from the offscreen
+ * shell, where `oauth-token` runs) can come back with no `maskedValue`
+ * (issue #847). Retry a few times with a short backoff. Defense-in-depth: the
+ * primary #847 cause was the offscreen `chrome.storage` gap, fixed by moving the
+ * write into the SW (see `persistOAuthMaskViaServiceWorker`).
+ *
+ * @param send Issues one round-trip, resolving `{ maskedValue?, error? }`.
+ * @param opts `attempts` (floored to >=1, default 3), `delayMs` (default 150),
+ *   and an injectable `sleep`; no sleep after the final attempt.
+ * @returns the masked value, or `undefined` if every attempt was empty (never
+ *   throws — the caller decides how to surface the give-up). Pure + injectable.
  */
 export async function maskOAuthTokenWithRetry(
   send: () => Promise<{ maskedValue?: string; error?: string }>,
@@ -928,11 +942,12 @@ export async function maskOAuthTokenWithRetry(
  * the masked value on the account.
  *
  * #847: `oauth-token` runs in the offscreen document, which has `chrome.runtime`
- * but NOT `chrome.storage`. So the token + domains must travel IN the SW message
- * — the SW (which owns `chrome.storage`) writes them and returns the masked
- * value. The caller must never touch `chrome.storage` directly (it throws
- * "Cannot read properties of undefined (reading 'local')" in offscreen). Pure +
- * injectable so it is unit-testable without `chrome`.
+ * but NOT `chrome.storage`. So the token + domains travel IN the SW message —
+ * the SW (which owns `chrome.storage`) writes them and returns the masked value.
+ * This helper deliberately keeps `chrome.storage` out of the offscreen caller;
+ * the remove path does the same via `deleteOAuthReplica`. Returns silently
+ * (after a `log.error` breadcrumb) if masking never succeeds, and no-ops if the
+ * account row is gone. Pure + injectable so it is unit-testable without `chrome`.
  */
 export async function persistOAuthMaskViaServiceWorker(
   opts: { providerId: string; accessToken: string; domains: string[] },
@@ -953,7 +968,15 @@ export async function persistOAuthMaskViaServiceWorker(
     domains: opts.domains.join(','),
   };
   const maskedValue = await maskOAuthTokenWithRetry(() => deps.sendMaskRequest(payload), maskOpts);
-  if (!maskedValue) return;
+  if (!maskedValue) {
+    // Don't fail silently: the account stays unmasked and `oauth-token` will
+    // report "no masked value". log.warn is dropped at the prod ERROR level, so
+    // this give-up breadcrumb must be log.error to be visible at all (#847).
+    log.error('OAuth mask give-up: no masked value after retries', {
+      providerId: opts.providerId,
+    });
+    return;
+  }
   const accounts = deps.getAccounts();
   const acct = accounts.find((a) => a.providerId === opts.providerId);
   if (acct) {
@@ -990,7 +1013,8 @@ export async function saveOAuthAccount(opts: {
   // worker writes through `panel-rpc` to real page localStorage.
   await saveAccountsAsync(accounts);
 
-  // Sync to replica (CLI: node-server /api/secrets/oauth-update; Extension: SW via chrome.storage.local + runtime.sendMessage)
+  // Sync to replica (CLI: node-server /api/secrets/oauth-update; Extension: SW
+  // message — the SW owns the chrome.storage write, see persistOAuthMaskViaServiceWorker)
   const cfg = getProviderConfig(opts.providerId);
   const defaults = cfg?.oauthTokenDomains ?? [];
   const extras = getExtraOAuthDomains(opts.providerId);

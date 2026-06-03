@@ -1944,8 +1944,9 @@ describe('persistOAuthMaskViaServiceWorker (#847 — offscreen has no chrome.sto
     expect((accounts[0] as { maskedValue?: string }).maskedValue).toBe('MASK');
   });
 
-  it('leaves the account unmasked when the SW returns no maskedValue (bounded, no throw)', async () => {
+  it('leaves the account unmasked AND logs a prod-visible error when masking never succeeds', async () => {
     const accounts = [{ providerId: 'github', apiKey: '', accessToken: 'tok' }] as never[];
+    mockLog.error.mockClear();
     await persistOAuthMaskViaServiceWorker(
       { providerId: 'github', accessToken: 'tok', domains: ['github.com'] },
       {
@@ -1956,5 +1957,9 @@ describe('persistOAuthMaskViaServiceWorker (#847 — offscreen has no chrome.sto
       { attempts: 2, sleep: noSleep }
     );
     expect((accounts[0] as { maskedValue?: string }).maskedValue).toBeUndefined();
+    // #847: the give-up must NOT be silent. log.warn is dropped in prod
+    // (level=ERROR), so the breadcrumb must be log.error or the "no masked
+    // value" symptom recurs with no diagnostic.
+    expect(mockLog.error).toHaveBeenCalled();
   });
 });

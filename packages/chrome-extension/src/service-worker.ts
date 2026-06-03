@@ -1237,6 +1237,13 @@ chrome.runtime.onMessage.addListener(
           await pipeline.reload();
           const name = `oauth.${providerId}.token`;
           const found = pipeline.getMaskedEntries().find((e) => e.name === name);
+          // We just wrote the secret above, so a missing entry here is NOT a
+          // cold-start miss — it's a real fault (write didn't land, or the
+          // pipeline stopped emitting it). Surface it so the page side can
+          // distinguish "not warm yet" from "wrote it and still missing".
+          if (accessToken && domains && !found) {
+            console.warn('[sw] secrets.mask-oauth-token: entry missing after write', { name });
+          }
           sendResponse({ maskedValue: found?.maskedValue });
         } catch (err) {
           console.error('[sw] secrets.mask-oauth-token failed', err);
