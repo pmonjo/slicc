@@ -6,6 +6,7 @@ import {
   buildDefaultCherryRegistry,
   type CherryRuntimeRegistry,
   createCherryEmitCommand,
+  setCherryEmitter,
 } from '../../../src/shell/supplemental-commands/cherry-emit-command.js';
 import type { ConnectedFollowerInfo } from '../../../src/shell/supplemental-commands/host-command.js';
 
@@ -177,5 +178,52 @@ describe('buildDefaultCherryRegistry', () => {
     const result = await reg.emitSliccEvent('follower-cherry', 'build.done', undefined);
     expect(result.delivered).toBe(false);
     expect(result.reason).toMatch(/panel-RPC delivery failed: channel gone/);
+  });
+
+  // Extension offscreen: the leader tray lives in-realm, so emit goes through a
+  // direct emitter (set via setCherryEmitter) instead of the panel-RPC bridge.
+  it('emitSliccEvent prefers the in-realm direct emitter and skips panel-RPC', async () => {
+    const emitter = vi.fn().mockReturnValue(true);
+    const call = vi.fn();
+    const reg = buildDefaultCherryRegistry({
+      getEmitter: () => emitter,
+      getPanelRpc: () => ({ call }) as unknown as PanelRpcClient,
+    });
+    const result = await reg.emitSliccEvent('follower-cherry', 'build.done', { ok: true });
+    expect(emitter).toHaveBeenCalledWith('follower-cherry', 'build.done', { ok: true });
+    expect(call).not.toHaveBeenCalled();
+    expect(result).toEqual({ delivered: true });
+  });
+
+  it('emitSliccEvent (direct emitter) reports a reason when the leader returns false', async () => {
+    const reg = buildDefaultCherryRegistry({ getEmitter: () => () => false });
+    const result = await reg.emitSliccEvent('follower-cherry', 'noop', undefined);
+    expect(result.delivered).toBe(false);
+    expect(result.reason).toMatch(/not connected/i);
+  });
+
+  it('emitSliccEvent (direct emitter) reports a reason (no throw) when the emitter throws', async () => {
+    const reg = buildDefaultCherryRegistry({
+      getEmitter: () => () => {
+        throw new Error('sync gone');
+      },
+    });
+    const result = await reg.emitSliccEvent('follower-cherry', 'noop', undefined);
+    expect(result.delivered).toBe(false);
+    expect(result.reason).toMatch(/direct emit failed: sync gone/);
+  });
+
+  it('honors the module-level emitter registered via setCherryEmitter()', async () => {
+    const emitter = vi.fn().mockResolvedValue(true);
+    setCherryEmitter(emitter);
+    try {
+      // No panel-RPC client published — only the direct emitter is available.
+      const reg = buildDefaultCherryRegistry({ getPanelRpc: () => null });
+      const result = await reg.emitSliccEvent('follower-cherry', 'x', undefined);
+      expect(emitter).toHaveBeenCalledWith('follower-cherry', 'x', undefined);
+      expect(result).toEqual({ delivered: true });
+    } finally {
+      setCherryEmitter(null);
+    }
   });
 });

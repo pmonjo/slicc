@@ -17,6 +17,33 @@ import { type ConnectedFollowerInfo, getConnectedFollowersWithFallback } from '.
 export type CherryEmitResult = { delivered: true } | { delivered: false; reason: string };
 
 /**
+ * A direct, in-realm emitter for floats where the leader tray lives in the
+ * SAME realm as the `cherry-emit` command — i.e. the extension offscreen
+ * document, where `extension-leader-tray.ts` constructs the `LeaderSyncManager`
+ * alongside the agent shell. Returns whether the event was handed to the owning
+ * follower's channel. When unset (e.g. the standalone kernel worker, where the
+ * leader tray lives on the page), `emitSliccEvent` falls back to the worker→page
+ * panel-RPC bridge.
+ */
+export type CherryDirectEmitter = (
+  runtimeId: string,
+  name: string,
+  detail: unknown
+) => boolean | Promise<boolean>;
+
+let directEmitter: CherryDirectEmitter | null = null;
+
+/**
+ * Register (or clear with `null`) the in-realm direct emitter. Set on leader
+ * start and cleared on stop by the in-realm leader, mirroring
+ * `setConnectedFollowersGetter`. Only the extension offscreen leader uses this;
+ * the standalone leader lives on the page and is reached over panel-RPC instead.
+ */
+export function setCherryEmitter(emitter: CherryDirectEmitter | null): void {
+  directEmitter = emitter;
+}
+
+/**
  * Leader-side registry the `cherry-emit` command drives to push a `slicc.event`
  * out to a cherry host page through a connected follower runtime.
  * `listRuntimeIds()` returns canonical ids (`follower-<bootstrapId>`);
@@ -43,21 +70,24 @@ export interface CherryEmitCommandOptions {
 export interface DefaultCherryRegistryDeps {
   getFollowers?: () => ConnectedFollowerInfo[];
   getPanelRpc?: () => PanelRpcClient | null;
+  getEmitter?: () => CherryDirectEmitter | null;
 }
 
 /**
  * The production `CherryRuntimeRegistry`. `listRuntimeIds()` returns the
  * canonical ids of connected followers whose runtime tag is `slicc-cherry`
- * (only those can receive a `slicc.event`); `emitSliccEvent` bridges to the
- * page-side `LeaderSyncManager.emitCherrySliccEvent` over panel-RPC, since the
- * `cherry-emit` command runs in the kernel worker but the leader tray's WebRTC
- * channels live on the page.
+ * (only those can receive a `slicc.event`). `emitSliccEvent` reaches the leader
+ * by whichever path the float provides: a same-realm direct emitter when one is
+ * registered (extension offscreen — see `setCherryEmitter`), otherwise the
+ * worker→page panel-RPC bridge (standalone, where the leader tray's WebRTC
+ * channels live on the page).
  */
 export function buildDefaultCherryRegistry(
   deps: DefaultCherryRegistryDeps = {}
 ): CherryRuntimeRegistry {
   const getFollowers = deps.getFollowers ?? getConnectedFollowersWithFallback;
   const getPanelRpc = deps.getPanelRpc ?? getPanelRpcClient;
+  const getEmitter = deps.getEmitter ?? (() => directEmitter);
   return {
     listRuntimeIds(): string[] {
       return getFollowers()
@@ -69,10 +99,27 @@ export function buildDefaultCherryRegistry(
       name: string,
       detail: unknown
     ): Promise<CherryEmitResult> {
+      // Preferred path when the leader tray is in this realm (extension
+      // offscreen): call `LeaderSyncManager.emitCherrySliccEvent` directly, no
+      // bridge hop — mirrors the inbound `handleCherryHostEvent` direct call.
+      const emitter = getEmitter();
+      if (emitter) {
+        try {
+          const delivered = await emitter(runtimeId, name, detail);
+          if (delivered) return { delivered: true };
+          return {
+            delivered: false,
+            reason: 'the follower runtime is not connected to the leader',
+          };
+        } catch (err: unknown) {
+          const message = err instanceof Error ? err.message : String(err);
+          return { delivered: false, reason: `direct emit failed: ${message}` };
+        }
+      }
       const client = getPanelRpc();
       if (!client) {
-        // No page bridge — the leader tray lives on the page, so without a
-        // panel-RPC client there's no way to reach it.
+        // No in-realm leader and no page bridge — there's no way to reach the
+        // leader tray (the standalone worker needs the panel-RPC client).
         return { delivered: false, reason: 'no page bridge to the leader tray (panel-RPC client)' };
       }
       try {

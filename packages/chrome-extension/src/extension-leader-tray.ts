@@ -25,6 +25,7 @@ import { LeaderSyncManager } from '../../webapp/src/scoops/tray-leader-sync.js';
 import type { SprinkleSummary } from '../../webapp/src/scoops/tray-sync-protocol.js';
 import { LeaderTrayPeerManager } from '../../webapp/src/scoops/tray-webrtc.js';
 import type { ChannelMessage } from '../../webapp/src/scoops/types.js';
+import { setCherryEmitter } from '../../webapp/src/shell/supplemental-commands/cherry-emit-command.js';
 import {
   setConnectedFollowersGetter,
   setTrayResetter,
@@ -363,6 +364,12 @@ export function startExtensionLeaderTray(
     }))
   );
 
+  // Outbound `cherry-emit` (cone → host `slicc.event`): the agent shell runs in
+  // this same offscreen realm as `sync`, so emit directly with no panel-RPC hop
+  // (the standalone float bridges worker→page instead). Mirror of the inbound
+  // `onCherryHostEvent` direct call.
+  setCherryEmitter((runtimeId, name, detail) => sync.emitCherrySliccEvent(runtimeId, name, detail));
+
   const resetSequence = async (): Promise<LeaderTrayRuntimeStatus> => {
     sync.stop();
     trayPeers.stop();
@@ -465,6 +472,7 @@ export function startExtensionLeaderTray(
       trayPeers.stop();
       trayLeader.stop();
       setConnectedFollowersGetter(null);
+      setCherryEmitter(null);
       setTrayResetter(null);
       chrome.runtime.onMessage.removeListener(resetListener);
       leaderBridge.signalLeaderMode(false);
