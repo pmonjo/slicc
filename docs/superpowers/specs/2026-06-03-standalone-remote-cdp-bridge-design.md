@@ -1,6 +1,6 @@
 # Standalone remote-CDP bridge — driving federated tray targets from the cone
 
-**Status:** Design / approved through brainstorming
+**Status:** Design / approved through brainstorming (revised after design review)
 **Date:** 2026-06-03
 **Owner:** Karl
 **Issue:** [ai-ecoverse/slicc#848](https://github.com/ai-ecoverse/slicc/issues/848)
@@ -28,20 +28,20 @@ channels all live in the **same realm** (the offscreen document), so the
 BrowserAPI builds a `RemoteCDPTransport` straight over the co-located WebRTC
 channel — no bridge needed. Standalone splits the agent + `BrowserAPI` (kernel
 worker) from the tray + WebRTC channels (page). The worker physically cannot
-build a `RemoteCDPTransport`. That realm boundary — not the driving logic — is
-the entire gap.
+build a `RemoteCDPTransport` (the `RTCDataChannel` is non-transferable). That
+realm boundary — not the driving logic — is the entire gap.
 
 Listing was already bridged worker→page via the `list-remote-targets`
-panel-RPC op. This is the same move for **driving**.
+panel-RPC op (PR #831, on main). This is the same move for **driving**.
 
 ## Goal
 
 From a standalone leader's cone, driving a remote (tray/cherry) target works
 with **full parity** to a local tab — `screenshot`, `navigate`, `evaluate`,
-`click`/`type`, `snapshot`/accessibility — anything `BrowserAPI` does. Achieved
-without changing `BrowserAPI`'s driving logic: the worker gets a
-`TrayTargetProvider` whose transport tunnels CDP over the existing panel-RPC
-BroadcastChannel to the page, where the real `RemoteCDPTransport` lives.
+`click`/`type`, `snapshot`/accessibility — anything `BrowserAPI` does, **without
+changing `BrowserAPI`'s driving logic**: the worker gets a `TrayTargetProvider`
+whose transport tunnels CDP over the existing panel-RPC BroadcastChannel to the
+page, where the real `RemoteCDPTransport` lives.
 
 ## Non-goals
 
@@ -49,7 +49,8 @@ BroadcastChannel to the page, where the real `RemoteCDPTransport` lives.
 - No new transport stack — reuse the existing panel-RPC BroadcastChannel and the
   page-side `RemoteCDPTransport`.
 - Not changing how targets are **listed** (the `list-remote-targets` supplement
-  in `playwright-command.ts` stays as-is).
+  in `playwright-command.ts` stays as-is). Worker-side `BrowserAPI.listAllTargets()`
+  therefore remains local-only — see "Listing stays split" below.
 - `Network.*` remains unavailable on cherry targets (a follower/cherry
   capability concern, orthogonal to this bridge).
 
@@ -58,130 +59,207 @@ BroadcastChannel to the page, where the real `RemoteCDPTransport` lives.
 Give the kernel-worker `BrowserAPI` a `TrayTargetProvider` whose
 `createRemoteTransport()` returns a `PanelRpcCdpTransport` — a `CDPTransport`
 implementation that tunnels over the panel-RPC BroadcastChannel to a page-side
-handler. The handler owns the _real_ `RemoteCDPTransport` (built via the
-page's `LeaderSyncManager` provider) and relays both directions. Net effect:
-the worker's `attachToPage` / `withTab` / `screenshot` / `navigate` / … run
-**unchanged** — the same code path the offscreen BrowserAPI already uses; only
-the transport differs (panel-RPC-tunneled instead of directly owning WebRTC).
+handler. The handler lazily creates/owns the _real_ `RemoteCDPTransport` (via
+the page's `LeaderSyncManager` provider) and relays both directions. Net
+effect: the worker's `attachToPage` / `withTab` / `screenshot` / `navigate` / …
+run **unchanged** — the same code path the offscreen BrowserAPI already uses;
+only the transport differs (panel-RPC-tunneled instead of directly owning
+WebRTC).
 
 ## Components
 
-### 1. `PanelRpcCdpTransport` (worker, `packages/webapp/src/cdp/`)
+### 1. `PanelRpcCdpTransport` (worker, `packages/webapp/src/cdp/panel-rpc-cdp-transport.ts`)
 
-Implements `CDPTransport`:
+Implements `CDPTransport`, **modeled on `RemoteCDPTransport`** (same shape, same
+no-`connect()` lifecycle) — this is load-bearing:
 
-- `connect()` → panel-RPC `remote-cdp-attach { runtimeId, localTargetId }`; the
-  page creates/gets its `RemoteCDPTransport` for the target.
-- `send(method, params, sessionId, timeout)` → panel-RPC
-  `remote-cdp-send { runtimeId, localTargetId, method, params, sessionId }`;
+- **Lifecycle parity with `RemoteCDPTransport`:** initial `state = 'connected'`,
+  `connect()` is a no-op. `BrowserAPI.attachToPage()` / `closePage()` go
+  straight to `createRemoteTransport()` → `send('Target.attachToTarget' | …)`
+  and **never call `connect()`** on a remote transport. The page-side session is
+  created **lazily on the first `send`/`subscribe`** for a key, not by an
+  explicit attach step. (Mirroring `RemoteCDPTransport`, whose `connect()` is
+  `/* no-op — connected via data channel */`.)
+- `send(method, params, sessionId, timeout)` → `panelRpc.call('remote-cdp-send',
+{ runtimeId, localTargetId, method, params, sessionId }, { timeoutMs })` →
   returns the page-relayed CDP response. `sessionId` threads through
-  transparently (the bridge is session-agnostic).
-- `on(event, listener)` / `off` / `once(event, timeout)` — register interest
-  locally; the first listener for an event sends `remote-cdp-subscribe`
-  (idempotent) so the page wires a forwarder; `off`/teardown send
-  `remote-cdp-unsubscribe`. Events arrive as pushed `remote-cdp-event` messages
-  and dispatch to local listeners. `once` resolves on the next matching push
-  (with timeout).
-- `disconnect()` → panel-RPC `remote-cdp-detach`; the page disposes its
-  transport + forwarders.
-- `state` tracks connection state.
+  transparently (the bridge is session-agnostic). Timeout rule below.
+- `on(event, listener)` / `off` / `once(event, timeout)` — maintain a local
+  `eventListeners` map (as `RemoteCDPTransport` does). The first listener for an
+  event sends `remote-cdp-subscribe`; the last `off` sends
+  `remote-cdp-unsubscribe`. Pushed `remote-cdp-event` messages dispatch to local
+  listeners; `once` resolves on the next matching push (with timeout).
+- `disconnect()` → `panelRpc.call('remote-cdp-detach', …)`; clears local
+  listeners.
+- Fails closed: if `getPanelRpcClient()` is `null` (not standalone / no page
+  bridge), `send` rejects with a clear "no page bridge to the leader tray"
+  error — the same fail-closed pattern other worker-side panel-RPC consumers use
+  (e.g. `cherry-emit`).
 
-Keyed per `runtimeId:localTargetId`.
+> Implementation note: a hand-rolled impl mirroring `RemoteCDPTransport` fits
+> panel-RPC's call/promise + event-push model directly. `kernel/cdp-bridge.ts`'s
+> `CdpTransportBridge` (used by `panel-cdp-proxy` / `offscreen-cdp-proxy`) is an
+> alternative if it removes more duplicated listener/timeout logic than it adds
+> impedance against panel-RPC's promise-based `call()`. The plan picks one;
+> either way the observable `CDPTransport` behavior must match `RemoteCDPTransport`.
 
-### 2. Worker bridging `TrayTargetProvider` (`packages/webapp/src/cdp/`, wired in `kernel-worker.ts`)
+### 2. Worker bridging `TrayTargetProvider` (`packages/webapp/src/cdp/panel-rpc-tray-provider.ts`, wired in `kernel-worker.ts`)
 
 `createPanelRpcTrayProvider(getPanelRpc)`:
 
-- `createRemoteTransport(runtimeId, localTargetId)` → a `PanelRpcCdpTransport`.
-- `removeRemoteTransport(runtimeId, localTargetId)` → disconnects/disposes it.
-- `openRemoteTab(runtimeId, url)` → panel-RPC `remote-open-tab`, returning the
-  composite targetId.
-- `getTargets()` returns `[]` — listing stays handled by the existing
-  `list-remote-targets` supplement in `playwright-command.ts` (a `[]` here is
-  behaviourally identical to today's no-provider case, so there is no listing
-  regression). This provider's job is **driving**, not listing.
+- `createRemoteTransport(runtimeId, localTargetId)` → a `PanelRpcCdpTransport`,
+  **cached by `runtimeId:localTargetId`** so repeated `attachToPage` to the same
+  target (or `closePage`'s create/use/remove) doesn't leak page-side sessions.
+- `removeRemoteTransport(runtimeId, localTargetId)` → `disconnect()` the cached
+  transport (→ `remote-cdp-detach`) and drop it from the cache. Must be reached
+  from every `BrowserAPI` cleanup path (detach, target switch,
+  `ensureConnected()` recovery) — same call sites that already invoke it for the
+  page-side provider.
+- `openRemoteTab(runtimeId, url)` → `panelRpc.call('remote-open-tab', …)`,
+  returning the composite targetId.
+- `getTargets()` returns `[]` — listing stays on the existing
+  `list-remote-targets` supplement (a `[]` here is behaviourally identical to
+  today's no-provider case → no listing regression). This provider's job is
+  **driving**, not listing.
 
-Wired once at worker boot: `browser.setTrayTargetProvider(createPanelRpcTrayProvider(getPanelRpcClient))`.
-Safe to set unconditionally — its methods are only exercised for composite
-remote ids, which exist only when a tray is active; with no panel-RPC client
-they fail closed with a clear "no page bridge" error.
+Wired once at worker boot, after `BrowserAPI` construction:
+`browser.setTrayTargetProvider(createPanelRpcTrayProvider(getPanelRpcClient))`.
+Safe to set unconditionally — its methods are exercised only for composite
+remote ids (which exist only when a tray is active); with no panel-RPC client it
+fails closed.
 
 ### 3. Page-side handlers (`createStandalonePanelRpcHandlers` + `main.ts` wiring)
 
-New handlers, backed by a callback `main.ts` wires to
-`pageLeaderTray.sync` (the `LeaderSyncManager`, which is the page-side
-`TrayTargetProvider`):
+New handlers, backed by a callback `main.ts` wires to `pageLeaderTray.sync` (the
+`LeaderSyncManager`, the page-side `TrayTargetProvider`). The handler keeps a
+**session map** `runtimeId:localTargetId → { transport, forwarders }`:
 
-- `remote-cdp-attach` → `sync.createRemoteTransport(runtimeId, localTargetId)`;
-  track the session.
-- `remote-cdp-send` → relay `transport.send(...)`, return the response.
-- `remote-cdp-subscribe` / `remote-cdp-unsubscribe` → wire/unwire
-  `transport.on(event, forwarder)`; the forwarder posts a `remote-cdp-event`
-  worker-ward.
-- `remote-cdp-detach` → unsubscribe all + dispose; remove from tracking.
+- `remote-cdp-send` → get-or-**lazily create** the session's
+  `RemoteCDPTransport` via `sync.createRemoteTransport(runtimeId, localTargetId)`,
+  relay `transport.send(...)`, return the response. (No separate attach op —
+  matches `RemoteCDPTransport`'s lazy model.)
+- `remote-cdp-subscribe` / `remote-cdp-unsubscribe` `{ runtimeId, localTargetId,
+event }` → **ref-counted** per `(target, event)` (mirror the 0→1 / 1→0
+  subscribe protocol in `cdp-worker-proxy.ts` / `startPageCdpForwarder`): on
+  0→1, wire `transport.on(event, forwarder)` where the forwarder posts a
+  `remote-cdp-event` push worker-ward; on 1→0, `transport.off(...)`. Prevents
+  duplicate forwarders / premature unsubscription with multiple listeners.
+- `remote-cdp-detach` → drop all forwarders + dispose the session.
 - `remote-open-tab` → `sync.openRemoteTab(runtimeId, url)`.
-
-Lifecycle: all active remote sessions are torn down on `beforeunload` /
-session-reload (mirrors the existing handler teardown), so nothing leaks.
 
 ### 4. `panel-rpc.ts` protocol additions
 
-- Request ops (worker→page, req/resp): `remote-cdp-attach`, `remote-cdp-send`,
-  `remote-cdp-subscribe`, `remote-cdp-unsubscribe`, `remote-cdp-detach`,
-  `remote-open-tab`, with matching `PanelRpcResults` entries.
-- A new **page→worker push** message `remote-cdp-event`
-  `{ runtimeId, localTargetId, method, params }`. The BroadcastChannel is
-  already bidirectional (worker posts requests, page posts responses); the
-  worker's existing channel listener gains a branch that routes
-  `remote-cdp-event` to the matching `PanelRpcCdpTransport` (by
-  `runtimeId:localTargetId`).
+- Request ops (worker→page, req/resp, in the `PanelRpcRequest` union with
+  matching `PanelRpcResults`): `remote-cdp-send`, `remote-cdp-subscribe`,
+  `remote-cdp-unsubscribe`, `remote-cdp-detach`, `remote-open-tab`. Payloads:
+  - send: `{ runtimeId, localTargetId, method, params?, sessionId? }` → CDP result
+  - subscribe/unsubscribe: `{ runtimeId, localTargetId, event }` → `{ ok: true }`
+  - detach: `{ runtimeId, localTargetId }` → `{ ok: true }`
+  - open-tab: `{ runtimeId, url }` → `{ targetId }`
+- A new **page→worker push** envelope, distinct from req/resp:
+  ```ts
+  interface PanelRpcPushMsg {
+    type: 'panel-rpc-push';
+    op: 'remote-cdp-event';
+    payload: {
+      runtimeId: string;
+      localTargetId: string;
+      method: string;
+      params?: Record<string, unknown>;
+    };
+  }
+  ```
+  Posted on the **same instance-scoped** `slicc-panel-rpc:{instanceId}` channel.
+  `createPanelRpcClient`'s channel listener (today handles only
+  `panel-rpc-response`) gains a branch that routes `panel-rpc-push` /
+  `remote-cdp-event` to the matching `PanelRpcCdpTransport` via a worker-side
+  registry `(runtimeId:localTargetId) → transport`.
+
+## Timeout layering
+
+- panel-RPC default `call()` timeout is **15s** (`DEFAULT_TIMEOUT_MS`); CDP
+  default is **30s** (`RemoteCDPTransport`). For `remote-cdp-send`, the panel-RPC
+  `timeoutMs` **must be ≥ the CDP send timeout** so the bridge layer never times
+  out before the CDP op does. Rule: `timeoutMs = max(cdpTimeout ?? 30_000, DEFAULT_TIMEOUT_MS) + margin`.
+  Subscribe/unsubscribe/detach/open-tab use the panel-RPC default.
 
 ## Data flow
 
 ```
 worker:  playwright-cli screenshot --tab follower-X:cherry-target
   withTab(composite) → attachToPage(composite)
-    → provider.createRemoteTransport(X, cherry-target) = PanelRpcCdpTransport
-    → transport.connect()                  → [remote-cdp-attach]  → page: sync.createRemoteTransport(...)
-    → send('Target.attachToTarget', …)     → [remote-cdp-send]     → page RemoteCDPTransport → WebRTC → follower
+    → provider.createRemoteTransport(X, cherry-target) = PanelRpcCdpTransport  (state 'connected', no connect())
+    → send('Target.attachToTarget', …)  → [remote-cdp-send] → page lazily creates RemoteCDPTransport(X,ct) → WebRTC → follower
   → screenshot() → send('Page.captureScreenshot') → [remote-cdp-send] → … → bytes back
   navigate():
-    → send('Page.navigate', …)             → [remote-cdp-send]
-    → once('Page.loadEventFired')          → [remote-cdp-subscribe] then push:
+    → send('Page.navigate', …)          → [remote-cdp-send]
+    → once('Page.loadEventFired')        → [remote-cdp-subscribe] (0→1) then push:
          follower fires loadEventFired → page RemoteCDPTransport.on → [remote-cdp-event push] → worker dispatch → once() resolves
-  (withTab finally) → transport.disconnect() → [remote-cdp-detach]
+  (withTab finally) → provider.removeRemoteTransport → transport.disconnect() → [remote-cdp-detach]
 ```
 
 ## Error handling & lifecycle
 
-- No panel-RPC client (not standalone / no page bridge) → `connect`/`send`
-  reject with a clear "no page bridge to the leader tray" message (mirrors the
-  `cherry-emit` pattern); surfaces to `playwright-cli` as a non-zero exit.
-- No active leader tray / target gone / follower disconnected → the page handler
-  returns a CDP-style error, surfaced unchanged to the cone.
-- Hangs → panel-RPC calls already support `timeoutMs`; the CDP `send` timeout
-  threads through.
-- Teardown: detach disposes the page-side transport + forwarders; `beforeunload`
-  / session-reload tears down all active remote sessions.
+| Condition                                             | Behavior                                                                                                                                                                                    |
+| ----------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| No panel-RPC client (not standalone / no page bridge) | `send` rejects with a clear "no page bridge to the leader tray" message → `playwright-cli` non-zero exit (fail-closed, like `cherry-emit`).                                                 |
+| Leader tray not started                               | `remote-cdp-send` (lazy create) rejects with a clear error, same as `tray-reset` when no leader.                                                                                            |
+| Follower disconnects mid-command                      | Page `RemoteCDPTransport` errors → relayed unchanged to the worker → `BrowserAPI.ensureConnected()` recovery applies.                                                                       |
+| Follower disconnect (out of band)                     | `LeaderSyncManager.cleanupRemoteTransports(runtimeId)` already fires page-side; the handler's session map must drop matching sessions in sync (and a later worker `send` then fails clean). |
+| `tray-leave` / leader stop                            | Tear down active page-side sessions, else worker transports hang on the next `send`.                                                                                                        |
+| Page reload / session reload / `beforeunload`         | Dispose all sessions — wire into the existing handler disposer in `main.ts`.                                                                                                                |
+
+## Listing stays split (documented, intentional)
+
+`getTargets()` returning `[]` means worker-side `BrowserAPI.listAllTargets()`
+still won't include remote targets — only `playwright-cli tab-list` (via the
+`list-remote-targets` supplement) will. Other worker callers of
+`listAllTargets()` (e.g. `realm-host.ts`, `upskill-command.ts`) remain
+local-only. That's acceptable and out of scope here; folding listing into the
+provider is deferred.
+
+## Large responses over BroadcastChannel
+
+Screenshot/evaluate results can be multi-MB base64. The page-side
+`RemoteCDPTransport` already reassembles chunked tray responses before its
+`send()` resolves, so the panel-RPC relay sees a single complete result. The
+integration test must include a realistic-size screenshot payload to de-risk
+structured-clone limits on the BroadcastChannel (local CDP already crosses a
+MessagePort, so this is expected to be fine).
 
 ## Testing
 
-- **Unit (worker):** `PanelRpcCdpTransport` — `send` maps to the op, pushed
-  events dispatch to `on` listeners, `once` resolves/timeouts, `connect`/
-  `disconnect` issue attach/detach. The provider — `createRemoteTransport`
-  returns the transport; `removeRemoteTransport` disposes.
-- **Unit (page):** the handlers — attach creates via a fake `sync`, send
-  relays, subscribe wires a forwarder that posts `remote-cdp-event`, detach
-  disposes; teardown on unload.
-- **Integration:** wire a worker `PanelRpcCdpTransport` ↔ page handler ↔ a fake
-  `RemoteCDPTransport` over a fake BroadcastChannel, and assert a `screenshot`
-  round-trips **and** a `navigate` `once('Page.loadEventFired')` resolves from a
-  pushed event. This doubles as the cross-realm regression test the cherry PR
-  lacked.
+- **Unit (worker):** `PanelRpcCdpTransport` — initial `state==='connected'` and
+  `connect()` is a no-op; `send` maps to `remote-cdp-send` with the right
+  timeout; pushed events dispatch to `on` listeners; `once` resolves/timeouts;
+  first `on`→subscribe, last `off`→unsubscribe; `disconnect`→detach; no-client →
+  fail-closed. The provider — `createRemoteTransport` caches per key;
+  `removeRemoteTransport` disconnects + evicts.
+- **Unit (page):** handlers — lazy create via a fake `sync`; send relays;
+  ref-counted subscribe/unsubscribe wires/unwires a forwarder that posts a push;
+  detach disposes; teardown on unload; `cleanupRemoteTransports` drops sessions.
+- **Integration (the #848 regression bar):** wire worker `PanelRpcCdpTransport`
+  ↔ page handler ↔ a fake `RemoteCDPTransport` over a fake BroadcastChannel;
+  assert a `screenshot` round-trips (with a realistic-size payload) **and** a
+  `navigate`'s `once('Page.loadEventFired')` resolves from a pushed event.
+
+## Documentation (repo three-gates)
+
+- `docs/architecture.md` — tray / federated-CDP section: note the worker→page
+  bridge for **driving** (not just listing), and the `remote-cdp-*` ops +
+  `remote-cdp-event` push.
+- `packages/webapp/CLAUDE.md` — CDP/tray subsection: the worker `BrowserAPI`
+  now gets a panel-RPC bridging `TrayTargetProvider` in standalone.
+
+## Sequencing
+
+- Implement against **main** (which has the `list-remote-targets` listing bridge,
+  PR #831 — the "listing already bridged" premise). The driving bridge lands
+  independently but is tested with the listing supplement in place — repro from
+  #848: `tab-list` then `screenshot --tab=<follower:target>`.
 
 ## Out of scope / future
 
 - Folding remote listing into the worker provider's `getTargets()` (and
-  simplifying `playwright-command.ts`'s explicit supplement) — optional cleanup,
-  not required.
-- Per-event volume optimization beyond explicit subscribe/unsubscribe.
+  simplifying `playwright-command.ts`'s supplement) — optional cleanup.
+- Per-event volume optimization beyond ref-counted subscribe/unsubscribe.
