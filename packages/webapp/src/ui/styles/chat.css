@@ -80,9 +80,13 @@
 .msg.msg--user .msg__content a:visited {
   color: #fff;
   text-decoration: underline;
+  text-decoration-color: rgba(255, 255, 255, 0.6);
+  text-decoration-thickness: 1px;
+  text-underline-offset: 2px;
 }
 .msg.msg--user .msg__content a:hover {
   color: #fff;
+  text-decoration-color: #fff;
 }
 .msg.msg--user :not(pre) > code {
   background: rgba(255, 255, 255, 0.18);
