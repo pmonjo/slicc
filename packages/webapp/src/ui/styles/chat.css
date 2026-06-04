@@ -99,6 +99,16 @@
 .msg.msg--user pre code {
   color: #e8e0ff;
 }
+.msg.msg--user .msg__content th {
+  background: rgba(0, 0, 0, 0.2);
+}
+.msg.msg--user .msg__content th,
+.msg.msg--user .msg__content td {
+  border-color: rgba(255, 255, 255, 0.25);
+}
+.msg.msg--user .msg__content blockquote {
+  color: rgba(255, 255, 255, 0.8);
+}
 .msg--user .msg__attachments {
   margin-bottom: 8px;
 }
