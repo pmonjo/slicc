@@ -58,7 +58,7 @@
     "lint:ci": "biome check . && prettier --check . && npm run lint:docs && npm run lint:skills -- --strict",
     "lint:docs": "node packages/dev-tools/tools/check-doc-sizes.mjs",
     "lint:skills": "node packages/dev-tools/tools/lint-skills.mjs",
-    "lint:swift": "npm run lint -w @slicc/swift-server && npm run lint -w @slicc/swift-launcher && cd packages/ios-app && swiftlint lint",
+    "lint:swift": "npm run lint -w @slicc/swift-server && npm run lint -w @slicc/swift-launcher && node -e \"require('child_process').execSync('swiftlint lint', {stdio: 'inherit', cwd: 'packages/ios-app'})\"",
     "deadcode": "knip --include files,dependencies,devDependencies,unlisted,binaries,unresolved,duplicates",
     "deadcode:full": "knip",
     "deadcode:files": "knip --include files",
@@ -66,8 +66,8 @@
     "deadcode:swift": "npm run deadcode -w @slicc/swift-server && npm run deadcode -w @slicc/swift-launcher",
     "package:release": "node dist/node-server/release-package.js",
     "publish:chrome": "node dist/node-server/publish-chrome-web-store.js",
-    "publish:worker": "bash packages/cloudflare-worker/scripts/publish-worker.sh",
-    "postinstall": "if [ -d packages/shared-ts ]; then npm run build -w @slicc/shared-ts; fi && if [ -d packages/cloud-core ]; then npm run build -w @slicc/cloud-core; fi",
+    "publish:worker": "node scripts/publish-worker.mjs",
+    "postinstall": "node scripts/postinstall.mjs",
     "prepare": "husky"
   },
   "dependencies": {
