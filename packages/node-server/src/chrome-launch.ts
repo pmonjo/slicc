@@ -112,7 +112,7 @@ export function resolveQaProfilesRoot(projectRoot: string): string {
 }
 
 export function resolveDefaultChromeUserDataDir(
-  tmpDir = process.env['TMPDIR'] ?? '/tmp',
+  tmpDir = process.env['TMPDIR'] ?? process.env['TEMP'] ?? process.env['TMP'] ?? '/tmp',
   servePort?: number
 ): string {
   const suffix = servePort && servePort !== 5710 ? `-${servePort}` : '';
@@ -582,6 +582,39 @@ export function waitForCdpPortFromStderr(
       }
     });
   });
+}
+
+/**
+ * Check whether a Chrome instance launched from a previous session is still
+ * running and has its DevTools endpoint live. Reads the
+ * `<userDataDir>/DevToolsActivePort` file (Chrome writes this when its CDP
+ * listener comes up and never removes it), parses the port and WebSocket
+ * path from the file, then probes `/json/version` on that port.
+ *
+ * Returns the live CDP port number, or `null` if:
+ *   - the file doesn't exist (no previous run)
+ *   - the port is out of range / unparseable
+ *   - the CDP probe fails (Chrome is no longer running or is a different instance)
+ *
+ * Used by the launcher to skip spawning a new Chrome process when one is
+ * already live — e.g. when a previous `npm start` left Chrome open, or when
+ * Chrome on Windows hands off to an existing instance and exits immediately.
+ */
+export async function checkExistingChromeSession(userDataDir: string): Promise<number | null> {
+  try {
+    const contents = await readFile(join(userDataDir, 'DevToolsActivePort'), 'utf-8');
+    const lines = contents.split('\n');
+    const portStr = lines[0]?.trim();
+    if (!portStr) return null;
+    const port = Number.parseInt(portStr, 10);
+    if (!Number.isInteger(port) || port <= 0 || port > 65_535) return null;
+    const wsPath = lines[1]?.trim() ?? null;
+    const expectedWebSocketPath = wsPath?.startsWith('/') ? wsPath : null;
+    const alive = await probeCdpAlive(port, { expectedWebSocketPath });
+    return alive ? port : null;
+  } catch {
+    return null;
+  }
 }
 
 /**

@@ -14,6 +14,7 @@ import { fileURLToPath } from 'url';
 import { WebSocket, WebSocketServer } from 'ws';
 import {
   buildChromeLaunchArgs,
+  checkExistingChromeSession,
   clearStaleDevToolsActivePort,
   ensureQaProfileScaffold,
   findChromeExecutable,
@@ -556,7 +557,7 @@ async function main() {
       try {
         const resolved = resolveChromeLaunchProfile({
           projectRoot: PROJECT_ROOT,
-          tmpDir: process.env['TMPDIR'] ?? '/tmp',
+          tmpDir: process.env['TMPDIR'] ?? process.env['TEMP'] ?? process.env['TMP'] ?? '/tmp',
           profile: RUNTIME_FLAGS.profile,
           servePort: SERVE_PORT,
         });
@@ -606,49 +607,61 @@ async function main() {
       hosted: RUNTIME_FLAGS.hosted,
     });
 
-    // Profile directories are reused across runs (both the dev
-    // `/tmp/browser-coding-agent-chrome` profile and the persistent
-    // `.qa/chrome/<profile>` QA profiles). Chrome never proactively
-    // clears `DevToolsActivePort` on shutdown, so a stale file from a
-    // previous crash/SIGKILL would let our active-port-file poller win
-    // the race instantly with the wrong port. Clear it before spawn.
-    await clearStaleDevToolsActivePort(chromeProfile.userDataDir);
+    // If Chrome is already running from a previous session (e.g. a prior
+    // `npm start` that was not shut down, or Chrome handing off to an
+    // existing instance on Windows), reuse that live CDP session rather
+    // than spawning a new one.  We must check BEFORE clearing
+    // DevToolsActivePort: the clear+spawn sequence is the failure mode —
+    // the file gets deleted, Chrome hands off to the running instance and
+    // exits with code 0, the existing instance never rewrites the file,
+    // and both CDP discovery watchers time out.
+    const existingCdpPort = await checkExistingChromeSession(chromeProfile.userDataDir);
+    if (existingCdpPort !== null) {
+      CDP_PORT = existingCdpPort;
+      console.log(`Reusing existing Chrome session on CDP port ${CDP_PORT}`);
+    } else {
+      // No live Chrome on this profile. Clear any stale DevToolsActivePort
+      // so the file-based poller can't win the race with an old port from a
+      // crashed / SIGKILL'd previous launch.
+      await clearStaleDevToolsActivePort(chromeProfile.userDataDir);
 
-    // On macOS, route through `/usr/bin/open` so LaunchServices owns the
-    // new Chrome process. Without this hop the terminal that started
-    // `node` stays in Chrome's TCC responsibility chain, which silently
-    // breaks `getUserMedia()` (camera/mic in Google Meet, Zoom, etc.)
-    // whenever the terminal hasn't already been granted camera/microphone
-    // access. With LaunchServices in the loop, Chrome becomes its own
-    // TCC responsible process and the user's
-    // `/Applications/Google Chrome.app` privacy grant applies as expected.
-    const spawnPlan = planChromeSpawn({ executablePath: chromePath, chromeArgs });
+      // On macOS, route through `/usr/bin/open` so LaunchServices owns the
+      // new Chrome process. Without this hop the terminal that started
+      // `node` stays in Chrome's TCC responsibility chain, which silently
+      // breaks `getUserMedia()` (camera/mic in Google Meet, Zoom, etc.)
+      // whenever the terminal hasn't already been granted camera/microphone
+      // access. With LaunchServices in the loop, Chrome becomes its own
+      // TCC responsible process and the user's
+      // `/Applications/Google Chrome.app` privacy grant applies as expected.
+      const spawnPlan = planChromeSpawn({ executablePath: chromePath, chromeArgs });
 
-    launchedBrowserProcess = spawn(spawnPlan.command, spawnPlan.args, {
-      stdio: ['ignore', 'pipe', 'pipe'],
-      detached: false,
-      env: { ...process.env, GOOGLE_CRASHPAD_DISABLE: '1' },
-    });
-    launchedBrowserLabel = chromeProfile.displayName;
+      launchedBrowserProcess = spawn(spawnPlan.command, spawnPlan.args, {
+        stdio: ['ignore', 'pipe', 'pipe'],
+        detached: false,
+        env: { ...process.env, GOOGLE_CRASHPAD_DISABLE: '1' },
+      });
+      launchedBrowserLabel = chromeProfile.displayName;
 
-    // Use the stderr-vs-DevToolsActivePort race so we work in both
-    // direct-exec mode (Linux/Windows, or bare-binary fallbacks where
-    // stderr carries Chrome's banner) and LaunchServices mode (macOS,
-    // where stderr belongs to `open` and only the active-port file
-    // surfaces the real CDP port).
-    const actualCdpPort = await waitForCdpPort(launchedBrowserProcess, {
-      userDataDir: chromeProfile.userDataDir,
-    });
-    CDP_PORT = actualCdpPort;
-    console.log(`Chrome CDP listening on port ${CDP_PORT}`);
+      // Use the stderr-vs-DevToolsActivePort race so we work in both
+      // direct-exec mode (Linux/Windows, or bare-binary fallbacks where
+      // stderr carries Chrome's banner) and LaunchServices mode (macOS,
+      // where stderr belongs to `open` and only the active-port file
+      // surfaces the real CDP port).
+      const actualCdpPort = await waitForCdpPort(launchedBrowserProcess, {
+        userDataDir: chromeProfile.userDataDir,
+      });
+      CDP_PORT = actualCdpPort;
+      console.log(`Chrome CDP listening on port ${CDP_PORT}`);
+    }
 
-    pipeChildOutput(launchedBrowserProcess, 'chrome');
-
-    launchedBrowserProcess.on('exit', (code) => {
-      if (shuttingDown) return;
-      console.log(`Chrome exited with code ${code}`);
-      process.exit(0);
-    });
+    if (launchedBrowserProcess) {
+      pipeChildOutput(launchedBrowserProcess, 'chrome');
+      launchedBrowserProcess.on('exit', (code) => {
+        if (shuttingDown) return;
+        console.log(`Chrome exited with code ${code}`);
+        process.exit(0);
+      });
+    }
   }
 
   // 3. Set up express app with request logging
