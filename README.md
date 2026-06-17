@@ -87,6 +87,7 @@ slicc
 git clone https://github.com/ai-ecoverse/slicc.git
 cd slicc
 npm install
+npm run build
 npm start
 ```
 
